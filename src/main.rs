@@ -1,18 +1,12 @@
-mod d2d_ui;
-mod ipc;
-mod search;
-mod skia_ui;
-mod store;
-mod timing;
-mod view_model;
-mod walker;
-
 use std::io::{BufRead, Write};
 use std::sync::Arc;
 
 use anyhow::Result;
-use ipc::StdinPickerRequest;
-use view_model::ViewModel;
+use rust_nfm::ipc::FlatItemsPickerRequest;
+#[cfg(feature = "skia")]
+use rust_nfm::skia_ui;
+use rust_nfm::view_model::ViewModel;
+use rust_nfm::{d2d_ui, ipc};
 
 fn main() -> Result<()> {
     let options = app_options();
@@ -31,6 +25,7 @@ fn main() -> Result<()> {
 
     match options.ui {
         UiBackend::D2d => d2d_ui::run(view_model),
+        #[cfg(feature = "skia")]
         UiBackend::Skia => skia_ui::run(view_model),
     }
 }
@@ -46,7 +41,7 @@ fn run_stdin_request(view_model: Arc<ViewModel>) -> Result<()> {
         .collect();
 
     std::thread::spawn(move || {
-        let request = StdinPickerRequest {
+        let request = FlatItemsPickerRequest {
             items,
             search_string: None,
         };
@@ -84,6 +79,7 @@ fn run_stdin_request(view_model: Arc<ViewModel>) -> Result<()> {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum UiBackend {
     D2d,
+    #[cfg(feature = "skia")]
     Skia,
 }
 
@@ -101,6 +97,7 @@ fn app_options() -> AppOptions {
     while let Some(arg) = args.next() {
         if arg == "--ui" {
             options.ui = match args.next().as_deref() {
+                #[cfg(feature = "skia")]
                 Some("skia") => UiBackend::Skia,
                 Some("d2d") | _ => UiBackend::D2d,
             };

@@ -3,13 +3,21 @@ name = "nfm-rust-win32host"
 version = "0.1.0"
 edition = "2024"
 
+[lib]
+name = "rust_nfm"
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = ["skia"]
+skia = ["dep:skia-safe"]
+
 [dependencies]
 anyhow = "1"
 crossbeam-channel = "0.5"
 rayon = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-skia-safe = "0.97.2"
+skia-safe = { version = "0.97.2", optional = true }
 windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_Graphics_Direct2D",

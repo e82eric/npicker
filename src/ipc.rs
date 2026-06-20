@@ -45,7 +45,7 @@ pub struct FileSystemPickerRequest {
     pub search_string: Option<String>,
 }
 
-pub struct StdinPickerRequest {
+pub struct FlatItemsPickerRequest {
     pub items: Vec<String>,
     pub search_string: Option<String>,
 }
@@ -75,7 +75,7 @@ impl PickerRequest for FileSystemPickerRequest {
     }
 }
 
-impl PickerRequest for StdinPickerRequest {
+impl PickerRequest for FlatItemsPickerRequest {
     type Source = FlatSnapshot;
 
     fn search_string(&self) -> Option<&str> {
@@ -252,7 +252,7 @@ mod tests {
 
     #[test]
     fn stdin_request_creates_completed_flat_store() {
-        let request = StdinPickerRequest {
+        let request = FlatItemsPickerRequest {
             items: vec!["alpha".to_owned(), "beta\\gamma".to_owned()],
             search_string: Some("beta".to_owned()),
         };

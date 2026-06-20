@@ -1,6 +1,7 @@
 #![allow(unsafe_op_in_unsafe_fn, unused_unsafe)]
 
 use std::ffi::c_void;
+use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, anyhow};
@@ -8,11 +9,11 @@ use skia_safe::{
     Canvas, Color, Font, FontMgr, FontStyle, Paint, PaintStyle, RRect, Rect as SkRect, Surface,
     surfaces,
 };
-use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     BITMAPINFO, BITMAPINFOHEADER, BeginPaint, DIB_RGB_COLORS, EndPaint, GetMonitorInfoW,
-    InvalidateRect, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow, PAINTSTRUCT, SRCCOPY,
-    StretchDIBits,
+    InvalidateRect, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromPoint, MonitorFromWindow,
+    PAINTSTRUCT, SRCCOPY, StretchDIBits,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
@@ -38,6 +39,8 @@ const MIN_HEIGHT: i32 = 360;
 const MONITOR_HORIZONTAL_MARGIN: i32 = 80;
 const MONITOR_VERTICAL_MARGIN: i32 = 160;
 const ROW_HEIGHT: f32 = 24.0;
+const DISPLAY_ROWS: i32 = 15;
+const PADDING: f32 = 8.0;
 const COUNTER_WIDTH: f32 = 300.0;
 const WM_UI_UPDATE: u32 = WM_APP + 21;
 const WM_UI_BRING_TO_FOREGROUND: u32 = WM_APP + 22;
@@ -49,6 +52,16 @@ const COLOR_TEXT: u32 = 0xa89984;
 const COLOR_HIGHLIGHT: u32 = 0xffa500;
 const COLOR_SELECTED: u32 = 0x504945;
 const SKIA_BADGE_TEXT: &str = "SKIA";
+const DEFAULT_LOCATION_VALUE: i32 = i32::MIN;
+
+static PREFERRED_CENTER_X: AtomicI32 = AtomicI32::new(DEFAULT_LOCATION_VALUE);
+static PREFERRED_CENTER_Y: AtomicI32 = AtomicI32::new(DEFAULT_LOCATION_VALUE);
+static DESIRED_WINDOW_HEIGHT: AtomicI32 = AtomicI32::new(DEFAULT_HEIGHT);
+
+pub fn set_preferred_center(x: i32, y: i32) {
+    PREFERRED_CENTER_X.store(x, Ordering::Relaxed);
+    PREFERRED_CENTER_Y.store(y, Ordering::Relaxed);
+}
 
 pub fn run(view_model: Arc<ViewModel>) -> Result<()> {
     unsafe {
@@ -243,6 +256,13 @@ fn calculate_layout(window: Rect, padding: f32, number_of_items: i32, text_heigh
     }
 }
 
+fn desired_window_height(text_height: f32, padding: f32, number_of_items: i32) -> i32 {
+    let search_border_height = text_height + (padding * 2.0);
+    let row_height = text_height + padding;
+    let list_border_height = (number_of_items as f32 * row_height) + (padding * 2.0);
+    (padding + search_border_height + padding + list_border_height + padding).ceil() as i32
+}
+
 impl WindowState {
     fn new(
         view_model: Arc<ViewModel>,
@@ -250,7 +270,7 @@ impl WindowState {
         left: f32,
         top: f32,
         width: f32,
-        height: f32,
+        _height: f32,
     ) -> Result<Self> {
         let typeface = FontMgr::default()
             .legacy_make_typeface("Cascadia Mono", FontStyle::normal())
@@ -261,14 +281,17 @@ impl WindowState {
         let counter_font = Font::new(typeface, 15.0);
         let text_height = font.metrics().0;
 
+        let desired_height = desired_window_height(text_height, PADDING, DISPLAY_ROWS);
+        DESIRED_WINDOW_HEIGHT.store(desired_height, Ordering::Relaxed);
+
         let window = Rect {
             x: left,
             y: top,
             width,
-            height,
+            height: desired_height as f32,
         };
 
-        let app_layout = calculate_layout(window, 8.0, 15, text_height);
+        let app_layout = calculate_layout(window, PADDING, DISPLAY_ROWS, text_height);
 
         Ok(Self {
             view_model,
@@ -319,6 +342,17 @@ impl WindowState {
         if self.last_window_location != Some(location) {
             self.surface = None;
             self.last_window_location = Some(location);
+            self.layout = calculate_layout(
+                Rect {
+                    x: location.x as f32,
+                    y: location.y as f32,
+                    width: location.width as f32,
+                    height: location.height as f32,
+                },
+                PADDING,
+                DISPLAY_ROWS,
+                self.layout.text_height,
+            );
         }
 
         let _ = SetWindowPos(
@@ -654,31 +688,53 @@ struct ScreenLocation {
 }
 
 unsafe fn calculate_window_location() -> ScreenLocation {
-    let hwnd = GetForegroundWindow();
-    if !hwnd.is_invalid() {
-        let monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
-        if !monitor.is_invalid() {
-            let mut info = MONITORINFO {
-                cbSize: std::mem::size_of::<MONITORINFO>() as u32,
-                ..Default::default()
+    let preferred_x = PREFERRED_CENTER_X.load(Ordering::Relaxed);
+    let preferred_y = PREFERRED_CENTER_Y.load(Ordering::Relaxed);
+    let monitor = if preferred_x != DEFAULT_LOCATION_VALUE && preferred_y != DEFAULT_LOCATION_VALUE
+    {
+        MonitorFromPoint(
+            POINT {
+                x: preferred_x,
+                y: preferred_y,
+            },
+            MONITOR_DEFAULTTONEAREST,
+        )
+    } else {
+        MonitorFromWindow(GetForegroundWindow(), MONITOR_DEFAULTTONEAREST)
+    };
+
+    if !monitor.is_invalid() {
+        let mut info = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+
+        if GetMonitorInfoW(monitor, &mut info).as_bool() {
+            let work = info.rcWork;
+            let mon_width = work.right - work.left;
+            let mon_height = work.bottom - work.top;
+            let width = DEFAULT_WIDTH.min((mon_width - MONITOR_HORIZONTAL_MARGIN).max(MIN_WIDTH));
+            let desired_height = DESIRED_WINDOW_HEIGHT.load(Ordering::Relaxed);
+            let height = desired_height.min((mon_height - MONITOR_VERTICAL_MARGIN).max(MIN_HEIGHT));
+            let center_x = if preferred_x != DEFAULT_LOCATION_VALUE {
+                preferred_x
+            } else {
+                work.left + mon_width / 2
             };
+            let center_y = if preferred_y != DEFAULT_LOCATION_VALUE {
+                preferred_y
+            } else {
+                work.top + mon_height / 2
+            };
+            let x = (center_x - width / 2).clamp(work.left, work.right - width);
+            let y = (center_y - height / 2).clamp(work.top, work.bottom - height);
 
-            if GetMonitorInfoW(monitor, &mut info).as_bool() {
-                let work = info.rcWork;
-                let mon_width = work.right - work.left;
-                let mon_height = work.bottom - work.top;
-                let width =
-                    DEFAULT_WIDTH.min((mon_width - MONITOR_HORIZONTAL_MARGIN).max(MIN_WIDTH));
-                let height =
-                    DEFAULT_HEIGHT.min((mon_height - MONITOR_VERTICAL_MARGIN).max(MIN_HEIGHT));
-
-                return ScreenLocation {
-                    x: work.left + (mon_width - width) / 2,
-                    y: work.top + (mon_height - height) / 2,
-                    width,
-                    height,
-                };
-            }
+            return ScreenLocation {
+                x,
+                y,
+                width,
+                height,
+            };
         }
     }
 
