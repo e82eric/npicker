@@ -121,7 +121,7 @@ pub trait ItemsSource {
     fn len(&self) -> usize;
     fn is_empty(&self) -> bool;
     fn get_string<'a>(
-        &self,
+        &'a self,
         index: usize,
         stack_buffer: &'a mut [u8],
         heap_buffer: &'a mut Vec<u8>,
@@ -132,29 +132,33 @@ pub trait ItemsSource {
 
 pub enum AnyItemSource {
     FileSystem(Arc<PublishedSnapshot>),
+    Flat(Arc<FlatSnapshot>),
 }
 
 impl ItemsSource for AnyItemSource {
     fn version(&self) -> u64 {
         match self {
             AnyItemSource::FileSystem(source) => source.version(),
+            AnyItemSource::Flat(source) => source.version(),
         }
     }
 
     fn len(&self) -> usize {
         match self {
             AnyItemSource::FileSystem(source) => source.len(),
+            AnyItemSource::Flat(source) => source.len(),
         }
     }
 
     fn is_empty(&self) -> bool {
         match self {
             AnyItemSource::FileSystem(source) => source.is_empty(),
+            AnyItemSource::Flat(source) => source.is_empty(),
         }
     }
 
     fn get_string<'a>(
-        &self,
+        &'a self,
         index: usize,
         stack_buffer: &'a mut [u8],
         heap_buffer: &'a mut Vec<u8>,
@@ -163,13 +167,88 @@ impl ItemsSource for AnyItemSource {
             AnyItemSource::FileSystem(source) => {
                 source.get_string(index, stack_buffer, heap_buffer)
             }
+            AnyItemSource::Flat(source) => source.get_string(index, stack_buffer, heap_buffer),
         }
     }
 
     fn get_string_lossy(&self, node_index: usize, out: &mut Vec<u8>) -> String {
         match self {
             AnyItemSource::FileSystem(source) => source.get_string_lossy(node_index, out),
+            AnyItemSource::Flat(source) => source.get_string_lossy(node_index, out),
         }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct FlatItem {
+    offset: usize,
+    len: usize,
+}
+
+pub struct FlatSnapshot {
+    items: Vec<FlatItem>,
+    bytes: Vec<u8>,
+    version: u64,
+}
+
+impl FlatSnapshot {
+    pub fn from_items<I, S>(items: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let mut flat_items = Vec::new();
+        let mut bytes = Vec::new();
+
+        for item in items {
+            let item = item.as_ref();
+            let offset = bytes.len();
+            bytes.extend_from_slice(item.as_bytes());
+            flat_items.push(FlatItem {
+                offset,
+                len: item.len(),
+            });
+        }
+
+        Self {
+            items: flat_items,
+            bytes,
+            version: 1,
+        }
+    }
+
+    fn item_bytes(&self, index: usize) -> &[u8] {
+        let item = self.items[index];
+        let start = item.offset;
+        let end = start + item.len;
+        &self.bytes[start..end]
+    }
+}
+
+impl ItemsSource for FlatSnapshot {
+    fn version(&self) -> u64 {
+        self.version
+    }
+
+    fn len(&self) -> usize {
+        self.items.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+
+    fn get_string<'a>(
+        &'a self,
+        index: usize,
+        _stack_buffer: &'a mut [u8],
+        _heap_buffer: &'a mut Vec<u8>,
+    ) -> &'a [u8] {
+        self.item_bytes(index)
+    }
+
+    fn get_string_lossy(&self, node_index: usize, _out: &mut Vec<u8>) -> String {
+        String::from_utf8_lossy(self.item_bytes(node_index)).into_owned()
     }
 }
 
@@ -194,7 +273,7 @@ impl ItemsSource for PublishedSnapshot {
         self.node_count == 0
     }
     fn get_string<'a>(
-        &self,
+        &'a self,
         index: usize,
         stack_buffer: &'a mut [u8],
         heap_buffer: &'a mut Vec<u8>,
@@ -472,4 +551,31 @@ fn hash_bytes(bytes: &[u8]) -> u64 {
         hash = hash.wrapping_mul(FNV_PRIME);
     }
     hash
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn flat_snapshot_returns_direct_item_bytes() {
+        let snapshot = FlatSnapshot::from_items(["alpha", "beta\\gamma"]);
+        let mut stack = [0u8; 16];
+        let mut heap = Vec::new();
+
+        assert_eq!(snapshot.get_string(0, &mut stack, &mut heap), b"alpha");
+        assert_eq!(
+            snapshot.get_string(1, &mut stack, &mut heap),
+            b"beta\\gamma"
+        );
+        assert!(heap.is_empty());
+    }
+
+    #[test]
+    fn flat_snapshot_materializes_lossy_strings() {
+        let snapshot = FlatSnapshot::from_items(["one", "two"]);
+        let mut out = Vec::new();
+
+        assert_eq!(snapshot.get_string_lossy(1, &mut out), "two");
+    }
 }

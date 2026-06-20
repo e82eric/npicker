@@ -7,25 +7,78 @@ mod timing;
 mod view_model;
 mod walker;
 
+use std::io::{BufRead, Write};
 use std::sync::Arc;
 
 use anyhow::Result;
+use ipc::StdinPickerRequest;
 use view_model::ViewModel;
 
 fn main() -> Result<()> {
+    let options = app_options();
     let view_model = Arc::new(ViewModel::new());
-    let server_view_model = Arc::clone(&view_model);
 
-    std::thread::spawn(move || {
-        if let Err(error) = ipc::run_pipe_server(server_view_model) {
-            eprintln!("pipe server stopped: {error:?}");
-        }
-    });
+    if options.stdin {
+        run_stdin_request(Arc::clone(&view_model))?;
+    } else {
+        let server_view_model = Arc::clone(&view_model);
+        std::thread::spawn(move || {
+            if let Err(error) = ipc::run_pipe_server(server_view_model) {
+                eprintln!("pipe server stopped: {error:?}");
+            }
+        });
+    }
 
-    match selected_ui() {
+    match options.ui {
         UiBackend::D2d => d2d_ui::run(view_model),
         UiBackend::Skia => skia_ui::run(view_model),
     }
+}
+
+fn run_stdin_request(view_model: Arc<ViewModel>) -> Result<()> {
+    let stdin = std::io::stdin();
+    let items = stdin
+        .lock()
+        .lines()
+        .collect::<std::io::Result<Vec<_>>>()?
+        .into_iter()
+        .filter(|line| !line.is_empty())
+        .collect();
+
+    std::thread::spawn(move || {
+        let request = StdinPickerRequest {
+            items,
+            search_string: None,
+        };
+        let code = match view_model.run_request(&request) {
+            Ok(response) if response.status == "selected" => {
+                if let Some(item) = response.selected_item {
+                    let mut stdout = std::io::stdout().lock();
+                    if writeln!(stdout, "{item}").is_err() || stdout.flush().is_err() {
+                        1
+                    } else {
+                        0
+                    }
+                } else {
+                    0
+                }
+            }
+            Ok(response) if response.status == "cancelled" => 0,
+            Ok(response) => {
+                if let Some(message) = response.error_message {
+                    eprintln!("{message}");
+                }
+                1
+            }
+            Err(error) => {
+                eprintln!("{error:?}");
+                1
+            }
+        };
+        std::process::exit(code);
+    });
+
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -34,16 +87,27 @@ enum UiBackend {
     Skia,
 }
 
-fn selected_ui() -> UiBackend {
+struct AppOptions {
+    ui: UiBackend,
+    stdin: bool,
+}
+
+fn app_options() -> AppOptions {
+    let mut options = AppOptions {
+        ui: UiBackend::D2d,
+        stdin: false,
+    };
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         if arg == "--ui" {
-            return match args.next().as_deref() {
+            options.ui = match args.next().as_deref() {
                 Some("skia") => UiBackend::Skia,
                 Some("d2d") | _ => UiBackend::D2d,
             };
+        } else if arg == "--stdin" {
+            options.stdin = true;
         }
     }
 
-    UiBackend::D2d
+    options
 }

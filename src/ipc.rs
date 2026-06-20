@@ -4,7 +4,7 @@ use std::os::windows::io::{FromRawHandle, OwnedHandle};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use crate::store::{ItemsSource, PublishedSnapshot};
+use crate::store::{AnyItemSource, FlatSnapshot, ItemsSource, PublishedSnapshot};
 use crate::view_model::ViewModel;
 use crate::walker::{ScanOptions, SharedStore, start_scan};
 use anyhow::{Context, Result, anyhow};
@@ -45,6 +45,11 @@ pub struct FileSystemPickerRequest {
     pub search_string: Option<String>,
 }
 
+pub struct StdinPickerRequest {
+    pub items: Vec<String>,
+    pub search_string: Option<String>,
+}
+
 impl PickerRequest for FileSystemPickerRequest {
     type Source = PublishedSnapshot;
 
@@ -67,6 +72,21 @@ impl PickerRequest for FileSystemPickerRequest {
         });
 
         store
+    }
+}
+
+impl PickerRequest for StdinPickerRequest {
+    type Source = FlatSnapshot;
+
+    fn search_string(&self) -> Option<&str> {
+        self.search_string.as_deref()
+    }
+
+    fn run(&self) -> Arc<SharedStore> {
+        let snapshot = Arc::new(FlatSnapshot::from_items(self.items.iter()));
+        Arc::new(SharedStore::completed(Arc::new(AnyItemSource::Flat(
+            snapshot,
+        ))))
     }
 }
 
@@ -224,4 +244,30 @@ pub fn send_request(request: &FileSystemPickerRequest) -> Result<PickerResponse>
 
 fn wide_null(value: &str) -> Vec<u16> {
     value.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stdin_request_creates_completed_flat_store() {
+        let request = StdinPickerRequest {
+            items: vec!["alpha".to_owned(), "beta\\gamma".to_owned()],
+            search_string: Some("beta".to_owned()),
+        };
+
+        let store = request.run();
+        let snapshot = store.snapshot();
+        let mut stack = [0u8; 64];
+        let mut heap = Vec::new();
+
+        assert!(store.is_done());
+        assert_eq!(snapshot.len(), 2);
+        assert_eq!(
+            snapshot.get_string(1, &mut stack, &mut heap),
+            b"beta\\gamma"
+        );
+        assert_eq!(request.search_string(), Some("beta"));
+    }
 }

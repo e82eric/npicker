@@ -37,6 +37,14 @@ impl SharedStore {
         }
     }
 
+    pub fn completed(source: Arc<AnyItemSource>) -> Self {
+        Self {
+            published: RwLock::new(source),
+            done: AtomicBool::new(true),
+            stats: ScanStats::default(),
+        }
+    }
+
     pub fn snapshot(&self) -> Arc<AnyItemSource> {
         Arc::clone(&self.published.read().expect("store poisoned"))
     }
