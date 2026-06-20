@@ -4,11 +4,14 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::ipc::{PickerRequest, PickerResponse};
-use crate::search::{search, SearchOutput, SearchResult, DISPLAY_LIMIT};
+use crate::search::{
+    DISPLAY_LIMIT, RESULT_LIMIT, SearchOutput, SearchResult, search, search_range,
+};
+use crate::store::ItemsSource;
 use crate::timing;
 use crate::walker::SharedStore;
-use anyhow::{bail, Result};
-use crossbeam_channel::{bounded, unbounded, Receiver, Sender};
+use anyhow::{Result, bail};
+use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     VK_BACK, VK_DELETE, VK_DOWN, VK_END, VK_ESCAPE, VK_HOME, VK_LEFT, VK_RETURN, VK_RIGHT, VK_UP,
 };
@@ -76,6 +79,14 @@ struct ActiveRequest {
     response_tx: Sender<PickerResponse>,
 }
 
+#[derive(Default)]
+struct SearchCache {
+    query: String,
+    searched_len: usize,
+    results: Vec<SearchResult>,
+    matched: usize,
+}
+
 impl ViewModel {
     pub fn new() -> Self {
         let (events_tx, events_rx) = unbounded();
@@ -104,18 +115,16 @@ impl ViewModel {
         self.events_rx.clone()
     }
 
-    pub fn run_request<R>(
-        self: &Arc<Self>,
-        request: &R,
-    ) -> Result<PickerResponse> where R: PickerRequest{
+    pub fn run_request<R>(self: &Arc<Self>, request: &R) -> Result<PickerResponse>
+    where
+        R: PickerRequest,
+    {
         timing::begin_request();
         let search_len = request
             .search_string()
             .as_ref()
             .map_or(0, |value| value.len());
-        timing::write(format!(
-            "begin_request search_len={search_len}",
-        ));
+        timing::write(format!("begin_request search_len={search_len}",));
 
         let request_id = self.request_generation.fetch_add(1, Ordering::AcqRel) + 1;
         self.search_version.store(0, Ordering::Release);
@@ -522,6 +531,7 @@ impl ViewModel {
         std::thread::spawn(move || {
             let mut last_completed_version = None;
             let mut last_snapshot_version = None;
+            let mut cache = SearchCache::default();
             loop {
                 if this.request_generation.load(Ordering::Acquire) != request_id {
                     return;
@@ -543,10 +553,9 @@ impl ViewModel {
                 };
 
                 if last_completed_version != Some(version)
-                    || scanning
                     || last_snapshot_version != Some(snapshot_version)
                 {
-                    this.run_search_generation(request_id, version);
+                    this.run_search_generation(request_id, version, &mut cache);
                     last_completed_version = Some(version);
                     last_snapshot_version = Some(snapshot_version);
                 }
@@ -566,7 +575,7 @@ impl ViewModel {
         });
     }
 
-    fn run_search_generation(&self, request_id: u64, version: u64) {
+    fn run_search_generation(&self, request_id: u64, version: u64, cache: &mut SearchCache) {
         let (store, query) = {
             let state = self.state.lock().expect("view model poisoned");
             let Some(active) = state.active.as_ref() else {
@@ -580,16 +589,35 @@ impl ViewModel {
 
         let snapshot = store.snapshot();
         let scanning = !store.is_done();
-        let Some(SearchOutput {
-            results,
-            matched,
-            total,
-        }) = search(snapshot, &query, || {
-            self.request_generation.load(Ordering::Acquire) != request_id
-                || self.search_version.load(Ordering::Acquire) != version
-        })
-        else {
-            return;
+        let total = snapshot.len();
+        let use_incremental = cache.query == query && cache.searched_len <= total;
+        let output = if use_incremental {
+            let Some(delta) = search_range(
+                Arc::clone(&snapshot),
+                &query,
+                cache.searched_len..total,
+                || {
+                    self.request_generation.load(Ordering::Acquire) != request_id
+                        || self.search_version.load(Ordering::Acquire) != version
+                },
+            ) else {
+                return;
+            };
+            merge_cached_search(cache, &query, delta)
+        } else {
+            let Some(output) = search(Arc::clone(&snapshot), &query, || {
+                self.request_generation.load(Ordering::Acquire) != request_id
+                    || self.search_version.load(Ordering::Acquire) != version
+            }) else {
+                return;
+            };
+            *cache = SearchCache {
+                query: query.clone(),
+                searched_len: output.total,
+                results: output.results.clone(),
+                matched: output.matched,
+            };
+            output
         };
         if self.request_generation.load(Ordering::Acquire) != request_id
             || self.search_version.load(Ordering::Acquire) != version
@@ -598,9 +626,9 @@ impl ViewModel {
         }
 
         let counters = UiCounters {
-            displayed: results.len(),
-            matched,
-            published: total,
+            displayed: output.results.len(),
+            matched: output.matched,
+            published: output.total,
             scanning,
         };
 
@@ -612,7 +640,7 @@ impl ViewModel {
             if active.id != request_id {
                 return;
             }
-            state.results = results;
+            state.results = output.results;
             state.counters = counters.clone();
             state.selected = state.selected.min(state.results.len().saturating_sub(1));
             state.ensure_selection_visible();
@@ -620,6 +648,39 @@ impl ViewModel {
             let _ = self.events_tx.send(UiEvent::Results(update));
         }
     }
+}
+
+fn merge_cached_search(cache: &mut SearchCache, query: &str, delta: SearchOutput) -> SearchOutput {
+    cache.query = query.to_owned();
+    cache.searched_len = delta.total;
+    cache.matched += delta.matched;
+
+    if query.is_empty() {
+        if cache.results.len() < RESULT_LIMIT {
+            let remaining = RESULT_LIMIT - cache.results.len();
+            cache
+                .results
+                .extend(delta.results.into_iter().take(remaining));
+        }
+    } else {
+        cache.results.extend(delta.results);
+        cache.results.sort_by(compare_search_results);
+        cache.results.truncate(RESULT_LIMIT);
+    }
+
+    SearchOutput {
+        results: cache.results.clone(),
+        matched: cache.matched,
+        total: cache.searched_len,
+    }
+}
+
+fn compare_search_results(left: &SearchResult, right: &SearchResult) -> std::cmp::Ordering {
+    right
+        .score
+        .cmp(&left.score)
+        .then_with(|| left.path.len().cmp(&right.path.len()))
+        .then_with(|| left.node_index.cmp(&right.node_index))
 }
 
 impl State {

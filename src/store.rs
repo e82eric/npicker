@@ -136,23 +136,40 @@ pub enum AnyItemSource {
 
 impl ItemsSource for AnyItemSource {
     fn version(&self) -> u64 {
-        match self { AnyItemSource::FileSystem(source) => source.version() }
+        match self {
+            AnyItemSource::FileSystem(source) => source.version(),
+        }
     }
 
     fn len(&self) -> usize {
-        match self { AnyItemSource::FileSystem(source) => source.len() }
+        match self {
+            AnyItemSource::FileSystem(source) => source.len(),
+        }
     }
 
     fn is_empty(&self) -> bool {
-        match self { AnyItemSource::FileSystem(source) => source.is_empty() }
+        match self {
+            AnyItemSource::FileSystem(source) => source.is_empty(),
+        }
     }
 
-    fn get_string<'a>(&self, index: usize, stack_buffer: &'a mut [u8], heap_buffer: &'a mut Vec<u8>) -> &'a [u8] {
-        match self { AnyItemSource::FileSystem(source) => source.get_string(index, stack_buffer, heap_buffer) }
+    fn get_string<'a>(
+        &self,
+        index: usize,
+        stack_buffer: &'a mut [u8],
+        heap_buffer: &'a mut Vec<u8>,
+    ) -> &'a [u8] {
+        match self {
+            AnyItemSource::FileSystem(source) => {
+                source.get_string(index, stack_buffer, heap_buffer)
+            }
+        }
     }
 
     fn get_string_lossy(&self, node_index: usize, out: &mut Vec<u8>) -> String {
-        match self { AnyItemSource::FileSystem(source) => source.get_string_lossy(node_index, out) }
+        match self {
+            AnyItemSource::FileSystem(source) => source.get_string_lossy(node_index, out),
+        }
     }
 }
 

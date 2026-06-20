@@ -1,5 +1,6 @@
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
+use std::ops::Range;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -9,7 +10,7 @@ use crate::store::{ItemsSource, Name};
 use crate::timing;
 
 pub const DISPLAY_LIMIT: usize = 15;
-const RESULT_LIMIT: usize = 1_000;
+pub const RESULT_LIMIT: usize = 1_000;
 const SEARCH_TIMING_SAMPLE_RATE: usize = 256;
 const SLAB_CAP: usize = 2_000_000;
 
@@ -80,24 +81,46 @@ where
     S: ItemsSource + Send + Sync,
     F: Fn() -> bool + Sync,
 {
+    let end = snapshot.len();
+    search_range(snapshot, query, 0..end, is_cancelled)
+}
+
+pub fn search_range<S, F>(
+    snapshot: Arc<S>,
+    query: &str,
+    range: Range<usize>,
+    is_cancelled: F,
+) -> Option<SearchOutput>
+where
+    S: ItemsSource + Send + Sync,
+    F: Fn() -> bool + Sync,
+{
     let total_start = Instant::now();
     let total = snapshot.len();
+    let start_index = range.start.min(total);
+    let end_index = range.end.min(total);
+    let searched = end_index.saturating_sub(start_index);
     if is_cancelled() {
         return None;
     }
 
-    if snapshot.is_empty() {
-        timing::write(
-            "search_detail total_us=0 parse_us=0 match_us=0 sort_us=0 append_us=0 shown=0 matched=0 total=0",
-        );
-        return Some(SearchOutput::default());
+    if snapshot.is_empty() || searched == 0 {
+        let total_us = timing::elapsed_us(total_start);
+        timing::write(format!(
+            "search_detail total_us={total_us} parse_us=0 match_us=0 sort_us=0 append_us=0 shown=0 matched=0 total={total}",
+        ));
+        return Some(SearchOutput {
+            results: Vec::new(),
+            matched: 0,
+            total,
+        });
     }
 
     if query.is_empty() {
         let append_start = Instant::now();
         let output = SearchOutput {
-            results: materialize_unfiltered(snapshot, RESULT_LIMIT),
-            matched: total,
+            results: materialize_unfiltered(snapshot, start_index..end_index, RESULT_LIMIT),
+            matched: searched,
             total,
         };
         let append_us = timing::elapsed_us(append_start);
@@ -115,7 +138,7 @@ where
     let Some(pattern) = AsciiPattern::parse(query) else {
         let total_us = timing::elapsed_us(total_start);
         timing::write(format!(
-            "search_detail mode=fuzzy total_us={total_us} parse_us=0 match_us=0 sort_us=0 append_us=0 utf8_path_estimate_us=0 ascii_score_estimate_us=0 char_fallback_estimate_us=0 heap_estimate_us=0 timing_sample_rate={SEARCH_TIMING_SAMPLE_RATE} timing_samples=0 utf8_count=0 fallback_count={total} shown=0 matched=0 total={total}",
+            "search_detail mode=fuzzy total_us={total_us} parse_us=0 match_us=0 sort_us=0 append_us=0 utf8_path_estimate_us=0 ascii_score_estimate_us=0 char_fallback_estimate_us=0 heap_estimate_us=0 timing_sample_rate={SEARCH_TIMING_SAMPLE_RATE} timing_samples=0 utf8_count=0 fallback_count={searched} shown=0 matched=0 total={total}",
         ));
         return Some(SearchOutput {
             results: Vec::new(),
@@ -139,7 +162,7 @@ where
         score_us,
         heap_us,
         cancelled,
-    ) = (0..snapshot.len())
+    ) = (start_index..end_index)
         .into_par_iter()
         .fold(
             || {
@@ -392,12 +415,17 @@ where
     })
 }
 
-fn materialize_unfiltered<S>(snapshot: Arc<S>, limit: usize) -> Vec<SearchResult>
+fn materialize_unfiltered<S>(
+    snapshot: Arc<S>,
+    range: Range<usize>,
+    limit: usize,
+) -> Vec<SearchResult>
 where
     S: ItemsSource + Send + Sync,
 {
     let mut path_buffer = Vec::with_capacity(512);
-    (0..snapshot.len().min(limit))
+    range
+        .take(limit)
         .map(|node_index| SearchResult {
             node_index,
             score: 0,

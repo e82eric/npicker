@@ -4,6 +4,9 @@ use std::os::windows::io::{FromRawHandle, OwnedHandle};
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use crate::store::{ItemsSource, PublishedSnapshot};
+use crate::view_model::ViewModel;
+use crate::walker::{ScanOptions, SharedStore, start_scan};
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 use windows::Win32::Foundation::{CloseHandle, GetLastError, HANDLE, INVALID_HANDLE_VALUE};
@@ -16,14 +19,11 @@ use windows::Win32::System::Pipes::{
     PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
 };
 use windows::core::PCWSTR;
-use crate::store::{ItemsSource, PublishedSnapshot};
-use crate::view_model::ViewModel;
-use crate::walker::{start_scan, ScanOptions, SharedStore};
 
 const PIPE_NAME: &str = r"\\.\pipe\nfm.win32.picker.v1";
 
 pub trait PickerRequest {
-    type Source : ItemsSource;
+    type Source: ItemsSource;
     fn search_string(&self) -> Option<&str>;
     fn run(&self) -> Arc<SharedStore>;
 }

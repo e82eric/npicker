@@ -4,13 +4,13 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
-use crossbeam_channel::{bounded, unbounded, Receiver, Sender};
-use windows::core::PCWSTR;
+use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
 use windows::Win32::Foundation::{HANDLE, INVALID_HANDLE_VALUE};
 use windows::Win32::Storage::FileSystem::{
-    FindClose, FindExInfoBasic, FindExSearchNameMatch, FindFirstFileExW,
-    FindNextFileW, FILE_ATTRIBUTE_DIRECTORY, FINDEX_SEARCH_OPS, FIND_FIRST_EX_LARGE_FETCH, WIN32_FIND_DATAW,
+    FILE_ATTRIBUTE_DIRECTORY, FIND_FIRST_EX_LARGE_FETCH, FINDEX_SEARCH_OPS, FindClose,
+    FindExInfoBasic, FindExSearchNameMatch, FindFirstFileExW, FindNextFileW, WIN32_FIND_DATAW,
 };
+use windows::core::PCWSTR;
 
 use crate::store::{AnyItemSource, CompactUtf8FileStore, ItemsSource};
 use crate::timing;
@@ -405,7 +405,8 @@ fn store_writer_loop(shared: Arc<SharedStore>, rx: Receiver<WriterCommand>) {
 }
 
 fn publish_snapshot(shared: &SharedStore, store: &CompactUtf8FileStore) {
-    *shared.published.write().expect("store poisoned") = Arc::new(AnyItemSource::FileSystem(store.snapshot()));
+    *shared.published.write().expect("store poisoned") =
+        Arc::new(AnyItemSource::FileSystem(store.snapshot()));
 }
 
 fn add_node_sync(
