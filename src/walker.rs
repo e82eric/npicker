@@ -49,8 +49,16 @@ impl SharedStore {
         Arc::clone(&self.published.read().expect("store poisoned"))
     }
 
+    pub fn publish(&self, source: Arc<AnyItemSource>){
+        *self.published.write().expect("store poisoned") = source;
+    }
+
     pub fn snapshot_version(&self) -> u64 {
         self.published.read().expect("store poisoned").version()
+    }
+
+    pub fn complete(&self) {
+        self.done.store(true, Ordering::Release);
     }
 
     pub fn is_done(&self) -> bool {

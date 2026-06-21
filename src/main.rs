@@ -1,8 +1,8 @@
-use std::io::{BufRead, Write};
+use std::io::Write;
 use std::sync::Arc;
 
 use anyhow::Result;
-use rust_nfm::ipc::FlatItemsPickerRequest;
+use rust_nfm::ipc::StdInRequest;
 #[cfg(feature = "skia")]
 use rust_nfm::skia_ui;
 use rust_nfm::view_model::ViewModel;
@@ -11,6 +11,10 @@ use rust_nfm::{d2d_ui, ipc};
 fn main() -> Result<()> {
     let options = app_options();
     let view_model = Arc::new(ViewModel::new());
+
+    if options.debug_wait {
+        debug_wait();
+    }
 
     if options.stdin {
         run_stdin_request(Arc::clone(&view_model))?;
@@ -30,21 +34,16 @@ fn main() -> Result<()> {
     }
 }
 
-fn run_stdin_request(view_model: Arc<ViewModel>) -> Result<()> {
-    let stdin = std::io::stdin();
-    let items = stdin
-        .lock()
-        .lines()
-        .collect::<std::io::Result<Vec<_>>>()?
-        .into_iter()
-        .filter(|line| !line.is_empty())
-        .collect();
+fn debug_wait() {
+    eprintln!("pid: {}", std::process::id());
+    eprintln!("Attach debugger now...");
+    std::thread::sleep(std::time::Duration::from_secs(20));
+}
 
+fn run_stdin_request(view_model: Arc<ViewModel>) -> Result<()> {
     std::thread::spawn(move || {
-        let request = FlatItemsPickerRequest {
-            items,
-            search_string: None,
-        };
+        let request = StdInRequest::new(None);
+
         let code = match view_model.run_request(&request) {
             Ok(response) if response.status == "selected" => {
                 if let Some(item) = response.selected_item {
@@ -86,12 +85,14 @@ enum UiBackend {
 struct AppOptions {
     ui: UiBackend,
     stdin: bool,
+    debug_wait: bool,
 }
 
 fn app_options() -> AppOptions {
     let mut options = AppOptions {
         ui: UiBackend::D2d,
         stdin: false,
+        debug_wait: false,
     };
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -103,6 +104,8 @@ fn app_options() -> AppOptions {
             };
         } else if arg == "--stdin" {
             options.stdin = true;
+        } else if arg == "--debug-wait" {
+            options.debug_wait = true;
         }
     }
 

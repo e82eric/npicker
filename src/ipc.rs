@@ -3,8 +3,8 @@ use std::io::{BufRead, BufReader, Write};
 use std::os::windows::io::{FromRawHandle, OwnedHandle};
 use std::path::PathBuf;
 use std::sync::Arc;
-
-use crate::store::{AnyItemSource, FlatSnapshot, ItemsSource, PublishedSnapshot};
+use std::thread;
+use crate::store::{AnyItemSource, FlatSnapshot, ItemsSource, PublishedSnapshot, StreamingItemSnapshot, StreamingItemStore};
 use crate::view_model::ViewModel;
 use crate::walker::{ScanOptions, SharedStore, start_scan};
 use anyhow::{Context, Result, anyhow};
@@ -87,6 +87,66 @@ impl PickerRequest for FlatItemsPickerRequest {
         Arc::new(SharedStore::completed(Arc::new(AnyItemSource::Flat(
             snapshot,
         ))))
+    }
+}
+
+pub struct StdInRequest {
+    search_string: Option<String>,
+    shared_store: Arc<SharedStore>,
+}
+
+impl StdInRequest {
+    pub fn new(search_string: Option<String>) -> Self {
+        let store = StreamingItemStore::new();
+        let wrapper = Arc::new(AnyItemSource::Streaming(store.snapshot()));
+        let shared_store = Arc::new(SharedStore::new(wrapper));
+
+        Self {
+            shared_store,
+            search_string,
+        }
+    }
+
+    fn spawn_stdin_reader(&self) {
+        let shared_store = Arc::clone(&self.shared_store);
+
+        thread::spawn(move || {
+            let mut store = StreamingItemStore::new();
+            let stdin = std::io::stdin();
+
+            for line in stdin.lock().lines() {
+                let Ok(line) = line else {
+                    break;
+                };
+
+                if line.is_empty() {
+                    continue;
+                }
+
+                let node_index = store.add_item(line.as_bytes());
+
+                if (node_index + 1) % 1_000 == 0{
+                    shared_store.publish(Arc::new(AnyItemSource::Streaming(store.snapshot())));
+                }
+            }
+
+            store.complete_adding();
+            shared_store.publish(Arc::new(AnyItemSource::Streaming(store.snapshot())));
+            shared_store.complete();
+        });
+    }
+}
+
+impl PickerRequest for StdInRequest {
+    type Source = StreamingItemSnapshot;
+
+    fn search_string(&self) -> Option<&str> {
+        self.search_string.as_deref()
+    }
+
+    fn run(&self) -> Arc<SharedStore> {
+        self.spawn_stdin_reader();
+        self.shared_store.clone()
     }
 }
 

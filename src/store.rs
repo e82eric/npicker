@@ -4,8 +4,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 const NODE_CHUNK_SIZE: usize = 64 * 1024;
 const NAME_CHUNK_SIZE: usize = 64 * 1024;
+const ITEM_CHUNK_SIZE: usize = 64 * 1024;
 const BYTE_CHUNK_SIZE: usize = 1024 * 1024;
 const PUBLISH_NODE_INTERVAL: usize = 1_000;
+const PUBLISH_ITEM_INTERVAL: usize = 1_000;
 
 #[derive(Clone, Copy, Debug)]
 pub struct Node {
@@ -133,6 +135,7 @@ pub trait ItemsSource {
 pub enum AnyItemSource {
     FileSystem(Arc<PublishedSnapshot>),
     Flat(Arc<FlatSnapshot>),
+    Streaming(Arc<StreamingItemSnapshot>),
 }
 
 impl ItemsSource for AnyItemSource {
@@ -140,6 +143,7 @@ impl ItemsSource for AnyItemSource {
         match self {
             AnyItemSource::FileSystem(source) => source.version(),
             AnyItemSource::Flat(source) => source.version(),
+            AnyItemSource::Streaming(source) => source.version(),
         }
     }
 
@@ -147,6 +151,7 @@ impl ItemsSource for AnyItemSource {
         match self {
             AnyItemSource::FileSystem(source) => source.len(),
             AnyItemSource::Flat(source) => source.len(),
+            AnyItemSource::Streaming(source) => source.len(),
         }
     }
 
@@ -154,6 +159,7 @@ impl ItemsSource for AnyItemSource {
         match self {
             AnyItemSource::FileSystem(source) => source.is_empty(),
             AnyItemSource::Flat(source) => source.is_empty(),
+            AnyItemSource::Streaming(source) => source.is_empty(),
         }
     }
 
@@ -168,6 +174,7 @@ impl ItemsSource for AnyItemSource {
                 source.get_string(index, stack_buffer, heap_buffer)
             }
             AnyItemSource::Flat(source) => source.get_string(index, stack_buffer, heap_buffer),
+            AnyItemSource::Streaming(source) => source.get_string(index, stack_buffer, heap_buffer),
         }
     }
 
@@ -175,14 +182,24 @@ impl ItemsSource for AnyItemSource {
         match self {
             AnyItemSource::FileSystem(source) => source.get_string_lossy(node_index, out),
             AnyItemSource::Flat(source) => source.get_string_lossy(node_index, out),
+            AnyItemSource::Streaming(source) => source.get_string_lossy(node_index, out),
         }
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 struct FlatItem {
     offset: usize,
     len: usize,
+}
+
+impl Default for FlatItem {
+    fn default() -> Self {
+        Self {
+            offset: 0,
+            len: 0,
+        }
+    }
 }
 
 pub struct FlatSnapshot {
@@ -222,6 +239,140 @@ impl FlatSnapshot {
         let start = item.offset;
         let end = start + item.len;
         &self.bytes[start..end]
+    }
+}
+
+pub struct StreamingItemStore {
+    items: ChunkedStorage<FlatItem>,
+    bytes: ChunkedStorage<u8>,
+    published: Arc<StreamingItemSnapshot>,
+    version: AtomicU64,
+}
+
+impl StreamingItemStore {
+    pub fn new() -> Self {
+        Self {
+            items: ChunkedStorage::new(ITEM_CHUNK_SIZE),
+            bytes: ChunkedStorage::new(BYTE_CHUNK_SIZE),
+            published: Arc::new(StreamingItemSnapshot::empty()),
+            version: AtomicU64::new(0),
+        }
+    }
+
+    pub fn add_item(&mut self, item: &[u8]) -> u32 {
+        let flat_item = FlatItem {
+            offset: self.bytes.len(),
+            len: item.len(),
+        };
+
+        let item_index = self.items.len() as u32;
+        self.bytes.extend_from_slice(item);
+        self.items.push(flat_item);
+
+        if self.items.len() % PUBLISH_ITEM_INTERVAL == 0 {
+            self.publish();
+        }
+
+        item_index
+    }
+
+    pub fn publish(&mut self) {
+        let version = self.version.fetch_add(1, Ordering::Relaxed) + 1;
+        self.published = Arc::new(StreamingItemSnapshot {
+            items: self.items.snapshot(),
+            items_count: self.items.len(),
+            bytes: self.bytes.snapshot(),
+            byte_count: self.bytes.len(),
+            version
+        });
+    }
+
+    pub fn snapshot(&self) -> Arc<StreamingItemSnapshot> {
+        Arc::clone(&self.published)
+    }
+
+    pub fn complete_adding(&mut self) {
+        self.publish();
+    }
+}
+
+pub struct StreamingItemSnapshot {
+    items: ChunkedSnapshot<FlatItem>,
+    items_count: usize,
+    bytes: ChunkedSnapshot<u8>,
+    byte_count: usize,
+    version: u64,
+}
+
+impl StreamingItemSnapshot {
+    fn empty() -> Self {
+        Self {
+            items: ChunkedSnapshot::empty(),
+            items_count: 0,
+            bytes: ChunkedSnapshot::empty(),
+            byte_count: 0,
+            version: 0,
+        }
+    }
+
+    fn copy_item_to_slice(&self, item: FlatItem ,out: &mut [u8]) {
+        debug_assert!(item.len <= out.len());
+        let mut remaining = item.len;
+        let mut offset = item.offset;
+        let mut written = 0usize;
+
+        while remaining > 0 {
+            let (chunk_index, chunk_offset) = self.bytes.locate_direct(offset);
+            let chunk = &self.bytes.chunks[chunk_index];
+            let readable = remaining.min(chunk.len() - chunk_offset);
+            out[written..written + readable].copy_from_slice(&chunk[chunk_offset..chunk_offset + readable]);
+
+            remaining -= readable;
+            offset += readable;
+            written += readable;
+        }
+    }
+}
+
+impl ItemsSource for StreamingItemSnapshot {
+    fn version(&self) -> u64 { self.version }
+
+    fn len(&self) -> usize {
+        self.items_count
+    }
+
+    fn is_empty(&self) -> bool { self.items_count == 0 }
+
+    fn get_string<'a>(&'a self, index: usize, stack_buffer: &'a mut [u8], heap_buffer: &'a mut Vec<u8>) -> &'a [u8] {
+        debug_assert!(index < self.items_count);
+        let item = self.items[index];
+        debug_assert!(item.offset + item.len <= self.byte_count);
+
+        if item.len == 0 {
+            return &stack_buffer[..0];
+        }
+
+        let (chunk_index, chunk_offset) = self.bytes.locate_direct(item.offset);
+        let chunk = &self.bytes.chunks[chunk_index];
+        let contained_in_single_chunk = chunk_offset + item.len <= chunk.len();
+        if contained_in_single_chunk {
+            return &chunk[chunk_offset..chunk_offset + item.len];
+        }
+
+        if item.len > stack_buffer.len() {
+            heap_buffer.resize(item.len, 0);
+            self.copy_item_to_slice(item, heap_buffer);
+            return heap_buffer.as_slice();
+        }
+
+        self.copy_item_to_slice(item, &mut stack_buffer[..item.len]);
+        &stack_buffer[..item.len]
+    }
+
+    fn get_string_lossy(&self, node_index: usize, out: &mut Vec<u8>) -> String {
+        let mut stack_buffer = [0u8; 4096];
+        let result = self.get_string(node_index, &mut stack_buffer, out);
+        String::from_utf8_lossy(result).into_owned()
     }
 }
 
