@@ -1,14 +1,15 @@
-use std::ffi::{CStr, CString, c_char, c_void};
+use std::ffi::{CStr, CString, c_char, c_void, c_int};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::OnceLock;
 
 #[cfg(not(feature = "skia"))]
 use crate::d2d_ui as picker_ui;
-use crate::ipc::FlatItemsPickerRequest;
+use crate::ipc::{FileSystemPickerRequest, FlatItemsPickerRequest};
 #[cfg(feature = "skia")]
 use crate::skia_ui as picker_ui;
 use crate::view_model::ViewModel;
 use std::sync::Arc;
+use std::thread;
 
 type NativeItemsAction = unsafe extern "C" fn(*mut c_void) -> *mut *mut c_char;
 type OnSelect = unsafe extern "C" fn(*mut c_char, *mut c_void);
@@ -21,6 +22,75 @@ pub extern "C" fn RustNfmInitialize() {
     let _ = catch_unwind(AssertUnwindSafe(|| {
         ensure_initialized();
     }));
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn RustNfmShowProgramsList(
+    directories: *const *const c_char,
+    directory_count: c_int,
+    on_select: Option<OnSelect>,
+    on_closed: Option<OnClosed>,
+    state: *mut c_void,
+) {
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        let view_model = ensure_initialized();
+        let root_directories = unsafe {copy_directories(directories, directory_count)};
+        let state = state as usize;
+
+        thread::spawn(move || {
+            let request = FileSystemPickerRequest {
+                command: "filesystem".to_string(),
+                root_directories,
+                max_depth: 5,
+                directories_only: false,
+                files_only: false,
+                search_string: None,
+            };
+
+            if let Ok(response) = view_model.run_request(&request)
+                && response.status == "selected"
+                && let (Some(on_select), Some(selected)) = (on_select, response.selected_item)
+                && let Ok(selected) = CString::new(selected)  {
+
+                unsafe {
+                    on_select(selected.as_ptr() as *mut c_char, state as *mut c_void);
+                }
+            }
+
+            if let Some(on_closed) = on_closed {
+                unsafe {
+                    on_closed();
+                }
+            }
+        });
+    }));
+}
+
+unsafe fn copy_directories(
+    directories: *const *const c_char,
+    directory_count: c_int,
+) -> Vec<String> {
+    if directories.is_null() || directory_count <= 0 {
+        return Vec::new();
+    }
+
+    let mut result = Vec::with_capacity(directory_count as usize);
+
+    for i in 0..directory_count as usize{
+        let ptr = unsafe {*directories.add(i)};
+
+        if ptr.is_null() {
+            continue;
+        }
+
+        let value = unsafe { CStr::from_ptr(ptr) }
+            .to_string_lossy()
+            .into_owned();
+
+        result.push(value);
+    }
+
+    result
 }
 
 #[unsafe(no_mangle)]
