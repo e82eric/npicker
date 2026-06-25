@@ -233,19 +233,6 @@ where
 
                 let time_sample = (node_index & (SEARCH_TIMING_SAMPLE_RATE - 1)) == 0;
                 let path_start = time_sample.then(Instant::now);
-                // let stack_path = snapshot.path_utf8_stack(
-                //     node_index,
-                //     &mut *stack_path_buffer,
-                // );
-                // let path_bytes = if let Some(path) = stack_path {
-                //     path
-                // } else {
-                //     snapshot.path_utf8_with_segments(
-                //         node_index,
-                //         &mut path_buffer,
-                //     );
-                //     &path_buffer
-                // };
                 let path_bytes =
                     snapshot.get_string(node_index, &mut stack_path_buffer[..], &mut path_buffer);
                 if let Some(path_start) = path_start {

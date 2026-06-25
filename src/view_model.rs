@@ -1,6 +1,7 @@
 use std::ops::Range;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::thread;
 use std::time::Duration;
 
 use crate::ipc::{PickerRequest, PickerResponse};
@@ -41,9 +42,8 @@ pub struct UiUpdate {
 pub struct ViewModel {
     state: Mutex<State>,
     request_generation: AtomicU64,
-    search_version: AtomicU64,
-    search_signal_tx: Sender<()>,
-    search_signal_rx: Receiver<()>,
+    search_update_tx: Sender<SearchUpdate>,
+    search_update_rx: Receiver<SearchUpdate>,
     events_tx: Sender<UiEvent>,
     events_rx: Receiver<UiEvent>,
 }
@@ -75,8 +75,8 @@ pub struct KeyModifiers {
 
 struct ActiveRequest {
     id: u64,
-    store: Arc<SharedStore>,
     response_tx: Sender<PickerResponse>,
+    search_session: FuzzySearchSession,
 }
 
 #[derive(Default)]
@@ -88,10 +88,11 @@ struct SearchCache {
 }
 
 impl ViewModel {
-    pub fn new() -> Self {
+    pub fn new() -> Arc<Self> {
         let (events_tx, events_rx) = unbounded();
-        let (search_signal_tx, search_signal_rx) = bounded(1);
-        Self {
+        let (search_update_tx, search_update_rx) = unbounded();
+
+        let this = Arc::new(Self {
             state: Mutex::new(State {
                 active: None,
                 search_text: String::new(),
@@ -103,12 +104,25 @@ impl ViewModel {
                 cursor_selection_anchor: None,
             }),
             request_generation: AtomicU64::new(0),
-            search_version: AtomicU64::new(0),
-            search_signal_tx,
-            search_signal_rx,
+            search_update_tx,
+            search_update_rx,
             events_tx,
             events_rx,
-        }
+        });
+
+        this.spawn_search_update_thread();
+        this
+    }
+
+    fn spawn_search_update_thread(self: &Arc<Self>) {
+        let this= Arc::clone(self);
+        let rx = this.search_update_rx.clone();
+
+        thread::spawn(move || {
+            while let Ok(event) = rx.recv() {
+                this.apply_search_update(event);
+            }
+        });
     }
 
     pub fn subscribe(&self) -> Receiver<UiEvent> {
@@ -127,33 +141,38 @@ impl ViewModel {
         timing::write(format!("begin_request search_len={search_len}",));
 
         let request_id = self.request_generation.fetch_add(1, Ordering::AcqRel) + 1;
-        self.search_version.store(0, Ordering::Release);
         let (response_tx, response_rx) = unbounded();
         let store = request.run();
 
+        let query = request.search_string().unwrap_or_default().to_owned();
+        let session = FuzzySearchSession::new(
+            request_id,
+            Arc::clone(&store),
+            query.clone(),
+            self.search_update_tx.clone());
         {
             let mut state = self.state.lock().expect("view model poisoned");
             if state.active.is_some() {
                 bail!("A picker request is already active.");
             }
 
-            state.search_text = request.search_string().unwrap_or_default().to_owned();
+            let cursor_position = query.len();
+            state.search_text = query;
             state.results.clear();
             state.counters = UiCounters::default();
             state.selected = 0;
             state.cursor_selection_anchor = None;
-            state.cursor_position = 0;
+            state.cursor_position = cursor_position;
             state.viewport_start = 0;
             state.active = Some(ActiveRequest {
                 id: request_id,
-                store: Arc::clone(&store),
                 response_tx,
+                search_session: session.clone()
             });
         }
 
         let _ = self.events_tx.send(UiEvent::Show);
-        self.signal_search();
-        self.spawn_search_loop(request_id);
+        session.start();
 
         let response = response_rx
             .recv()
@@ -162,37 +181,52 @@ impl ViewModel {
         Ok(response)
     }
 
+    fn update_search_text(self: &Arc<Self>, update: impl FnOnce(&mut State) -> bool) {
+        let search_update = {
+            let mut state = self.state.lock().expect("view model poisoned");
+
+            let changed = update(&mut state);
+
+            if changed {
+                state.selected = 0;
+                state.viewport_start = 0;
+
+                state.active.as_ref().map(|active| {
+                    (active.search_session.clone(),
+                    state.search_text.clone())
+                })
+            } else {
+                None
+            }
+        };
+
+        if let Some((search_session, search_text)) = search_update {
+            search_session.set_query(search_text);
+        }
+    }
+
     pub fn handle_char(self: &Arc<Self>, ch: usize) {
         match ch as u32 {
             0x7f => {}
             13 | 27 => {}
             ch if ch >= 0x20 => {
-                if let Some(ch) = char::from_u32(ch) {
-                    let changed = {
-                        let mut state = self.state.lock().expect("view model poisoned");
+                let Some(ch) = char::from_u32(ch) else {
+                    return;
+                };
 
-                        let cursor = state.cursor_position;
+                self.update_search_text(|state|{
+                    let cursor = state.cursor_position;
 
-                        if cursor <= state.search_text.len()
-                            && state.search_text.is_char_boundary(cursor)
-                        {
-                            state.search_text.insert(cursor, ch);
-                            state.cursor_position = cursor + ch.len_utf8();
-
-                            state.selected = 0;
-                            state.viewport_start = 0;
-
-                            true
-                        } else {
-                            false
-                        }
-                    };
-
-                    if changed {
-                        self.search_version.fetch_add(1, Ordering::AcqRel);
-                        self.signal_search();
+                    if cursor > state.search_text.len() ||
+                        !state.search_text.is_char_boundary(cursor) {
+                        return false;
                     }
-                }
+
+                    state.search_text.insert(cursor, ch);
+                    state.cursor_position = cursor + ch.len_utf8();
+
+                    true
+                });
             }
 
             _ => {}
@@ -222,98 +256,88 @@ impl ViewModel {
     }
 
     fn handle_backspace(self: &Arc<Self>, modifiers: KeyModifiers) {
-        let changed = {
-            let mut state = self.state.lock().expect("view model poisoned");
-
+        self.update_search_text(|state|{
             if modifiers.ctrl {
-                Self::move_cursor_previous_word_in_state(&mut state, true);
+                //TODO: update to calculate this instead of relying of selection
+                Self::move_cursor_previous_word_in_state(state, true);
             }
 
             let cursor = state.cursor_position;
 
             if (cursor == 0 && state.cursor_selection_anchor.is_none())
                 || cursor > state.search_text.len()
+                || !state.search_text.is_char_boundary(cursor)
             {
-                false
-            } else if !state.search_text.is_char_boundary(cursor) {
-                false
-            } else {
-                if let Some(selection) = state.cursor_selection_anchor {
-                    let start = selection.min(cursor);
-                    let end = selection.max(cursor);
-                    state.search_text.replace_range(start..end, "");
-                    state.cursor_selection_anchor = None;
-                    state.cursor_position = start;
-                    true
-                } else {
-                    let prev_cursor = state.search_text[..cursor]
-                        .char_indices()
-                        .last()
-                        .map(|(i, _)| i);
-
-                    if let Some(prev_cursor) = prev_cursor {
-                        state.search_text.drain(prev_cursor..cursor);
-                        state.cursor_position = prev_cursor;
-
-                        state.selected = 0;
-                        state.viewport_start = 0;
-
-                        true
-                    } else {
-                        false
-                    }
-                }
+                return false;
             }
-        };
 
-        if changed {
-            self.search_version.fetch_add(1, Ordering::AcqRel);
-            self.signal_search();
-        }
+            if let Some(selection) = state.cursor_selection_anchor {
+                let start = selection.min(cursor);
+                let end = selection.max(cursor);
+
+                if !state.search_text.is_char_boundary(start)
+                    || !state.search_text.is_char_boundary(end)
+                {
+                    return false;
+                }
+
+                state.search_text.replace_range(start..end, "");
+                state.cursor_selection_anchor = None;
+                state.cursor_position = start;
+                return true
+            }
+
+            let Some(prev_cursor) = state.search_text[..cursor]
+                .char_indices()
+                .last()
+                .map(|(i, _)| i)
+            else {
+                return false;
+            };
+
+            state.search_text.drain(prev_cursor..cursor);
+            state.cursor_position = prev_cursor;
+
+            true
+        });
     }
 
     fn handle_delete(self: &Arc<Self>, modifiers: KeyModifiers) {
-        let changed = {
-            let mut state = self.state.lock().expect("view model poisoned");
-
+        self.update_search_text(|state|{
             if modifiers.ctrl {
-                Self::move_cursor_next_word_in_state(&mut state, true);
+                Self::move_cursor_next_word_in_state(state, true);
             }
 
             let cursor = state.cursor_position;
 
             if (cursor == state.search_text.len() && state.cursor_selection_anchor.is_none())
                 || cursor > state.search_text.len()
+                || !state.search_text.is_char_boundary(cursor)
             {
-                false
-            } else if !state.search_text.is_char_boundary(cursor) {
-                false
-            } else {
-                if let Some(selection) = state.cursor_selection_anchor {
-                    let start = selection.min(cursor);
-                    let end = selection.max(cursor);
-                    state.search_text.replace_range(start..end, "");
-                    state.cursor_selection_anchor = None;
-                    state.cursor_position = start;
-                    true
-                } else {
-                    if let Some(ch) = state.search_text[cursor..].chars().next() {
-                        let next_cursor = cursor + ch.len_utf8();
-                        state.search_text.replace_range(cursor..next_cursor, "");
-                        state.selected = 0;
-                        state.viewport_start = 0;
-                        true
-                    } else {
-                        false
-                    }
-                }
+                return false;
             }
-        };
+            if let Some(selection) = state.cursor_selection_anchor {
+                let start = selection.min(cursor);
+                let end = selection.max(cursor);
 
-        if changed {
-            self.search_version.fetch_add(1, Ordering::AcqRel);
-            self.signal_search();
-        }
+                if !state.search_text.is_char_boundary(start)
+                    || !state.search_text.is_char_boundary(end) {
+                    return false;
+                }
+
+                state.search_text.replace_range(start..end, "");
+                state.cursor_selection_anchor = None;
+                state.cursor_position = start;
+                return true;
+            }
+
+            let Some(ch) = state.search_text[cursor..].chars().next() else {
+                return false;
+            };
+            let next_cursor = cursor + ch.len_utf8();
+            state.search_text.replace_range(cursor..next_cursor, "");
+            true
+        });
     }
 
     pub fn move_selection(&self, delta: isize) {
@@ -467,7 +491,7 @@ impl ViewModel {
     }
 
     pub fn select_current(&self) {
-        {
+        let session_to_stop = {
             let mut state = self.state.lock().expect("view model poisoned");
             if let Some(active) = state.active.take() {
                 let response = state
@@ -476,21 +500,34 @@ impl ViewModel {
                     .map(|result| PickerResponse::selected(result.path.clone()))
                     .unwrap_or_else(PickerResponse::cancelled);
                 let _ = active.response_tx.send(response);
+                Some(active.search_session)
+            } else {
+                None
             }
+        };
+
+        if let Some(session_to_stop) = session_to_stop {
+            session_to_stop.stop();
         }
 
-        self.request_generation.fetch_add(1, Ordering::AcqRel);
-        self.signal_search();
         let _ = self.events_tx.send(UiEvent::Close);
     }
 
     pub fn cancel(&self) {
-        let mut state = self.state.lock().expect("view model poisoned");
-        if let Some(active) = state.active.take() {
-            let _ = active.response_tx.send(PickerResponse::cancelled());
+        let session_to_stop = {
+            let mut state = self.state.lock().expect("view model poisoned");
+            if let Some(active) = state.active.take() {
+                let _ = active.response_tx.send(PickerResponse::cancelled());
+                Some(active.search_session)
+            } else {
+                None
+            }
+        };
+
+        if let Some(session_to_stop) = session_to_stop {
+            session_to_stop.stop();
         }
-        self.request_generation.fetch_add(1, Ordering::AcqRel);
-        self.signal_search();
+
         let _ = self.events_tx.send(UiEvent::Close);
     }
 
@@ -521,132 +558,27 @@ impl ViewModel {
         }
     }
 
-    fn signal_search(&self) {
-        let _ = self.search_signal_tx.try_send(());
-    }
-
-    fn spawn_search_loop(self: &Arc<Self>, request_id: u64) {
-        let this = Arc::clone(self);
-
-        std::thread::spawn(move || {
-            let mut last_completed_version = None;
-            let mut last_snapshot_version = None;
-            let mut cache = SearchCache::default();
-            loop {
-                if this.request_generation.load(Ordering::Acquire) != request_id {
-                    return;
-                }
-
-                let (version, snapshot_version, scanning) = {
-                    let state = this.state.lock().expect("view model poisoned");
-                    let Some(active) = state.active.as_ref() else {
-                        return;
-                    };
-                    if active.id != request_id {
-                        return;
-                    }
-                    (
-                        this.search_version.load(Ordering::Acquire),
-                        active.store.snapshot_version(),
-                        !active.store.is_done(),
-                    )
-                };
-
-                if last_completed_version != Some(version)
-                    || last_snapshot_version != Some(snapshot_version)
-                {
-                    this.run_search_generation(request_id, version, &mut cache);
-                    last_completed_version = Some(version);
-                    last_snapshot_version = Some(snapshot_version);
-                }
-
-                if scanning {
-                    let _ = this
-                        .search_signal_rx
-                        .recv_timeout(Duration::from_millis(50));
-                } else if this
-                    .search_signal_rx
-                    .recv_timeout(Duration::from_millis(250))
-                    .is_err()
-                {
-                    // Periodically re-check request lifetime even when the source is complete.
-                }
-            }
-        });
-    }
-
-    fn run_search_generation(&self, request_id: u64, version: u64, cache: &mut SearchCache) {
-        let (store, query) = {
-            let state = self.state.lock().expect("view model poisoned");
-            let Some(active) = state.active.as_ref() else {
-                return;
-            };
-            if active.id != request_id {
-                return;
-            }
-            (Arc::clone(&active.store), state.search_text.clone())
-        };
-
-        let snapshot = store.snapshot();
-        let scanning = !store.is_done();
-        let total = snapshot.len();
-        let use_incremental = cache.query == query && cache.searched_len <= total;
-        let output = if use_incremental {
-            let Some(delta) = search_range(
-                Arc::clone(&snapshot),
-                &query,
-                cache.searched_len..total,
-                || {
-                    self.request_generation.load(Ordering::Acquire) != request_id
-                        || self.search_version.load(Ordering::Acquire) != version
-                },
-            ) else {
-                return;
-            };
-            merge_cached_search(cache, &query, delta)
-        } else {
-            let Some(output) = search(Arc::clone(&snapshot), &query, || {
-                self.request_generation.load(Ordering::Acquire) != request_id
-                    || self.search_version.load(Ordering::Acquire) != version
-            }) else {
-                return;
-            };
-            *cache = SearchCache {
-                query: query.clone(),
-                searched_len: output.total,
-                results: output.results.clone(),
-                matched: output.matched,
-            };
-            output
-        };
-        if self.request_generation.load(Ordering::Acquire) != request_id
-            || self.search_version.load(Ordering::Acquire) != version
-        {
-            return;
-        }
-
-        let counters = UiCounters {
-            displayed: output.results.len(),
-            matched: output.matched,
-            published: output.total,
-            scanning,
-        };
-
-        {
+    fn apply_search_update(&self, search_update: SearchUpdate) {
+        let ui_update = {
             let mut state = self.state.lock().expect("view model poisoned");
+
             let Some(active) = state.active.as_ref() else {
                 return;
             };
-            if active.id != request_id {
+
+            if search_update.request_id != active.id {
                 return;
             }
-            state.results = output.results;
-            state.counters = counters.clone();
+
+            state.results = search_update.results;
+            state.counters = search_update.counters;
             state.selected = state.selected.min(state.results.len().saturating_sub(1));
             state.ensure_selection_visible();
-            let update = state.visible_update();
-            let _ = self.events_tx.send(UiEvent::Results(update));
-        }
+
+            let ui_update = state.visible_update();
+            ui_update
+        };
+        let _ = self.events_tx.send(UiEvent::Results( ui_update));
     }
 }
 
@@ -723,5 +655,169 @@ impl State {
             },
             selected_row,
         }
+    }
+}
+
+struct SearchUpdate {
+    pub request_id: u64,
+    pub results: Vec<SearchResult>,
+    pub counters: UiCounters,
+}
+
+#[derive(Clone)]
+struct FuzzySearchSession {
+    inner: Arc<FuzzySearcherInner>,
+}
+
+struct FuzzySearcherInner {
+    request_id: u64,
+    store: Arc<SharedStore>,
+    query: Mutex<String>,
+    search_version: AtomicU64,
+    cancelled: AtomicBool,
+
+    signal_tx: Sender<()>,
+    signal_rx: Receiver<()>,
+    updates_tx: Sender<SearchUpdate>,
+}
+
+impl FuzzySearchSession {
+    pub fn new(request_id: u64, store: Arc<SharedStore>, initial_query: String, updates_tx: Sender<SearchUpdate>) -> Self {
+        let (signal_tx, signal_rx) = bounded(1);
+        Self {
+            inner: Arc::new(FuzzySearcherInner {
+                request_id,
+                store,
+                query: Mutex::new(initial_query),
+                search_version: AtomicU64::new(0),
+                cancelled: AtomicBool::new(false),
+                signal_tx,
+                signal_rx,
+                updates_tx
+            }),
+        }
+    }
+
+    pub fn start(&self) {
+        let inner = Arc::clone(&self.inner);
+
+        thread::spawn(move || {
+            inner.run_loop();
+        });
+
+        self.signal();
+    }
+
+    pub fn stop(&self) {
+        self.inner.cancelled.store(true, Ordering::Release);
+        self.signal();
+    }
+
+    pub fn set_query(&self, query: String) {
+        {
+            let mut current = self.inner.query.lock().expect("search query poisoned");
+            if *current == query {
+                return;
+            }
+
+            *current = query;
+        }
+
+        self.inner.search_version.fetch_add(1, Ordering::AcqRel);
+        self.signal();
+    }
+
+    fn signal(&self) {
+        let _ = self.inner.signal_tx.try_send(());
+    }
+}
+
+impl FuzzySearcherInner {
+    fn run_loop(self: &Arc<Self>) {
+        let mut last_completed_version = None;
+        let mut last_snapshot_version = None;
+        let mut cache = SearchCache::default();
+        loop {
+            if self.cancelled.load(Ordering::Acquire) {
+                return;
+            }
+
+            let (version, snapshot_version, scanning) = {
+                (
+                    self.search_version.load(Ordering::Acquire),
+                    self.store.snapshot_version(),
+                    !self.store.is_done(),
+                )
+            };
+
+            if last_completed_version != Some(version)
+                || last_snapshot_version != Some(snapshot_version)
+            {
+                self.run_search_generation(version, &mut cache);
+                last_completed_version = Some(version);
+                last_snapshot_version = Some(snapshot_version);
+            }
+
+            let timeout = if scanning {
+                Duration::from_millis(50)
+            } else {
+                Duration::from_millis(250)
+            };
+
+            let _ = self.signal_rx.recv_timeout(timeout);
+        }
+    }
+
+    fn run_search_generation(&self, version: u64, cache: &mut SearchCache) {
+        let query = self.query.lock().expect("search query poisoned").clone();
+
+        let snapshot = self.store.snapshot();
+        let scanning = !self.store.is_done();
+        let total = snapshot.len();
+
+        let should_cancel = || {
+            self.cancelled.load(Ordering::Acquire) ||
+                self.search_version.load(Ordering::Acquire) != version
+        };
+
+        let use_incremental = cache.query == query && cache.searched_len <= total;
+        let output = if use_incremental {
+            let Some(delta) = search_range(
+                Arc::clone(&snapshot),
+                &query,
+                cache.searched_len..total,
+                should_cancel,
+            ) else {
+                return;
+            };
+            merge_cached_search(cache, &query, delta)
+        } else {
+            let Some(output) = search(Arc::clone(&snapshot), &query, should_cancel) else {
+                return;
+            };
+            *cache = SearchCache {
+                query,
+                searched_len: output.total,
+                results: output.results.clone(),
+                matched: output.matched,
+            };
+            output
+        };
+        if should_cancel() {
+            return;
+        }
+
+        let counters = UiCounters {
+            displayed: output.results.len(),
+            matched: output.matched,
+            published: output.total,
+            scanning,
+        };
+
+        let _ = self.updates_tx.send(SearchUpdate{
+            request_id: self.request_id,
+            results: output.results,
+            counters,
+        });
     }
 }

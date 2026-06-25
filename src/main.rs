@@ -10,7 +10,7 @@ use rust_nfm::{d2d_ui, ipc};
 
 fn main() -> Result<()> {
     let options = app_options();
-    let view_model = Arc::new(ViewModel::new());
+    let view_model = ViewModel::new();
 
     if options.debug_wait {
         debug_wait();

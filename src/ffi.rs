@@ -147,7 +147,7 @@ pub extern "C" fn RustNfmSetMenuLocation(x: i32, y: i32) {
 
 fn ensure_initialized() -> Arc<ViewModel> {
     Arc::clone(VIEW_MODEL.get_or_init(|| {
-        let view_model = Arc::new(ViewModel::new());
+        let view_model = ViewModel::new();
         let ui_view_model = Arc::clone(&view_model);
         std::thread::spawn(move || {
             if let Err(error) = picker_ui::run(ui_view_model) {
