@@ -3,8 +3,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-use crate::fuzzy_search_session::{FuzzySearchSession, SearchCounters, SearchUpdate};
+use crate::fuzzy_search_session::{FuzzySearchSession, FuzzySearchUpdate};
 use crate::ipc::{PickerRequest, PickerResponse};
+use crate::source_store::{AnyItemSource, SharedStore};
 use anyhow::{Result, bail};
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use nfm_search_core::search::{DISPLAY_LIMIT, SearchResult};
@@ -20,7 +21,13 @@ pub enum UiEvent {
     Close,
 }
 
-pub type UiCounters = SearchCounters;
+#[derive(Clone, Debug, Default)]
+pub struct UiCounters {
+    pub displayed: usize,
+    pub matched: usize,
+    pub published: usize,
+    pub scanning: bool,
+}
 
 #[derive(Clone, Debug, Default)]
 pub struct UiUpdate {
@@ -32,8 +39,8 @@ pub struct UiUpdate {
 pub struct ViewModel {
     state: Mutex<State>,
     request_generation: AtomicU64,
-    search_update_tx: Sender<SearchUpdate>,
-    search_update_rx: Receiver<SearchUpdate>,
+    search_update_tx: Sender<FuzzySearchUpdate>,
+    search_update_rx: Receiver<FuzzySearchUpdate>,
     events_tx: Sender<UiEvent>,
     events_rx: Receiver<UiEvent>,
 }
@@ -66,7 +73,7 @@ pub struct KeyModifiers {
 struct ActiveRequest {
     id: u64,
     response_tx: Sender<PickerResponse>,
-    search_session: FuzzySearchSession,
+    search_session: FuzzySearchSession<AnyItemSource, SharedStore>,
 }
 
 impl ViewModel {
@@ -543,7 +550,7 @@ impl ViewModel {
         }
     }
 
-    fn apply_search_update(&self, search_update: SearchUpdate) {
+    fn apply_search_update(&self, search_update: FuzzySearchUpdate) {
         let ui_update = {
             let mut state = self.state.lock().expect("view model poisoned");
 
@@ -551,12 +558,17 @@ impl ViewModel {
                 return;
             };
 
-            if search_update.request_id != active.id {
+            if search_update.session_id != active.id {
                 return;
             }
 
             state.results = search_update.results;
-            state.counters = search_update.counters;
+            state.counters = UiCounters {
+                displayed: state.results.len(),
+                matched: search_update.matched,
+                published: search_update.searched,
+                scanning: !search_update.source_done,
+            };
             state.selected = state.selected.min(state.results.len().saturating_sub(1));
             state.ensure_selection_visible();
 

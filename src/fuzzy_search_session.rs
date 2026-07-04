@@ -1,3 +1,4 @@
+use std::marker::PhantomData;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -7,38 +8,50 @@ use crossbeam_channel::{Receiver, Sender, bounded};
 use nfm_search_core::search::{RESULT_LIMIT, SearchOutput, SearchResult, search, search_range};
 use nfm_search_core::store::ItemsSource;
 
-use crate::source_store::SharedStore;
-
-#[derive(Clone, Debug, Default)]
-pub struct SearchCounters {
-    pub displayed: usize,
-    pub matched: usize,
-    pub published: usize,
-    pub scanning: bool,
+pub trait SearchSnapshotProvider<S>: Send + Sync + 'static
+where
+    S: ItemsSource + Send + Sync + 'static,
+{
+    fn snapshot(&self) -> Option<Arc<S>>;
+    fn snapshot_version(&self) -> u64;
+    fn is_done(&self) -> bool;
 }
 
 #[derive(Clone, Debug)]
-pub struct SearchUpdate {
-    pub request_id: u64,
+pub struct FuzzySearchUpdate {
+    pub session_id: u64,
+    pub generation: u64,
     pub results: Vec<SearchResult>,
-    pub counters: SearchCounters,
+    pub matched: usize,
+    pub searched: usize,
+    pub total: usize,
+    pub source_version: u64,
+    pub source_done: bool,
 }
 
-#[derive(Clone)]
-pub struct FuzzySearchSession {
-    inner: Arc<FuzzySearcherInner>,
+pub struct FuzzySearchSession<S, P>
+where
+    S: ItemsSource + Send + Sync + 'static,
+    P: SearchSnapshotProvider<S>,
+{
+    inner: Arc<FuzzySearcherInner<S, P>>,
 }
 
-struct FuzzySearcherInner {
-    request_id: u64,
-    store: Arc<SharedStore>,
+struct FuzzySearcherInner<S, P>
+where
+    S: ItemsSource + Send + Sync + 'static,
+    P: SearchSnapshotProvider<S>,
+{
+    session_id: u64,
+    provider: Arc<P>,
     query: Mutex<String>,
     search_version: AtomicU64,
     cancelled: AtomicBool,
 
     signal_tx: Sender<()>,
     signal_rx: Receiver<()>,
-    updates_tx: Sender<SearchUpdate>,
+    updates_tx: Sender<FuzzySearchUpdate>,
+    _snapshot: PhantomData<S>,
 }
 
 #[derive(Default)]
@@ -49,24 +62,41 @@ struct SearchCache {
     matched: usize,
 }
 
-impl FuzzySearchSession {
+impl<S, P> Clone for FuzzySearchSession<S, P>
+where
+    S: ItemsSource + Send + Sync + 'static,
+    P: SearchSnapshotProvider<S>,
+{
+    fn clone(&self) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+        }
+    }
+}
+
+impl<S, P> FuzzySearchSession<S, P>
+where
+    S: ItemsSource + Send + Sync + 'static,
+    P: SearchSnapshotProvider<S>,
+{
     pub fn new(
-        request_id: u64,
-        store: Arc<SharedStore>,
+        session_id: u64,
+        provider: Arc<P>,
         initial_query: String,
-        updates_tx: Sender<SearchUpdate>,
+        updates_tx: Sender<FuzzySearchUpdate>,
     ) -> Self {
         let (signal_tx, signal_rx) = bounded(1);
         Self {
             inner: Arc::new(FuzzySearcherInner {
-                request_id,
-                store,
+                session_id,
+                provider,
                 query: Mutex::new(initial_query),
                 search_version: AtomicU64::new(0),
                 cancelled: AtomicBool::new(false),
                 signal_tx,
                 signal_rx,
                 updates_tx,
+                _snapshot: PhantomData,
             }),
         }
     }
@@ -105,7 +135,11 @@ impl FuzzySearchSession {
     }
 }
 
-impl FuzzySearcherInner {
+impl<S, P> FuzzySearcherInner<S, P>
+where
+    S: ItemsSource + Send + Sync + 'static,
+    P: SearchSnapshotProvider<S>,
+{
     fn run_loop(self: &Arc<Self>) {
         let mut last_completed_version = None;
         let mut last_snapshot_version = None;
@@ -118,15 +152,15 @@ impl FuzzySearcherInner {
             let (version, snapshot_version, scanning) = {
                 (
                     self.search_version.load(Ordering::Acquire),
-                    self.store.snapshot_version(),
-                    !self.store.is_done(),
+                    self.provider.snapshot_version(),
+                    !self.provider.is_done(),
                 )
             };
 
             if last_completed_version != Some(version)
                 || last_snapshot_version != Some(snapshot_version)
             {
-                self.run_search_generation(version, &mut cache);
+                self.run_search_generation(version, snapshot_version, &mut cache);
                 last_completed_version = Some(version);
                 last_snapshot_version = Some(snapshot_version);
             }
@@ -141,14 +175,14 @@ impl FuzzySearcherInner {
         }
     }
 
-    fn run_search_generation(&self, version: u64, cache: &mut SearchCache) {
+    fn run_search_generation(&self, version: u64, snapshot_version: u64, cache: &mut SearchCache) {
         let query = self.query.lock().expect("search query poisoned").clone();
 
-        let Some(snapshot) = self.store.snapshot() else {
+        let Some(snapshot) = self.provider.snapshot() else {
             return;
         };
 
-        let scanning = !self.store.is_done();
+        let source_done = self.provider.is_done();
         let total = snapshot.len();
 
         let should_cancel = || {
@@ -183,17 +217,15 @@ impl FuzzySearcherInner {
             return;
         }
 
-        let counters = SearchCounters {
-            displayed: output.results.len(),
-            matched: output.matched,
-            published: output.total,
-            scanning,
-        };
-
-        let _ = self.updates_tx.send(SearchUpdate {
-            request_id: self.request_id,
+        let _ = self.updates_tx.send(FuzzySearchUpdate {
+            session_id: self.session_id,
+            generation: version,
             results: output.results,
-            counters,
+            matched: output.matched,
+            searched: output.total,
+            total,
+            source_version: snapshot_version,
+            source_done,
         });
     }
 }

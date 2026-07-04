@@ -1,3 +1,4 @@
+use crate::fuzzy_search_session::SearchSnapshotProvider;
 use nfm_file_system::walker::PublishedSnapshot;
 use nfm_search_core::store::{FlatSnapshot, ItemsSource, StreamingItemSnapshot};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -100,5 +101,19 @@ impl SharedStore {
 
     pub fn is_done(&self) -> bool {
         self.done.load(Ordering::Acquire)
+    }
+}
+
+impl SearchSnapshotProvider<AnyItemSource> for SharedStore {
+    fn snapshot(&self) -> Option<Arc<AnyItemSource>> {
+        SharedStore::snapshot(self)
+    }
+
+    fn snapshot_version(&self) -> u64 {
+        SharedStore::snapshot_version(self)
+    }
+
+    fn is_done(&self) -> bool {
+        SharedStore::is_done(self)
     }
 }
