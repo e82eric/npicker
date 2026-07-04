@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
@@ -13,7 +13,7 @@ use windows::Win32::Storage::FileSystem::{
 };
 use windows::core::PCWSTR;
 
-use nfm_search_core::store::{ ItemsSource, ChunkedStorage, ChunkedSnapshot};
+use nfm_search_core::store::{ChunkedSnapshot, ChunkedStorage, ItemsSource};
 use nfm_search_core::timing;
 
 const NODE_CHUNK_SIZE: usize = 64 * 1024;
@@ -202,7 +202,6 @@ impl PublishedSnapshot {
     }
 }
 
-
 pub struct CompactUtf8FileStore {
     nodes: ChunkedStorage<Node>,
     names: ChunkedStorage<Name>,
@@ -326,17 +325,21 @@ enum WriterCommand {
     },
 }
 
-pub fn start_scan<P, C>(options: ScanOptions, publisher: P, on_complete: C) where
-    P : Fn(Arc<PublishedSnapshot>) + Send + Sync + 'static,
-    C : Fn() + Send + Sync + 'static {
+pub fn start_scan<P, C>(options: ScanOptions, publisher: P, on_complete: C)
+where
+    P: Fn(Arc<PublishedSnapshot>) + Send + Sync + 'static,
+    C: Fn() + Send + Sync + 'static,
+{
     std::thread::spawn(move || {
         scan(options, publisher, on_complete);
     });
 }
 
-fn scan<P, C>(options: ScanOptions, publisher: P, on_complete: C) where
-    P : Fn(Arc<PublishedSnapshot>) + Send + Sync + 'static,
-    C : Fn() + Send + Sync + 'static {
+fn scan<P, C>(options: ScanOptions, publisher: P, on_complete: C)
+where
+    P: Fn(Arc<PublishedSnapshot>) + Send + Sync + 'static,
+    C: Fn() + Send + Sync + 'static,
+{
     let (tx, rx) = unbounded();
     let (writer_tx, writer_rx) = unbounded();
     let pending = Arc::new(AtomicUsize::new(0));
@@ -486,8 +489,7 @@ fn scan_directory(
                             }
                         }
                     } else if is_dir {
-                        let child_index =
-                            add_node_sync(writer_tx, work.node_index, name.clone());
+                        let child_index = add_node_sync(writer_tx, work.node_index, name.clone());
                         let child_path = make_child_path(&work.path, name.as_bytes());
                         pending.fetch_add(1, Ordering::AcqRel);
                         if tx
@@ -513,9 +515,11 @@ fn scan_directory(
     }
 }
 
-fn store_writer_loop<P, C>(rx: Receiver<WriterCommand>, publisher: P, on_complete: C) where
-    P : Fn(Arc<PublishedSnapshot>) + Send + Sync + 'static,
-    C : Fn() + Send + Sync + 'static {
+fn store_writer_loop<P, C>(rx: Receiver<WriterCommand>, publisher: P, on_complete: C)
+where
+    P: Fn(Arc<PublishedSnapshot>) + Send + Sync + 'static,
+    C: Fn() + Send + Sync + 'static,
+{
     let mut store = CompactUtf8FileStore::new();
     while let Ok(command) = rx.recv() {
         match command {
@@ -540,11 +544,7 @@ fn store_writer_loop<P, C>(rx: Receiver<WriterCommand>, publisher: P, on_complet
     on_complete();
 }
 
-fn add_node_sync(
-    writer_tx: &Sender<WriterCommand>,
-    parent: i32,
-    name: String,
-) -> u32 {
+fn add_node_sync(writer_tx: &Sender<WriterCommand>, parent: i32, name: String) -> u32 {
     let (response_tx, response_rx) = bounded(1);
     let sent = writer_tx.send(WriterCommand::Add {
         parent,
@@ -559,11 +559,7 @@ fn add_node_sync(
     node_index
 }
 
-fn add_node_async(
-    writer_tx: &Sender<WriterCommand>,
-    parent: i32,
-    name: String,
-) {
+fn add_node_async(writer_tx: &Sender<WriterCommand>, parent: i32, name: String) {
     let _ = writer_tx.send(WriterCommand::Add {
         parent,
         name,

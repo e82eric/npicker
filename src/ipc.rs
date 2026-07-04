@@ -1,14 +1,17 @@
+use crate::source_store::{AnyItemSource, SharedStore};
+use crate::view_model::ViewModel;
+use anyhow::{Context, Result, anyhow};
+use nfm_file_system::walker::{PublishedSnapshot, ScanOptions, start_scan};
+use nfm_search_core::store::{
+    FlatSnapshot, ItemsSource, StreamingItemSnapshot, StreamingItemStore,
+};
+use serde::{Deserialize, Serialize};
 use std::ffi::c_void;
 use std::io::{BufRead, BufReader, Write};
 use std::os::windows::io::{FromRawHandle, OwnedHandle};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::thread;
-use nfm_search_core::store::{FlatSnapshot, ItemsSource, StreamingItemSnapshot, StreamingItemStore};
-use crate::view_model::ViewModel;
-use nfm_file_system::walker::{ScanOptions, start_scan, PublishedSnapshot};
-use anyhow::{Context, Result, anyhow};
-use serde::{Deserialize, Serialize};
 use windows::Win32::Foundation::{CloseHandle, GetLastError, HANDLE, INVALID_HANDLE_VALUE};
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_SHARE_MODE,
@@ -19,7 +22,6 @@ use windows::Win32::System::Pipes::{
     PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
 };
 use windows::core::PCWSTR;
-use crate::source_store::{AnyItemSource, SharedStore};
 
 const PIPE_NAME: &str = r"\\.\pipe\nfm.win32.picker.v1";
 
@@ -70,16 +72,20 @@ impl PickerRequest for FileSystemPickerRequest {
         let publish_shared = shared.clone();
         let completed_shared = shared.clone();
 
-        start_scan(ScanOptions {
-            roots,
-            max_depth: self.max_depth.max(0) as usize,
-            directories_only: self.directories_only,
-            files_only: self.files_only,
-        }, move |snapshot| {
-            publish_shared.publish(Arc::new(AnyItemSource::FileSystem(snapshot)));
-        }, move || {
-            completed_shared.complete();
-        });
+        start_scan(
+            ScanOptions {
+                roots,
+                max_depth: self.max_depth.max(0) as usize,
+                directories_only: self.directories_only,
+                files_only: self.files_only,
+            },
+            move |snapshot| {
+                publish_shared.publish(Arc::new(AnyItemSource::FileSystem(snapshot)));
+            },
+            move || {
+                completed_shared.complete();
+            },
+        );
 
         shared
     }
@@ -133,7 +139,7 @@ impl StdInRequest {
 
                 let node_index = store.add_item(line.as_bytes());
 
-                if (node_index + 1) % 1_000 == 0{
+                if (node_index + 1) % 1_000 == 0 {
                     shared_store.publish(Arc::new(AnyItemSource::Streaming(store.snapshot())));
                 }
             }

@@ -6,7 +6,7 @@ use std::time::Instant;
 
 use rayon::prelude::*;
 
-use crate::store::{ItemsSource};
+use crate::store::ItemsSource;
 use crate::timing;
 
 pub const DISPLAY_LIMIT: usize = 15;

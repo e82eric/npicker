@@ -359,7 +359,10 @@ mod tests {
 
             let first = *(*results).results;
             assert_eq!(first.item_index, 0);
-            assert_eq!(std::slice::from_raw_parts(first.text, first.text_len), b"alpha");
+            assert_eq!(
+                std::slice::from_raw_parts(first.text, first.text_len),
+                b"alpha"
+            );
 
             nfm_search_results_free(results);
             nfm_search_session_destroy(session);
@@ -403,6 +406,9 @@ mod tests {
 
     #[test]
     fn converts_utf8_byte_positions_to_utf16_offsets() {
-        assert_eq!(utf8_positions_to_utf16_offsets("aβ𝄞z", &[0, 1, 3, 7]), [0, 1, 2, 4]);
+        assert_eq!(
+            utf8_positions_to_utf16_offsets("aβ𝄞z", &[0, 1, 3, 7]),
+            [0, 1, 2, 4]
+        );
     }
 }

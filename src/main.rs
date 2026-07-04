@@ -8,7 +8,7 @@ use rust_nfm::skia_ui;
 use rust_nfm::view_model::ViewModel;
 use rust_nfm::{d2d_ui, ipc};
 
-fn output_debug_string(line: &str){
+fn output_debug_string(line: &str) {
     use windows::Win32::System::Diagnostics::Debug::OutputDebugStringW;
     use windows::core::PCWSTR;
 

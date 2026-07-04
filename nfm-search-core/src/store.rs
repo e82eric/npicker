@@ -27,10 +27,7 @@ struct FlatItem {
 
 impl Default for FlatItem {
     fn default() -> Self {
-        Self {
-            offset: 0,
-            len: 0,
-        }
+        Self { offset: 0, len: 0 }
     }
 }
 
@@ -115,7 +112,7 @@ impl StreamingItemStore {
             items_count: self.items.len(),
             bytes: self.bytes.snapshot(),
             byte_count: self.bytes.len(),
-            version
+            version,
         });
     }
 
@@ -147,7 +144,7 @@ impl StreamingItemSnapshot {
         }
     }
 
-    fn copy_item_to_slice(&self, item: FlatItem ,out: &mut [u8]) {
+    fn copy_item_to_slice(&self, item: FlatItem, out: &mut [u8]) {
         debug_assert!(item.len <= out.len());
         let mut remaining = item.len;
         let mut offset = item.offset;
@@ -157,7 +154,8 @@ impl StreamingItemSnapshot {
             let (chunk_index, chunk_offset) = self.bytes.locate_direct(offset);
             let chunk = &self.bytes.chunks[chunk_index];
             let readable = remaining.min(chunk.len() - chunk_offset);
-            out[written..written + readable].copy_from_slice(&chunk[chunk_offset..chunk_offset + readable]);
+            out[written..written + readable]
+                .copy_from_slice(&chunk[chunk_offset..chunk_offset + readable]);
 
             remaining -= readable;
             offset += readable;
@@ -167,15 +165,24 @@ impl StreamingItemSnapshot {
 }
 
 impl ItemsSource for StreamingItemSnapshot {
-    fn version(&self) -> u64 { self.version }
+    fn version(&self) -> u64 {
+        self.version
+    }
 
     fn len(&self) -> usize {
         self.items_count
     }
 
-    fn is_empty(&self) -> bool { self.items_count == 0 }
+    fn is_empty(&self) -> bool {
+        self.items_count == 0
+    }
 
-    fn get_string<'a>(&'a self, index: usize, stack_buffer: &'a mut [u8], heap_buffer: &'a mut Vec<u8>) -> &'a [u8] {
+    fn get_string<'a>(
+        &'a self,
+        index: usize,
+        stack_buffer: &'a mut [u8],
+        heap_buffer: &'a mut Vec<u8>,
+    ) -> &'a [u8] {
         debug_assert!(index < self.items_count);
         let item = self.items[index];
         debug_assert!(item.offset + item.len <= self.byte_count);

@@ -1,7 +1,7 @@
-﻿use std::sync::{Arc, RwLock};
-use std::sync::atomic::{AtomicBool, Ordering};
 use nfm_file_system::walker::PublishedSnapshot;
 use nfm_search_core::store::{FlatSnapshot, ItemsSource, StreamingItemSnapshot};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, RwLock};
 
 pub enum AnyItemSource {
     FileSystem(Arc<PublishedSnapshot>),
@@ -82,7 +82,7 @@ impl SharedStore {
         self.published.read().expect("store poisoned").clone()
     }
 
-    pub fn publish(&self, source: Arc<AnyItemSource>){
+    pub fn publish(&self, source: Arc<AnyItemSource>) {
         *self.published.write().expect("store poisoned") = Some(source);
     }
 
@@ -91,7 +91,7 @@ impl SharedStore {
             .read()
             .expect("store poisoned")
             .as_ref()
-            .map_or(0, |snapshot|snapshot.version())
+            .map_or(0, |snapshot| snapshot.version())
     }
 
     pub fn complete(&self) {
@@ -102,4 +102,3 @@ impl SharedStore {
         self.done.load(Ordering::Acquire)
     }
 }
-

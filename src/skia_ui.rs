@@ -30,8 +30,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 use windows::core::PCWSTR;
 
-use nfm_search_core::search::SearchResult;
 use crate::view_model::{KeyModifiers, UiCounters, UiEvent, ViewModel};
+use nfm_search_core::search::SearchResult;
 
 const DEFAULT_WIDTH: i32 = 1600;
 const MIN_WIDTH: i32 = 480;

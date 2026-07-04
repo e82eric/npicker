@@ -1,4 +1,4 @@
-use std::ffi::{CStr, CString, c_char, c_void, c_int};
+use std::ffi::{CStr, CString, c_char, c_int, c_void};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::OnceLock;
 
@@ -17,7 +17,7 @@ type OnClosed = unsafe extern "C" fn();
 
 static VIEW_MODEL: OnceLock<Arc<ViewModel>> = OnceLock::new();
 
-fn output_debug_string(line: &str){
+fn output_debug_string(line: &str) {
     use windows::Win32::System::Diagnostics::Debug::OutputDebugStringW;
     use windows::core::PCWSTR;
 
@@ -45,7 +45,7 @@ pub extern "C" fn RustNfmShowProgramsList(
 ) {
     let _ = catch_unwind(AssertUnwindSafe(|| {
         let view_model = ensure_initialized();
-        let root_directories = unsafe {copy_directories(directories, directory_count)};
+        let root_directories = unsafe { copy_directories(directories, directory_count) };
         let state = state as usize;
 
         thread::spawn(move || {
@@ -61,8 +61,8 @@ pub extern "C" fn RustNfmShowProgramsList(
             if let Ok(response) = view_model.run_request(&request)
                 && response.status == "selected"
                 && let (Some(on_select), Some(selected)) = (on_select, response.selected_item)
-                && let Ok(selected) = CString::new(selected)  {
-
+                && let Ok(selected) = CString::new(selected)
+            {
                 unsafe {
                     on_select(selected.as_ptr() as *mut c_char, state as *mut c_void);
                 }
@@ -87,8 +87,8 @@ unsafe fn copy_directories(
 
     let mut result = Vec::with_capacity(directory_count as usize);
 
-    for i in 0..directory_count as usize{
-        let ptr = unsafe {*directories.add(i)};
+    for i in 0..directory_count as usize {
+        let ptr = unsafe { *directories.add(i) };
 
         if ptr.is_null() {
             continue;
