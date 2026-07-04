@@ -864,17 +864,17 @@ fn fzf_fuzzy_match_v2_ascii(
 
     if pattern_size.saturating_mul(text_size) >= SLAB_CAP {
         let res = fuzzy_match_v1_ascii(case_sensitive, text, pattern);
-        if let Some(positions) = positions.as_deref_mut()
-            && res.start >= 0
-        {
-            append_positions_ascii(
-                case_sensitive,
-                text,
-                pattern,
-                res.start as usize,
-                res.end as usize,
-                positions,
-            );
+        if res.start >= 0 {
+            if let Some(positions) = positions.as_deref_mut() {
+                append_positions_ascii(
+                    case_sensitive,
+                    text,
+                    pattern,
+                    res.start as usize,
+                    res.end as usize,
+                    positions,
+                );
+            }
         }
         return res;
     }

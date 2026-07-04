@@ -1,5 +1,5 @@
-use std::ffi::{CStr, CString, c_char, c_int, c_void};
-use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::ffi::{c_char, c_int, c_void, CStr, CString};
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::OnceLock;
 
 #[cfg(not(feature = "skia"))]
@@ -18,8 +18,8 @@ type OnClosed = unsafe extern "C" fn();
 static VIEW_MODEL: OnceLock<Arc<ViewModel>> = OnceLock::new();
 
 fn output_debug_string(line: &str) {
-    use windows::Win32::System::Diagnostics::Debug::OutputDebugStringW;
     use windows::core::PCWSTR;
+    use windows::Win32::System::Diagnostics::Debug::OutputDebugStringW;
 
     let wide: Vec<u16> = line.encode_utf16().chain(std::iter::once(0)).collect();
     unsafe {
@@ -58,13 +58,15 @@ pub extern "C" fn RustNfmShowProgramsList(
                 search_string: None,
             };
 
-            if let Ok(response) = view_model.run_request(&request)
-                && response.status == "selected"
-                && let (Some(on_select), Some(selected)) = (on_select, response.selected_item)
-                && let Ok(selected) = CString::new(selected)
-            {
-                unsafe {
-                    on_select(selected.as_ptr() as *mut c_char, state as *mut c_void);
+            if let Ok(response) = view_model.run_request(&request) {
+                if response.status == "selected" {
+                    if let (Some(on_select), Some(selected)) = (on_select, response.selected_item) {
+                        if let Ok(selected) = CString::new(selected) {
+                            unsafe {
+                                on_select(selected.as_ptr() as *mut c_char, state as *mut c_void);
+                            }
+                        }
+                    }
                 }
             }
 
@@ -123,13 +125,15 @@ pub extern "C" fn RustNfmShowItemsList(
                 search_string: None,
             };
 
-            if let Ok(response) = view_model.run_request(&request)
-                && response.status == "selected"
-                && let (Some(on_select), Some(selected)) = (on_select, response.selected_item)
-                && let Ok(selected) = CString::new(selected)
-            {
-                unsafe {
-                    on_select(selected.as_ptr() as *mut c_char, state as *mut c_void);
+            if let Ok(response) = view_model.run_request(&request) {
+                if response.status == "selected" {
+                    if let (Some(on_select), Some(selected)) = (on_select, response.selected_item) {
+                        if let Ok(selected) = CString::new(selected) {
+                            unsafe {
+                                on_select(selected.as_ptr() as *mut c_char, state as *mut c_void);
+                            }
+                        }
+                    }
                 }
             }
 

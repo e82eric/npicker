@@ -1,7 +1,7 @@
 use crate::source_store::{AnyItemSource, SharedStore};
 use crate::view_model::ViewModel;
-use anyhow::{Context, Result, anyhow};
-use nfm_file_system::walker::{PublishedSnapshot, ScanOptions, start_scan};
+use anyhow::{anyhow, Context, Result};
+use nfm_file_system::walker::{start_scan, PublishedSnapshot, ScanOptions};
 use nfm_search_core::store::{
     FlatSnapshot, ItemsSource, StreamingItemSnapshot, StreamingItemStore,
 };
@@ -12,6 +12,7 @@ use std::os::windows::io::{FromRawHandle, OwnedHandle};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::thread;
+use windows::core::PCWSTR;
 use windows::Win32::Foundation::{CloseHandle, GetLastError, HANDLE, INVALID_HANDLE_VALUE};
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_SHARE_MODE,
@@ -21,7 +22,6 @@ use windows::Win32::System::Pipes::{
     ConnectNamedPipe, CreateNamedPipeW, PIPE_READMODE_BYTE, PIPE_TYPE_BYTE,
     PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
 };
-use windows::core::PCWSTR;
 
 const PIPE_NAME: &str = r"\\.\pipe\nfm.win32.picker.v1";
 

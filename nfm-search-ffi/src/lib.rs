@@ -1,8 +1,8 @@
-use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::ptr;
 use std::sync::Arc;
 
-use nfm_search_core::search::{SearchOutput, search};
+use nfm_search_core::search::{search, SearchOutput};
 use nfm_search_core::store::{StreamingItemSnapshot, StreamingItemStore};
 
 #[repr(C)]

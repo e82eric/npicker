@@ -1,17 +1,17 @@
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
-use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
+use crossbeam_channel::{bounded, unbounded, Receiver, Sender};
+use windows::core::PCWSTR;
 use windows::Win32::Foundation::{HANDLE, INVALID_HANDLE_VALUE};
 use windows::Win32::Storage::FileSystem::{
-    FILE_ATTRIBUTE_DIRECTORY, FIND_FIRST_EX_LARGE_FETCH, FINDEX_SEARCH_OPS, FindClose,
-    FindExInfoBasic, FindExSearchNameMatch, FindFirstFileExW, FindNextFileW, WIN32_FIND_DATAW,
+    FindClose, FindExInfoBasic, FindExSearchNameMatch, FindFirstFileExW, FindNextFileW,
+    FILE_ATTRIBUTE_DIRECTORY, FINDEX_SEARCH_OPS, FIND_FIRST_EX_LARGE_FETCH, WIN32_FIND_DATAW,
 };
-use windows::core::PCWSTR;
 
 use nfm_search_core::store::{ChunkedSnapshot, ChunkedStorage, ItemsSource};
 use nfm_search_core::timing;

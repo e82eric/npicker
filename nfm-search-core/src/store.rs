@@ -1,5 +1,5 @@
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 const ITEM_CHUNK_SIZE: usize = 64 * 1024;
 const BYTE_CHUNK_SIZE: usize = 1024 * 1024;

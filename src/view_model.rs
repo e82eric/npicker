@@ -6,9 +6,9 @@ use std::thread;
 use crate::fuzzy_search_session::{FuzzySearchSession, FuzzySearchUpdate};
 use crate::ipc::{PickerRequest, PickerResponse};
 use crate::source_store::{AnyItemSource, SharedStore};
-use anyhow::{Result, bail};
-use crossbeam_channel::{Receiver, Sender, unbounded};
-use nfm_search_core::search::{DISPLAY_LIMIT, SearchResult};
+use anyhow::{bail, Result};
+use crossbeam_channel::{unbounded, Receiver, Sender};
+use nfm_search_core::search::{SearchResult, DISPLAY_LIMIT};
 use nfm_search_core::timing;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     VK_BACK, VK_DELETE, VK_DOWN, VK_END, VK_ESCAPE, VK_HOME, VK_LEFT, VK_RETURN, VK_RIGHT, VK_UP,

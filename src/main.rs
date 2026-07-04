@@ -9,8 +9,8 @@ use rust_nfm::view_model::ViewModel;
 use rust_nfm::{d2d_ui, ipc};
 
 fn output_debug_string(line: &str) {
-    use windows::Win32::System::Diagnostics::Debug::OutputDebugStringW;
     use windows::core::PCWSTR;
+    use windows::Win32::System::Diagnostics::Debug::OutputDebugStringW;
 
     let wide: Vec<u16> = line.encode_utf16().chain(std::iter::once(0)).collect();
     unsafe {

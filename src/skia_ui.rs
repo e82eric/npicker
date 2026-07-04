@@ -4,31 +4,31 @@ use std::ffi::c_void;
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Arc, Mutex};
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 use skia_safe::{
-    Canvas, Color, Font, FontMgr, FontStyle, Paint, PaintStyle, RRect, Rect as SkRect, Surface,
-    surfaces,
+    surfaces, Canvas, Color, Font, FontMgr, FontStyle, Paint, PaintStyle, RRect, Rect as SkRect,
+    Surface,
 };
+use windows::core::PCWSTR;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    BITMAPINFO, BITMAPINFOHEADER, BeginPaint, DIB_RGB_COLORS, EndPaint, GetMonitorInfoW,
-    InvalidateRect, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromPoint, MonitorFromWindow,
-    PAINTSTRUCT, SRCCOPY, StretchDIBits,
+    BeginPaint, EndPaint, GetMonitorInfoW, InvalidateRect, MonitorFromPoint, MonitorFromWindow,
+    StretchDIBits, BITMAPINFO, BITMAPINFOHEADER, DIB_RGB_COLORS, MONITORINFO,
+    MONITOR_DEFAULTTONEAREST, PAINTSTRUCT, SRCCOPY,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyState, INPUT, INPUT_MOUSE, KEYEVENTF_KEYUP, SendInput, SetFocus, VK_CONTROL, VK_MENU,
-    VK_SHIFT, keybd_event,
+    keybd_event, GetKeyState, SendInput, SetFocus, INPUT, INPUT_MOUSE, KEYEVENTF_KEYUP, VK_CONTROL,
+    VK_MENU, VK_SHIFT,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CREATESTRUCTW, CreateWindowExW, DefWindowProcW, DispatchMessageW, GWLP_USERDATA,
-    GetCaretBlinkTime, GetClientRect, GetForegroundWindow, GetMessageW, GetWindowLongPtrW,
-    IDC_ARROW, LoadCursorW, MSG, PostMessageW, RegisterClassW, SW_HIDE, SWP_NOACTIVATE,
-    SWP_NOZORDER, SWP_SHOWWINDOW, SetForegroundWindow, SetTimer, SetWindowLongPtrW, SetWindowPos,
-    ShowWindow, TranslateMessage, WM_APP, WM_CHAR, WM_DESTROY, WM_KEYDOWN, WM_NCCREATE, WM_PAINT,
-    WM_TIMER, WNDCLASSW, WS_EX_TOPMOST, WS_POPUP,
+    CreateWindowExW, DefWindowProcW, DispatchMessageW, GetCaretBlinkTime, GetClientRect,
+    GetForegroundWindow, GetMessageW, GetWindowLongPtrW, LoadCursorW, PostMessageW, RegisterClassW,
+    SetForegroundWindow, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow, TranslateMessage,
+    CREATESTRUCTW, GWLP_USERDATA, IDC_ARROW, MSG, SWP_NOACTIVATE, SWP_NOZORDER, SWP_SHOWWINDOW,
+    SW_HIDE, WM_APP, WM_CHAR, WM_DESTROY, WM_KEYDOWN, WM_NCCREATE, WM_PAINT, WM_TIMER, WNDCLASSW,
+    WS_EX_TOPMOST, WS_POPUP,
 };
-use windows::core::PCWSTR;
 
 use crate::view_model::{KeyModifiers, UiCounters, UiEvent, ViewModel};
 use nfm_search_core::search::SearchResult;

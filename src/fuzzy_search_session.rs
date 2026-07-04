@@ -4,8 +4,8 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use crossbeam_channel::{Receiver, Sender, bounded};
-use nfm_search_core::search::{RESULT_LIMIT, SearchOutput, SearchResult, search, search_range};
+use crossbeam_channel::{bounded, Receiver, Sender};
+use nfm_search_core::search::{search, search_range, SearchOutput, SearchResult, RESULT_LIMIT};
 use nfm_search_core::store::ItemsSource;
 
 pub trait SearchSnapshotProvider<S>: Send + Sync + 'static

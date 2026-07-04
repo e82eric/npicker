@@ -1,7 +1,7 @@
 [package]
 name = "nfm_file_system"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
 
 [dependencies]
 crossbeam-channel = "0.5.15"
