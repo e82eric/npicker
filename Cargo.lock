@@ -275,12 +275,37 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "crossbeam-channel",
+ "nfm_file_system",
+ "nfm_search_core",
  "rayon",
  "serde",
  "serde_json",
  "skia-safe",
  "windows",
  "windows-numerics",
+]
+
+[[package]]
+name = "nfm_file_system"
+version = "0.1.0"
+dependencies = [
+ "crossbeam-channel",
+ "nfm_search_core",
+ "windows",
+]
+
+[[package]]
+name = "nfm_search-ffi"
+version = "0.1.0"
+dependencies = [
+ "nfm_search_core",
+]
+
+[[package]]
+name = "nfm_search_core"
+version = "0.1.0"
+dependencies = [
+ "rayon",
 ]
 
 [[package]]

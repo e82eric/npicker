@@ -1,0 +1,12 @@
+[package]
+name = "nfm_file_system"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+crossbeam-channel = "0.5.15"
+windows = { version = "0.62.2", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+] }
+nfm_search_core = {  path = "../nfm-search-core" }

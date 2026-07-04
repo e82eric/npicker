@@ -4,9 +4,9 @@ use std::os::windows::io::{FromRawHandle, OwnedHandle};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::thread;
-use crate::store::{AnyItemSource, FlatSnapshot, ItemsSource, PublishedSnapshot, StreamingItemSnapshot, StreamingItemStore};
+use nfm_search_core::store::{FlatSnapshot, ItemsSource, StreamingItemSnapshot, StreamingItemStore};
 use crate::view_model::ViewModel;
-use crate::walker::{ScanOptions, SharedStore, start_scan};
+use nfm_file_system::walker::{ScanOptions, start_scan, PublishedSnapshot};
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 use windows::Win32::Foundation::{CloseHandle, GetLastError, HANDLE, INVALID_HANDLE_VALUE};
@@ -19,6 +19,7 @@ use windows::Win32::System::Pipes::{
     PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
 };
 use windows::core::PCWSTR;
+use crate::source_store::{AnyItemSource, SharedStore};
 
 const PIPE_NAME: &str = r"\\.\pipe\nfm.win32.picker.v1";
 
@@ -64,14 +65,23 @@ impl PickerRequest for FileSystemPickerRequest {
             self.root_directories.iter().map(PathBuf::from).collect()
         };
 
-        let store = start_scan(ScanOptions {
+        let shared = Arc::new(SharedStore::new());
+
+        let publish_shared = shared.clone();
+        let completed_shared = shared.clone();
+
+        start_scan(ScanOptions {
             roots,
             max_depth: self.max_depth.max(0) as usize,
             directories_only: self.directories_only,
             files_only: self.files_only,
+        }, move |snapshot| {
+            publish_shared.publish(Arc::new(AnyItemSource::FileSystem(snapshot)));
+        }, move || {
+            completed_shared.complete();
         });
 
-        store
+        shared
     }
 }
 
@@ -97,9 +107,7 @@ pub struct StdInRequest {
 
 impl StdInRequest {
     pub fn new(search_string: Option<String>) -> Self {
-        let store = StreamingItemStore::new();
-        let wrapper = Arc::new(AnyItemSource::Streaming(store.snapshot()));
-        let shared_store = Arc::new(SharedStore::new(wrapper));
+        let shared_store = Arc::new(SharedStore::new());
 
         Self {
             shared_store,
@@ -214,7 +222,7 @@ pub fn run_pipe_server(view_model: Arc<ViewModel>) -> Result<()> {
 
         let raw_handle = handle.0 as usize;
         let connection_view_model = Arc::clone(&view_model);
-        std::thread::spawn(move || {
+        thread::spawn(move || {
             let handle = HANDLE(raw_handle as *mut c_void);
             if let Err(error) = handle_connection(handle, connection_view_model) {
                 eprintln!("pipe connection failed: {error:?}");
@@ -318,7 +326,9 @@ mod tests {
         };
 
         let store = request.run();
-        let snapshot = store.snapshot();
+        let Some(snapshot) = store.snapshot() else {
+            return;
+        };
         let mut stack = [0u8; 64];
         let mut heap = Vec::new();
 

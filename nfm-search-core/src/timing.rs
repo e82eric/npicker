@@ -1,10 +1,14 @@
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
-use windows::Win32::System::Diagnostics::Debug::OutputDebugStringW;
-use windows::core::PCWSTR;
+type TimingSink = fn(&str);
 
 static REQUEST_START: Mutex<Option<Instant>> = Mutex::new(None);
+static SINK: OnceLock<TimingSink> = OnceLock::new();
+
+pub fn set_sink(sink: TimingSink) {
+    let _ = SINK.set(sink);
+}
 
 pub fn begin_request() {
     *REQUEST_START.lock().expect("timing mutex poisoned") = Some(Instant::now());
@@ -20,9 +24,8 @@ pub fn write(message: impl AsRef<str>) {
         "[RustWin32HostTiming] +{elapsed_ms:.3}ms {}\n",
         message.as_ref()
     );
-    let wide: Vec<u16> = line.encode_utf16().chain(std::iter::once(0)).collect();
-    unsafe {
-        OutputDebugStringW(PCWSTR(wide.as_ptr()));
+    if let Some(sink) = SINK.get() {
+        sink(&line);
     }
 }
 

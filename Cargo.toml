@@ -1,3 +1,12 @@
+[workspace]
+members = [
+    ".",
+    "nfm-file-system",
+    "nfm-search-core",
+    "nfm-search-ffi",
+]
+resolver = "2"
+
 [package]
 name = "nfm-rust-win32host"
 version = "0.1.0"
@@ -12,6 +21,8 @@ default = ["skia"]
 skia = ["dep:skia-safe"]
 
 [dependencies]
+nfm_search_core = { path = "nfm-search-core"}
+nfm_file_system = { path = "nfm-file-system"}
 anyhow = "1"
 crossbeam-channel = "0.5"
 rayon = "1"

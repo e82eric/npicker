@@ -17,9 +17,20 @@ type OnClosed = unsafe extern "C" fn();
 
 static VIEW_MODEL: OnceLock<Arc<ViewModel>> = OnceLock::new();
 
+fn output_debug_string(line: &str){
+    use windows::Win32::System::Diagnostics::Debug::OutputDebugStringW;
+    use windows::core::PCWSTR;
+
+    let wide: Vec<u16> = line.encode_utf16().chain(std::iter::once(0)).collect();
+    unsafe {
+        OutputDebugStringW(PCWSTR(wide.as_ptr()));
+    }
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn RustNfmInitialize() {
     let _ = catch_unwind(AssertUnwindSafe(|| {
+        nfm_search_core::timing::set_sink(output_debug_string);
         ensure_initialized();
     }));
 }

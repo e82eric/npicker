@@ -5,17 +5,17 @@ use std::thread;
 use std::time::Duration;
 
 use crate::ipc::{PickerRequest, PickerResponse};
-use crate::search::{
+use nfm_search_core::search::{
     DISPLAY_LIMIT, RESULT_LIMIT, SearchOutput, SearchResult, search, search_range,
 };
-use crate::store::ItemsSource;
-use crate::timing;
-use crate::walker::SharedStore;
+use nfm_search_core::store::ItemsSource;
+use nfm_search_core::timing;
 use anyhow::{Result, bail};
 use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     VK_BACK, VK_DELETE, VK_DOWN, VK_END, VK_ESCAPE, VK_HOME, VK_LEFT, VK_RETURN, VK_RIGHT, VK_UP,
 };
+use crate::source_store::SharedStore;
 
 #[derive(Clone, Debug)]
 pub enum UiEvent {
@@ -771,7 +771,10 @@ impl FuzzySearcherInner {
     fn run_search_generation(&self, version: u64, cache: &mut SearchCache) {
         let query = self.query.lock().expect("search query poisoned").clone();
 
-        let snapshot = self.store.snapshot();
+        let  Some(snapshot) = self.store.snapshot() else {
+           return;
+        };
+
         let scanning = !self.store.is_done();
         let total = snapshot.len();
 

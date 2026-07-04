@@ -6,7 +6,7 @@ use std::time::Instant;
 
 use rayon::prelude::*;
 
-use crate::store::{ItemsSource, Name};
+use crate::store::{ItemsSource};
 use crate::timing;
 
 pub const DISPLAY_LIMIT: usize = 15;
@@ -172,7 +172,7 @@ where
                     MatchScratch::default(),
                     Vec::with_capacity(512),
                     Box::new([0u8; 4096]),
-                    Box::new([Name::default(); 256]),
+                    Box::new([0; 256]),
                     0usize,
                     0usize,
                     0u128,
@@ -292,7 +292,7 @@ where
                     MatchScratch::default(),
                     Vec::new(),
                     Box::new([0u8; 4096]),
-                    Box::new([Name::default(); 256]),
+                    Box::new([0; 256]),
                     0usize,
                     0usize,
                     0u128,

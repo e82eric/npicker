@@ -1,10 +1,7 @@
 pub mod d2d_ui;
-pub mod ffi;
 pub mod ipc;
-pub mod search;
 #[cfg(feature = "skia")]
 pub mod skia_ui;
-pub mod store;
-pub mod timing;
 pub mod view_model;
-pub mod walker;
+pub mod source_store;
+pub mod ffi;
