@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::ffi::c_void;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
@@ -23,9 +23,71 @@ const BYTE_CHUNK_SIZE: usize = 1024 * 1024;
 
 pub struct ScanOptions {
     pub roots: Vec<PathBuf>,
-    pub max_depth: usize,
+    pub max_depth: i32,
     pub directories_only: bool,
     pub files_only: bool,
+}
+
+impl ScanOptions {
+    fn effective_max_depth(&self) -> usize {
+        if self.max_depth <= 0 {
+            usize::MAX
+        } else {
+            self.max_depth as usize
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScanStatus {
+    Scanning,
+    Completed,
+    Cancelled,
+    Failed,
+}
+
+impl ScanStatus {
+    fn as_u8(self) -> u8 {
+        match self {
+            Self::Scanning => 0,
+            Self::Completed => 1,
+            Self::Cancelled => 2,
+            Self::Failed => 3,
+        }
+    }
+
+    fn from_u8(value: u8) -> Self {
+        match value {
+            1 => Self::Completed,
+            2 => Self::Cancelled,
+            3 => Self::Failed,
+            _ => Self::Scanning,
+        }
+    }
+}
+
+pub trait ScanEventSink: Send + Sync + 'static {
+    fn snapshot(&self, snapshot: Arc<PublishedSnapshot>);
+    fn complete(&self, status: ScanStatus);
+}
+
+pub struct FileWalkerScan {
+    status: Arc<AtomicU8>,
+    cancelled: Arc<AtomicBool>,
+}
+
+impl FileWalkerScan {
+    pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+    }
+
+    pub fn status(&self) -> ScanStatus {
+        ScanStatus::from_u8(self.status.load(Ordering::Acquire))
+    }
+
+    pub fn is_done(&self) -> bool {
+        self.status() != ScanStatus::Scanning
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -325,20 +387,25 @@ enum WriterCommand {
     },
 }
 
-pub fn start_scan<P, C>(options: ScanOptions, publisher: P, on_complete: C)
+pub fn start_scan<S>(options: ScanOptions, sink: Arc<S>) -> FileWalkerScan
 where
-    P: Fn(Arc<PublishedSnapshot>) + Send + Sync + 'static,
-    C: Fn() + Send + Sync + 'static,
+    S: ScanEventSink,
 {
+    let status = Arc::new(AtomicU8::new(ScanStatus::Scanning.as_u8()));
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let scan_status = Arc::clone(&status);
+    let scan_cancelled = Arc::clone(&cancelled);
+
     std::thread::spawn(move || {
-        scan(options, publisher, on_complete);
+        scan(options, sink, scan_status, scan_cancelled);
     });
+
+    FileWalkerScan { status, cancelled }
 }
 
-fn scan<P, C>(options: ScanOptions, publisher: P, on_complete: C)
+fn scan<S>(options: ScanOptions, sink: Arc<S>, status: Arc<AtomicU8>, cancelled: Arc<AtomicBool>)
 where
-    P: Fn(Arc<PublishedSnapshot>) + Send + Sync + 'static,
-    C: Fn() + Send + Sync + 'static,
+    S: ScanEventSink,
 {
     let (tx, rx) = unbounded();
     let (writer_tx, writer_rx) = unbounded();
@@ -356,9 +423,17 @@ where
         options.files_only
     ));
 
-    let writer = std::thread::spawn(move || store_writer_loop(writer_rx, publisher, on_complete));
+    let writer_status = Arc::clone(&status);
+    let writer_cancelled = Arc::clone(&cancelled);
+    let writer = std::thread::spawn(move || {
+        store_writer_loop(writer_rx, sink, writer_status, writer_cancelled)
+    });
 
     for root in &options.roots {
+        if cancelled.load(Ordering::Acquire) {
+            break;
+        }
+
         let root_text = root.to_string_lossy().into_owned();
         let root_index = add_node_sync(&writer_tx, -1, root_text.clone());
 
@@ -387,6 +462,7 @@ where
         let worker_writer_tx = writer_tx.clone();
         let worker_tx = tx.clone();
         let worker_rx = rx.clone();
+        let worker_cancelled = Arc::clone(&cancelled);
         workers.push(std::thread::spawn(move || {
             worker_loop(
                 worker_options,
@@ -394,6 +470,7 @@ where
                 worker_writer_tx,
                 worker_tx,
                 worker_rx,
+                worker_cancelled,
             );
         }));
     }
@@ -414,11 +491,16 @@ fn worker_loop(
     writer_tx: Sender<WriterCommand>,
     tx: Sender<DirectoryWork>,
     rx: Receiver<DirectoryWork>,
+    cancelled: Arc<AtomicBool>,
 ) {
     loop {
+        if cancelled.load(Ordering::Acquire) {
+            return;
+        }
+
         match rx.recv_timeout(Duration::from_millis(25)) {
             Ok(work) => {
-                scan_directory(&options, &pending, &writer_tx, &tx, work);
+                scan_directory(&options, &pending, &writer_tx, &tx, &cancelled, work);
                 pending.fetch_sub(1, Ordering::AcqRel);
             }
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
@@ -436,13 +518,15 @@ fn scan_directory(
     pending: &AtomicUsize,
     writer_tx: &Sender<WriterCommand>,
     tx: &Sender<DirectoryWork>,
+    cancelled: &AtomicBool,
     work: DirectoryWork,
 ) {
-    if work.depth >= options.max_depth {
+    if cancelled.load(Ordering::Acquire) {
         return;
     }
 
     let search_path = make_search_path(&work.path);
+    let effective_max_depth = options.effective_max_depth();
 
     unsafe {
         let mut find_data = WIN32_FIND_DATAW::default();
@@ -462,9 +546,14 @@ fn scan_directory(
 
         let find_handle = FindHandle(handle);
         loop {
+            if cancelled.load(Ordering::Acquire) {
+                break;
+            }
+
             if let Some(name) = file_name(&find_data) {
                 if name != "." && name != ".." {
                     let is_dir = (find_data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY.0) != 0;
+                    let will_recurse = is_dir && work.depth + 1 < effective_max_depth;
 
                     if (!options.directories_only || is_dir) && (!options.files_only || !is_dir) {
                         let child_index = if is_dir {
@@ -474,7 +563,7 @@ fn scan_directory(
                             u32::MAX
                         };
 
-                        if is_dir {
+                        if will_recurse {
                             let child_path = make_child_path(&work.path, name.as_bytes());
                             pending.fetch_add(1, Ordering::AcqRel);
                             if tx
@@ -488,7 +577,7 @@ fn scan_directory(
                                 pending.fetch_sub(1, Ordering::AcqRel);
                             }
                         }
-                    } else if is_dir {
+                    } else if will_recurse {
                         let child_index = add_node_sync(writer_tx, work.node_index, name.clone());
                         let child_path = make_child_path(&work.path, name.as_bytes());
                         pending.fetch_add(1, Ordering::AcqRel);
@@ -515,10 +604,13 @@ fn scan_directory(
     }
 }
 
-fn store_writer_loop<P, C>(rx: Receiver<WriterCommand>, publisher: P, on_complete: C)
-where
-    P: Fn(Arc<PublishedSnapshot>) + Send + Sync + 'static,
-    C: Fn() + Send + Sync + 'static,
+fn store_writer_loop<S>(
+    rx: Receiver<WriterCommand>,
+    sink: Arc<S>,
+    status: Arc<AtomicU8>,
+    cancelled: Arc<AtomicBool>,
+) where
+    S: ScanEventSink,
 {
     let mut store = CompactUtf8FileStore::new();
     while let Ok(command) = rx.recv() {
@@ -530,7 +622,7 @@ where
             } => {
                 let node_index = store.add_node(parent, &name);
                 if node_index == 0 || (node_index + 1) % 1_000 == 0 {
-                    publisher(store.snapshot());
+                    sink.snapshot(store.snapshot());
                 }
                 if let Some(response) = response {
                     let _ = response.send(node_index);
@@ -540,8 +632,15 @@ where
     }
 
     store.complete_adding();
-    publisher(store.snapshot());
-    on_complete();
+    sink.snapshot(store.snapshot());
+
+    let final_status = if cancelled.load(Ordering::Acquire) {
+        ScanStatus::Cancelled
+    } else {
+        ScanStatus::Completed
+    };
+    status.store(final_status.as_u8(), Ordering::Release);
+    sink.complete(final_status);
 }
 
 fn add_node_sync(writer_tx: &Sender<WriterCommand>, parent: i32, name: String) -> u32 {

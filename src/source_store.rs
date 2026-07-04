@@ -1,5 +1,5 @@
 use crate::fuzzy_search_session::SearchSnapshotProvider;
-use nfm_file_system::walker::PublishedSnapshot;
+use nfm_file_system::walker::{PublishedSnapshot, ScanEventSink, ScanStatus};
 use nfm_search_core::store::{FlatSnapshot, ItemsSource, StreamingItemSnapshot};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
@@ -115,5 +115,15 @@ impl SearchSnapshotProvider<AnyItemSource> for SharedStore {
 
     fn is_done(&self) -> bool {
         SharedStore::is_done(self)
+    }
+}
+
+impl ScanEventSink for SharedStore {
+    fn snapshot(&self, snapshot: Arc<PublishedSnapshot>) {
+        self.publish(Arc::new(AnyItemSource::FileSystem(snapshot)));
+    }
+
+    fn complete(&self, _status: ScanStatus) {
+        SharedStore::complete(self);
     }
 }

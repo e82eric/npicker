@@ -69,22 +69,14 @@ impl PickerRequest for FileSystemPickerRequest {
 
         let shared = Arc::new(SharedStore::new());
 
-        let publish_shared = shared.clone();
-        let completed_shared = shared.clone();
-
         start_scan(
             ScanOptions {
                 roots,
-                max_depth: self.max_depth.max(0) as usize,
+                max_depth: self.max_depth,
                 directories_only: self.directories_only,
                 files_only: self.files_only,
             },
-            move |snapshot| {
-                publish_shared.publish(Arc::new(AnyItemSource::FileSystem(snapshot)));
-            },
-            move || {
-                completed_shared.complete();
-            },
+            Arc::clone(&shared),
         );
 
         shared
