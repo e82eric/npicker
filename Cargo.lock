@@ -305,6 +305,7 @@ dependencies = [
 name = "nfm_search_core"
 version = "0.1.0"
 dependencies = [
+ "crossbeam-channel",
  "rayon",
 ]
 

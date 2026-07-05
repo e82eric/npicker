@@ -1,4 +1,4 @@
-use crate::fuzzy_search_session::SearchSnapshotProvider;
+use nfm_search_core::fuzzy_search_session::SearchSnapshotProvider;
 use nfm_file_system::walker::{PublishedSnapshot, ScanEventSink, ScanStatus};
 use nfm_search_core::store::{FlatSnapshot, ItemsSource, StreamingItemSnapshot};
 use std::sync::atomic::{AtomicBool, Ordering};

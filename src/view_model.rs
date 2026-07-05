@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-use crate::fuzzy_search_session::{FuzzySearchSession, FuzzySearchUpdate};
+use nfm_search_core::fuzzy_search_session::{FuzzySearchSession, FuzzySearchUpdate};
 use crate::ipc::{PickerRequest, PickerResponse};
 use crate::source_store::{AnyItemSource, SharedStore};
 use anyhow::{bail, Result};

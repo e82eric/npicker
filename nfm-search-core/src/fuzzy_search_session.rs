@@ -5,8 +5,8 @@ use std::thread;
 use std::time::Duration;
 
 use crossbeam_channel::{bounded, Receiver, Sender};
-use nfm_search_core::search::{search, search_range, SearchOutput, SearchResult, RESULT_LIMIT};
-use nfm_search_core::store::ItemsSource;
+use crate::search::{search, search_range, SearchOutput, SearchResult, RESULT_LIMIT};
+use crate::store::ItemsSource;
 
 pub trait SearchSnapshotProvider<S>: Send + Sync + 'static
 where
@@ -143,26 +143,30 @@ where
     fn run_loop(self: &Arc<Self>) {
         let mut last_completed_version = None;
         let mut last_snapshot_version = None;
+        let mut last_source_done = false;
         let mut cache = SearchCache::default();
         loop {
             if self.cancelled.load(Ordering::Acquire) {
                 return;
             }
 
-            let (version, snapshot_version, scanning) = {
+            let (version, snapshot_version, scanning, source_done) = {
                 (
                     self.search_version.load(Ordering::Acquire),
                     self.provider.snapshot_version(),
                     !self.provider.is_done(),
+                    self.provider.is_done(),
                 )
             };
 
             if last_completed_version != Some(version)
                 || last_snapshot_version != Some(snapshot_version)
+                || last_source_done != source_done
             {
                 self.run_search_generation(version, snapshot_version, &mut cache);
                 last_completed_version = Some(version);
                 last_snapshot_version = Some(snapshot_version);
+                last_source_done = source_done;
             }
 
             let timeout = if scanning {
