@@ -1,4 +1,5 @@
-use std::sync::atomic::{AtomicU64, Ordering};
+use crate::fuzzy_search_session::SearchSnapshotProvider;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 const ITEM_CHUNK_SIZE: usize = 64 * 1024;
@@ -31,22 +32,24 @@ impl Default for FlatItem {
     }
 }
 
-pub struct FlatSnapshot {
+pub struct FlatSnapshot<T> {
     items: Vec<FlatItem>,
+    payloads: Vec<T>,
     bytes: Vec<u8>,
     version: u64,
 }
 
-impl FlatSnapshot {
+impl<T> FlatSnapshot<T> {
     pub fn from_items<I, S>(items: I) -> Self
     where
-        I: IntoIterator<Item = S>,
+        I: IntoIterator<Item = (S, T)>,
         S: AsRef<str>,
     {
         let mut flat_items = Vec::new();
         let mut bytes = Vec::new();
+        let mut payloads = Vec::new();
 
-        for item in items {
+        for (item, payload) in items {
             let item = item.as_ref();
             let offset = bytes.len();
             bytes.extend_from_slice(item.as_bytes());
@@ -54,13 +57,20 @@ impl FlatSnapshot {
                 offset,
                 len: item.len(),
             });
+
+            payloads.push(payload);
         }
 
         Self {
             items: flat_items,
+            payloads,
             bytes,
             version: 1,
         }
+    }
+
+    pub fn payload(&self, index: usize) -> &T {
+        &self.payloads[index]
     }
 
     fn item_bytes(&self, index: usize) -> &[u8] {
@@ -215,7 +225,183 @@ impl ItemsSource for StreamingItemSnapshot {
     }
 }
 
-impl ItemsSource for FlatSnapshot {
+impl<T : Copy> ItemsSource for StreamingItemSnapshotWithPayload<T> {
+    fn version(&self) -> u64 {
+        self.version
+    }
+
+    fn len(&self) -> usize {
+        self.items_count
+    }
+
+    fn is_empty(&self) -> bool {
+        self.items_count == 0
+    }
+
+    fn get_string<'a>(
+        &'a self,
+        index: usize,
+        stack_buffer: &'a mut [u8],
+        heap_buffer: &'a mut Vec<u8>,
+    ) -> &'a [u8] {
+        debug_assert!(index < self.items_count);
+        let item = self.items[index];
+        debug_assert!(item.offset + item.len <= self.byte_count);
+
+        if item.len == 0 {
+            return &stack_buffer[..0];
+        }
+
+        let (chunk_index, chunk_offset) = self.bytes.locate_direct(item.offset);
+        let chunk = &self.bytes.chunks[chunk_index];
+        let contained_in_single_chunk = chunk_offset + item.len <= chunk.len();
+        if contained_in_single_chunk {
+            return &chunk[chunk_offset..chunk_offset + item.len];
+        }
+
+        if item.len > stack_buffer.len() {
+            heap_buffer.resize(item.len, 0);
+            self.copy_item_to_slice(item, heap_buffer);
+            return heap_buffer.as_slice();
+        }
+
+        self.copy_item_to_slice(item, &mut stack_buffer[..item.len]);
+        &stack_buffer[..item.len]
+    }
+
+    fn get_string_lossy(&self, node_index: usize, out: &mut Vec<u8>) -> String {
+        let mut stack_buffer = [0u8; 4096];
+        let result = self.get_string(node_index, &mut stack_buffer, out);
+        String::from_utf8_lossy(result).into_owned()
+    }
+}
+
+pub struct StreamingItemSnapshotWithPayload<T : Copy> {
+    items: ChunkedSnapshot<FlatItem>,
+    items_count: usize,
+    payloads: ChunkedSnapshot<T>,
+    bytes: ChunkedSnapshot<u8>,
+    byte_count: usize,
+    version: u64,
+}
+
+impl<T : Copy> StreamingItemSnapshotWithPayload<T> {
+    fn empty() -> Self {
+        Self {
+            items: ChunkedSnapshot::empty(),
+            items_count: 0,
+            payloads: ChunkedSnapshot::empty(),
+            bytes: ChunkedSnapshot::empty(),
+            byte_count: 0,
+            version: 0,
+        }
+    }
+
+    pub fn payload(&self, index: usize) -> &T {
+        debug_assert!(index < self.items_count);
+        &self.payloads[index]
+    }
+
+    fn copy_item_to_slice(&self, item: FlatItem, out: &mut [u8]) {
+        debug_assert!(item.len <= out.len());
+        let mut remaining = item.len;
+        let mut offset = item.offset;
+        let mut written = 0usize;
+
+        while remaining > 0 {
+            let (chunk_index, chunk_offset) = self.bytes.locate_direct(offset);
+            let chunk = &self.bytes.chunks[chunk_index];
+            let readable = remaining.min(chunk.len() - chunk_offset);
+            out[written..written + readable]
+                .copy_from_slice(&chunk[chunk_offset..chunk_offset + readable]);
+
+            remaining -= readable;
+            offset += readable;
+            written += readable;
+        }
+    }
+}
+
+pub struct StreamingItemStoreWithPayload<T : Copy + Default> {
+    items: ChunkedStorage<FlatItem>,
+    bytes: ChunkedStorage<u8>,
+    payloads: ChunkedStorage<T>,
+    published: Arc<StreamingItemSnapshotWithPayload<T>>,
+    version: AtomicU64,
+    done: AtomicBool,
+}
+
+impl<T : Copy + Default> StreamingItemStoreWithPayload<T> {
+    pub fn new() -> Self {
+        Self {
+            items: ChunkedStorage::new(ITEM_CHUNK_SIZE),
+            bytes: ChunkedStorage::new(BYTE_CHUNK_SIZE),
+            payloads: ChunkedStorage::new(ITEM_CHUNK_SIZE),
+            published: Arc::new(StreamingItemSnapshotWithPayload::empty()),
+            version: AtomicU64::new(0),
+            done: AtomicBool::new(false),
+        }
+    }
+
+    pub fn add_item(&mut self, item: &[u8], payload: T) -> u32 {
+        let flat_item = FlatItem {
+            offset: self.bytes.len(),
+            len: item.len(),
+        };
+
+        let item_index = self.items.len() as u32;
+        self.bytes.extend_from_slice(item);
+        self.items.push(flat_item);
+        self.payloads.push(payload);
+
+        debug_assert_eq!(self.items.len(), self.payloads.len());
+
+        if self.items.len() % PUBLISH_ITEM_INTERVAL == 0 {
+            self.publish();
+        }
+
+        item_index
+    }
+
+    pub fn publish(&mut self) {
+        debug_assert_eq!(self.items.len(), self.payloads.len());
+
+        let version = self.version.fetch_add(1, Ordering::Relaxed) + 1;
+        self.published = Arc::new(StreamingItemSnapshotWithPayload {
+            items: self.items.snapshot(),
+            items_count: self.items.len(),
+            payloads: self.payloads.snapshot(),
+            bytes: self.bytes.snapshot(),
+            byte_count: self.bytes.len(),
+            version,
+        });
+    }
+
+    pub fn snapshot(&self) -> Arc<StreamingItemSnapshotWithPayload<T>> {
+        Arc::clone(&self.published)
+    }
+
+    pub fn complete_adding(&mut self) {
+        self.publish();
+        self.done.store(true, Ordering::Release);
+    }
+}
+
+impl<T : Copy + Default + Send + Sync + 'static> SearchSnapshotProvider<StreamingItemSnapshotWithPayload<T>> for StreamingItemStoreWithPayload<T> {
+    fn snapshot(&self) -> Option<Arc<StreamingItemSnapshotWithPayload<T>>> {
+        Some(StreamingItemStoreWithPayload::snapshot(self))
+    }
+
+    fn snapshot_version(&self) -> u64 {
+        self.version.load(Ordering::Acquire)
+    }
+
+    fn is_done(&self) -> bool {
+        self.done.load(Ordering::Acquire)
+    }
+}
+
+impl<T> ItemsSource for FlatSnapshot<T> {
     fn version(&self) -> u64 {
         self.version
     }
@@ -375,7 +561,7 @@ mod tests {
 
     #[test]
     fn flat_snapshot_returns_direct_item_bytes() {
-        let snapshot = FlatSnapshot::from_items(["alpha", "beta\\gamma"]);
+        let snapshot = FlatSnapshot::from_items([("alpha", ()), ("beta\\gamma", ())]);
         let mut stack = [0u8; 16];
         let mut heap = Vec::new();
 
@@ -389,7 +575,7 @@ mod tests {
 
     #[test]
     fn flat_snapshot_materializes_lossy_strings() {
-        let snapshot = FlatSnapshot::from_items(["one", "two"]);
+        let snapshot = FlatSnapshot::from_items([("one", ()), ("two", ())]);
         let mut out = Vec::new();
 
         assert_eq!(snapshot.get_string_lossy(1, &mut out), "two");

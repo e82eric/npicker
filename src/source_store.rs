@@ -6,7 +6,7 @@ use std::sync::{Arc, RwLock};
 
 pub enum AnyItemSource {
     FileSystem(Arc<PublishedSnapshot>),
-    Flat(Arc<FlatSnapshot>),
+    Flat(Arc<FlatSnapshot<()>>),
     Streaming(Arc<StreamingItemSnapshot>),
 }
 

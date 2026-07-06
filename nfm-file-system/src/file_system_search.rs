@@ -7,7 +7,7 @@ use crate::walker_search_store::FileSystemSearchStore;
 pub struct FileSystemSearch {
     search: FuzzySearchSession<PublishedSnapshot, FileSystemSearchStore>,
     scan: FileWalkerScan,
-    store: Arc<FileSystemSearchStore>,
+    _store: Arc<FileSystemSearchStore>,
 }
 
 impl FileSystemSearch {
@@ -33,7 +33,7 @@ impl FileSystemSearch {
         Self {
             search,
             scan,
-            store
+            _store: store
         }
     }
 

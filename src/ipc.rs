@@ -84,14 +84,16 @@ impl PickerRequest for FileSystemPickerRequest {
 }
 
 impl PickerRequest for FlatItemsPickerRequest {
-    type Source = FlatSnapshot;
+    type Source = FlatSnapshot<()>;
 
     fn search_string(&self) -> Option<&str> {
         self.search_string.as_deref()
     }
 
     fn run(&self) -> Arc<SharedStore> {
-        let snapshot = Arc::new(FlatSnapshot::from_items(self.items.iter()));
+        let snapshot = Arc::new(FlatSnapshot::from_items(
+            self.items.iter().map(|s| (s, ()))
+        ));
         Arc::new(SharedStore::completed(Arc::new(AnyItemSource::Flat(
             snapshot,
         ))))
