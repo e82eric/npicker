@@ -1012,7 +1012,7 @@ fn fzf_fuzzy_match_v2_ascii(
                 if bonus == BOUNDARY_BONUS {
                     consecutive = 1;
                 } else if consecutive > 1 {
-                    let consecutive_start = column - consecutive as usize + 1;
+                    let consecutive_start = column + 1 - consecutive as usize;
                     bonus = bonus
                         .max(BONUS_CONSECUTIVE)
                         .max(scratch.bonuses[consecutive_start]);
@@ -1039,45 +1039,46 @@ fn fzf_fuzzy_match_v2_ascii(
     }
 
     let mut start = max_score_pos;
-    if let Some(positions) = positions.as_deref_mut() {
-        let mut pattern_index = pattern_size - 1;
-        let mut prefer_match = true;
+    let mut pattern_index = pattern_size - 1;
+    let mut prefer_match = true;
 
-        loop {
-            let row = pattern_index * width;
-            let column = start - first_occurrence_of_first_char;
-            let current_score = scratch.score_matrix[row + column];
+    loop {
+        let row = pattern_index * width;
+        let column = start - first_occurrence_of_first_char;
+        let current_score = scratch.score_matrix[row + column];
 
-            let mut diagonal_score = 0;
-            if pattern_index > 0 && start >= scratch.first_occurrence[pattern_index] {
-                diagonal_score = scratch.score_matrix[row - width + column - 1];
-            }
+        let mut diagonal_score = 0;
+        if pattern_index > 0 && start >= scratch.first_occurrence[pattern_index] {
+            diagonal_score = scratch.score_matrix[row - width + column - 1];
+        }
 
-            let mut left_score = 0;
-            if start > scratch.first_occurrence[pattern_index] {
-                left_score = scratch.score_matrix[row + column - 1];
-            }
+        let mut left_score = 0;
+        if start > scratch.first_occurrence[pattern_index] {
+            left_score = scratch.score_matrix[row + column - 1];
+        }
 
-            if current_score > diagonal_score
-                && (current_score > left_score || (current_score == left_score && prefer_match))
-            {
+        if current_score > diagonal_score
+            && (current_score > left_score || (current_score == left_score && prefer_match))
+        {
+            if let Some(positions) = positions.as_deref_mut() {
                 positions.push(start);
-                if pattern_index == 0 {
-                    break;
-                }
-
-                pattern_index -= 1;
             }
 
-            if start == first_occurrence_of_first_char {
+            if pattern_index == 0 {
                 break;
             }
 
-            prefer_match = scratch.consecutive_matrix[row + column] > 1
-                || (row + width + column + 1 < scratch.consecutive_matrix.len()
-                    && scratch.consecutive_matrix[row + width + column + 1] > 0);
-            start -= 1;
+            pattern_index -= 1;
         }
+
+        if start == first_occurrence_of_first_char {
+            break;
+        }
+
+        prefer_match = scratch.consecutive_matrix[row + column] > 1
+            || (row + width + column + 1 < scratch.consecutive_matrix.len()
+                && scratch.consecutive_matrix[row + width + column + 1] > 0);
+        start -= 1;
     }
 
     FzfResult {
@@ -1343,5 +1344,290 @@ fn no_match() -> FzfResult {
         start: -1,
         end: -1,
         score: 0,
+    }
+}
+#[test]
+fn fuzzy_match_consecutive_at_start_does_not_underflow() {
+    let mut scratch = MatchScratch::default();
+
+    let result = fzf_fuzzy_match_v2_ascii(
+        false,
+        b"rights",
+        b"ri",
+        &mut scratch,
+        None,
+    );
+
+    assert!(result.score > 0);
+    assert_eq!(result.start, 0);
+    assert_eq!(result.end, 2);
+}
+
+#[cfg(test)]
+mod tests_from_fzf {
+    use super::*;
+
+    #[derive(Clone, Copy)]
+    enum Algorithm {
+        FuzzyV1,
+        FuzzyV2,
+        Exact,
+        Prefix,
+        Suffix,
+    }
+
+    fn run_match(
+        algorithm: Algorithm,
+        case_sensitive: bool,
+        text: &[u8],
+        pattern: &[u8],
+    ) -> FzfResult {
+        let mut scratch = MatchScratch::default();
+        match algorithm {
+            Algorithm::FuzzyV1 => fuzzy_match_v1_ascii(case_sensitive, text, pattern),
+            Algorithm::FuzzyV2 => {
+                fzf_fuzzy_match_v2_ascii(case_sensitive, text, pattern, &mut scratch, None)
+            }
+            Algorithm::Exact => fzf_exact_match_naive_ascii(case_sensitive, text, pattern),
+            Algorithm::Prefix => fzf_prefix_match_ascii(case_sensitive, text, pattern),
+            Algorithm::Suffix => fzf_suffix_match_ascii(case_sensitive, text, pattern),
+        }
+    }
+
+    fn assert_score(
+        algorithm: Algorithm,
+        case_sensitive: bool,
+        text: &[u8],
+        pattern: &[u8],
+        expected_score: i32,
+    ) {
+        let result = run_match(algorithm, case_sensitive, text, pattern);
+        assert_eq!(
+            result.score,
+            expected_score,
+            "pattern: {:?}, text: {:?}, case_sensitive: {case_sensitive}",
+            String::from_utf8_lossy(pattern),
+            String::from_utf8_lossy(text)
+        );
+    }
+
+    #[test]
+    fn fuzzy_match_scores_match_fzf_cases() {
+        for algorithm in [Algorithm::FuzzyV1, Algorithm::FuzzyV2] {
+            assert_score(
+                algorithm,
+                false,
+                b"fooBarbaz1",
+                b"obz",
+                SCORE_MATCH * 3 + CAMEL_CASE_BONUS + SCORE_GAP_START + SCORE_GAP_EXTENSION * 3,
+            );
+            assert_score(
+                algorithm,
+                false,
+                b"foo bar baz",
+                b"fbb",
+                SCORE_MATCH * 3
+                    + BOUNDARY_BONUS * BONUS_FIRST_CHAR_MULTIPLIER
+                    + BOUNDARY_BONUS * 2
+                    + 2 * SCORE_GAP_START
+                    + 4 * SCORE_GAP_EXTENSION,
+            );
+            assert_score(
+                algorithm,
+                false,
+                b"/AutomatorDocument.icns",
+                b"rdoc",
+                SCORE_MATCH * 4 + CAMEL_CASE_BONUS + BONUS_CONSECUTIVE * 2,
+            );
+            assert_score(
+                algorithm,
+                false,
+                b"/man1/zshcompctl.1",
+                b"zshc",
+                SCORE_MATCH * 4
+                    + BOUNDARY_BONUS * BONUS_FIRST_CHAR_MULTIPLIER
+                    + BOUNDARY_BONUS * 3,
+            );
+            assert_score(
+                algorithm,
+                false,
+                b"/.oh-my-zsh/cache",
+                b"zshc",
+                SCORE_MATCH * 4
+                    + BOUNDARY_BONUS * BONUS_FIRST_CHAR_MULTIPLIER
+                    + BOUNDARY_BONUS * 2
+                    + SCORE_GAP_START
+                    + BOUNDARY_BONUS,
+            );
+            assert_score(
+                algorithm,
+                false,
+                b"ab0123 456",
+                b"12356",
+                SCORE_MATCH * 5 + BONUS_CONSECUTIVE * 3 + SCORE_GAP_START + SCORE_GAP_EXTENSION,
+            );
+            assert_score(
+                algorithm,
+                false,
+                b"foo/bar/baz",
+                b"fbb",
+                SCORE_MATCH * 3
+                    + BOUNDARY_BONUS * BONUS_FIRST_CHAR_MULTIPLIER
+                    + BOUNDARY_BONUS * 2
+                    + 2 * SCORE_GAP_START
+                    + 4 * SCORE_GAP_EXTENSION,
+            );
+            assert_score(
+                algorithm,
+                true,
+                b"FooBarBaz",
+                b"FBB",
+                SCORE_MATCH * 3
+                    + BOUNDARY_BONUS * BONUS_FIRST_CHAR_MULTIPLIER
+                    + CAMEL_CASE_BONUS * 2
+                    + SCORE_GAP_START * 2
+                    + SCORE_GAP_EXTENSION * 2,
+            );
+            assert_score(algorithm, true, b"fooBarbaz", b"oBZ", 0);
+            assert_score(algorithm, true, b"Foo Bar Baz", b"fbb", 0);
+            assert_score(algorithm, true, b"fooBarbaz", b"fooBarbazz", 0);
+        }
+    }
+
+    #[test]
+    fn fuzzy_match_v1_forward_case_score_matches_fzf() {
+        assert_score(
+            Algorithm::FuzzyV1,
+            false,
+            b"foobar fb",
+            b"fb",
+            SCORE_MATCH * 2
+                + BOUNDARY_BONUS * BONUS_FIRST_CHAR_MULTIPLIER
+                + SCORE_GAP_START
+                + SCORE_GAP_EXTENSION,
+        );
+    }
+
+    #[test]
+    fn exact_match_naive_scores_match_fzf_cases() {
+        assert_score(Algorithm::Exact, true, b"fooBarbaz", b"oBA", 0);
+        assert_score(Algorithm::Exact, true, b"fooBarbaz", b"fooBarbazz", 0);
+        assert_score(
+            Algorithm::Exact,
+            false,
+            b"fooBarbaz",
+            b"oba",
+            SCORE_MATCH * 3 + CAMEL_CASE_BONUS + BONUS_CONSECUTIVE,
+        );
+        assert_score(
+            Algorithm::Exact,
+            false,
+            b"/AutomatorDocument.icns",
+            b"rdoc",
+            SCORE_MATCH * 4 + CAMEL_CASE_BONUS + BONUS_CONSECUTIVE * 2,
+        );
+        assert_score(
+            Algorithm::Exact,
+            false,
+            b"/man1/zshcompctl.1",
+            b"zshc",
+            SCORE_MATCH * 4 + BOUNDARY_BONUS * (BONUS_FIRST_CHAR_MULTIPLIER + 3),
+        );
+        assert_score(
+            Algorithm::Exact,
+            false,
+            b"/.oh-my-zsh/cache",
+            b"zsh/c",
+            SCORE_MATCH * 5
+                + BOUNDARY_BONUS * (BONUS_FIRST_CHAR_MULTIPLIER + 3)
+                + BOUNDARY_BONUS,
+        );
+    }
+
+    #[test]
+    fn exact_match_naive_backward_case_score_matches_fzf() {
+        assert_score(
+            Algorithm::Exact,
+            false,
+            b"foobar foob",
+            b"oo",
+            SCORE_MATCH * 2 + BONUS_CONSECUTIVE,
+        );
+    }
+
+    #[test]
+    fn prefix_match_scores_match_fzf_cases() {
+        let score = SCORE_MATCH * 3
+            + BOUNDARY_BONUS * BONUS_FIRST_CHAR_MULTIPLIER
+            + BOUNDARY_BONUS * 2;
+
+        assert_score(Algorithm::Prefix, true, b"fooBarbaz", b"Foo", 0);
+        assert_score(Algorithm::Prefix, false, b"fooBarBaz", b"baz", 0);
+        assert_score(Algorithm::Prefix, false, b"fooBarbaz", b"foo", score);
+        assert_score(Algorithm::Prefix, false, b"foOBarBaZ", b"foo", score);
+        assert_score(Algorithm::Prefix, false, b"f-oBarbaz", b"f-o", score);
+        assert_score(Algorithm::Prefix, false, b" fooBar", b"foo", score);
+        assert_score(Algorithm::Prefix, false, b" fooBar", b" fo", score);
+        assert_score(Algorithm::Prefix, false, b"     fo", b"foo", 0);
+    }
+
+    #[test]
+    fn suffix_match_scores_match_fzf_cases() {
+        assert_score(Algorithm::Suffix, true, b"fooBarbaz", b"Baz", 0);
+        assert_score(Algorithm::Suffix, false, b"fooBarbaz", b"foo", 0);
+        assert_score(
+            Algorithm::Suffix,
+            false,
+            b"fooBarbaz",
+            b"baz",
+            SCORE_MATCH * 3 + BONUS_CONSECUTIVE * 2,
+        );
+        assert_score(
+            Algorithm::Suffix,
+            false,
+            b"fooBarBaZ",
+            b"baz",
+            (SCORE_MATCH + CAMEL_CASE_BONUS) * 3
+                + CAMEL_CASE_BONUS * (BONUS_FIRST_CHAR_MULTIPLIER - 1),
+        );
+        assert_score(
+            Algorithm::Suffix,
+            false,
+            b"fooBarbaz ",
+            b"baz",
+            SCORE_MATCH * 3 + BONUS_CONSECUTIVE * 2,
+        );
+        assert_score(
+            Algorithm::Suffix,
+            false,
+            b"fooBarbaz ",
+            b"baz ",
+            SCORE_MATCH * 4 + BONUS_CONSECUTIVE * 2 + BOUNDARY_BONUS,
+        );
+    }
+
+    #[test]
+    fn empty_pattern_scores_match_fzf_cases() {
+        for algorithm in [
+            Algorithm::FuzzyV1,
+            Algorithm::FuzzyV2,
+            Algorithm::Exact,
+            Algorithm::Prefix,
+            Algorithm::Suffix,
+        ] {
+            assert_score(algorithm, true, b"foobar", b"", 0);
+        }
+    }
+
+    #[test]
+    fn long_string_match_past_u16_max_matches_fzf_case() {
+        let mut text = vec![b'x'; u16::MAX as usize * 2];
+        text.insert(u16::MAX as usize, b'z');
+
+        let result = run_match(Algorithm::FuzzyV2, true, &text, b"zx");
+
+        assert_eq!(result.start, u16::MAX as isize);
+        assert_eq!(result.end, u16::MAX as isize + 2);
+        assert_eq!(result.score, SCORE_MATCH * 2 + BONUS_CONSECUTIVE);
     }
 }

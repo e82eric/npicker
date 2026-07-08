@@ -1,4 +1,5 @@
 use crate::fuzzy_search_session::SearchSnapshotProvider;
+use crate::snapshot_store::SnapshotStore;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -331,6 +332,11 @@ pub struct StreamingItemStoreWithPayload<T : Copy + Default> {
     done: AtomicBool,
 }
 
+pub struct AddItemResult {
+    pub item_index: u32,
+    pub published: bool,
+}
+
 impl<T : Copy + Default> StreamingItemStoreWithPayload<T> {
     pub fn new() -> Self {
         Self {
@@ -343,7 +349,7 @@ impl<T : Copy + Default> StreamingItemStoreWithPayload<T> {
         }
     }
 
-    pub fn add_item(&mut self, item: &[u8], payload: T) -> u32 {
+    pub fn add_item(&mut self, item: &[u8], payload: T) -> AddItemResult {
         let flat_item = FlatItem {
             offset: self.bytes.len(),
             len: item.len(),
@@ -356,11 +362,17 @@ impl<T : Copy + Default> StreamingItemStoreWithPayload<T> {
 
         debug_assert_eq!(self.items.len(), self.payloads.len());
 
-        if self.items.len() % PUBLISH_ITEM_INTERVAL == 0 {
+        let published = if self.items.len() % PUBLISH_ITEM_INTERVAL == 0 {
             self.publish();
-        }
+            true
+        } else {
+            false
+        };
 
-        item_index
+        AddItemResult {
+            item_index,
+            published,
+        }
     }
 
     pub fn publish(&mut self) {
@@ -384,6 +396,41 @@ impl<T : Copy + Default> StreamingItemStoreWithPayload<T> {
     pub fn complete_adding(&mut self) {
         self.publish();
         self.done.store(true, Ordering::Release);
+    }
+}
+
+pub struct PublishingStreamingItemStoreWithPayload<T: Copy + Default> {
+    store: StreamingItemStoreWithPayload<T>,
+    publisher: Arc<SnapshotStore<StreamingItemSnapshotWithPayload<T>>>,
+}
+
+impl<T: Copy + Default> PublishingStreamingItemStoreWithPayload<T> {
+    pub fn new(publisher: Arc<SnapshotStore<StreamingItemSnapshotWithPayload<T>>>) -> Self {
+        Self {
+            store: StreamingItemStoreWithPayload::new(),
+            publisher,
+        }
+    }
+
+    pub fn add_item(&mut self, item: &[u8], payload: T) -> u32 {
+        let result = self.store.add_item(item, payload);
+
+        if result.published {
+            self.publisher.publish(self.store.snapshot());
+        }
+
+        result.item_index
+    }
+
+    pub fn publish(&mut self) {
+        self.store.publish();
+        self.publisher.publish(self.store.snapshot());
+    }
+
+    pub fn complete(&mut self) {
+        self.store.complete_adding();
+        self.publisher.publish(self.store.snapshot());
+        self.publisher.complete();
     }
 }
 
