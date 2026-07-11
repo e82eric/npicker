@@ -23,6 +23,22 @@ const CAMEL_CASE_BONUS: i32 = BOUNDARY_BONUS + SCORE_GAP_EXTENSION;
 const BONUS_CONSECUTIVE: i32 = -(SCORE_GAP_START + SCORE_GAP_EXTENSION);
 const BONUS_FIRST_CHAR_MULTIPLIER: i32 = 2;
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum SearchSortMode {
+    #[default]
+    Score,
+    SourceOrder,
+}
+
+impl SearchSortMode {
+    fn timing_label(self) -> &'static str {
+        match self {
+            Self::Score => "fuzzy",
+            Self::SourceOrder => "fuzzy_source_order",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct SearchOutput {
     pub results: Vec<SearchResult>,
@@ -76,19 +92,144 @@ impl PartialOrd for WorstFirst {
     }
 }
 
+enum CandidateCollector {
+    Score(BinaryHeap<WorstFirst>),
+    SourceOrder(Vec<Candidate>),
+}
+
+impl CandidateCollector {
+    fn new(sort_mode: SearchSortMode) -> Self {
+        match sort_mode {
+            SearchSortMode::Score => Self::Score(BinaryHeap::new()),
+            SearchSortMode::SourceOrder => Self::SourceOrder(Vec::new()),
+        }
+    }
+
+    fn push(&mut self, candidate: Candidate) {
+        match self {
+            Self::Score(heap) => push_bounded(heap, candidate, RESULT_LIMIT),
+            Self::SourceOrder(candidates) => {
+                if candidates.len() < RESULT_LIMIT {
+                    candidates.push(candidate);
+                }
+            }
+        }
+    }
+
+    fn merge(&mut self, other: Self) {
+        match (self, other) {
+            (Self::Score(left), Self::Score(right)) => {
+                for candidate in right.into_iter().map(|wrapped| wrapped.0) {
+                    push_bounded(left, candidate, RESULT_LIMIT);
+                }
+            }
+            (Self::SourceOrder(left), Self::SourceOrder(mut right)) => {
+                left.append(&mut right);
+                left.sort_unstable_by_key(|candidate| candidate.node_index);
+                left.truncate(RESULT_LIMIT);
+            }
+            _ => unreachable!("candidate collectors must have the same sort mode"),
+        }
+    }
+
+    fn into_sorted_candidates(self) -> Vec<Candidate> {
+        match self {
+            Self::Score(heap) => {
+                let mut candidates: Vec<_> = heap.into_iter().map(|wrapped| wrapped.0).collect();
+                candidates.sort_unstable_by(|left, right| right.cmp(left));
+                candidates
+            }
+            Self::SourceOrder(mut candidates) => {
+                candidates.sort_unstable_by_key(|candidate| candidate.node_index);
+                candidates
+            }
+        }
+    }
+}
+
+struct SearchAccumulator {
+    candidates: CandidateCollector,
+    matched: usize,
+    scratch: MatchScratch,
+    path_buffer: Vec<u8>,
+    stack_path_buffer: Box<[u8; 4096]>,
+    utf8_count: usize,
+    timing_samples: usize,
+    path_us: u128,
+    score_us: u128,
+    retention_us: u128,
+    cancelled: bool,
+}
+
+impl SearchAccumulator {
+    fn new(sort_mode: SearchSortMode) -> Self {
+        Self {
+            candidates: CandidateCollector::new(sort_mode),
+            matched: 0,
+            scratch: MatchScratch::default(),
+            path_buffer: Vec::with_capacity(512),
+            stack_path_buffer: Box::new([0u8; 4096]),
+            utf8_count: 0,
+            timing_samples: 0,
+            path_us: 0,
+            score_us: 0,
+            retention_us: 0,
+            cancelled: false,
+        }
+    }
+
+    fn merge(&mut self, other: Self) {
+        self.candidates.merge(other.candidates);
+        self.matched += other.matched;
+        self.utf8_count += other.utf8_count;
+        self.timing_samples += other.timing_samples;
+        self.path_us += other.path_us;
+        self.score_us += other.score_us;
+        self.retention_us += other.retention_us;
+        self.cancelled |= other.cancelled;
+    }
+}
+
 pub fn search<S, F>(snapshot: Arc<S>, query: &str, is_cancelled: F) -> Option<SearchOutput>
 where
     S: ItemsSource + Send + Sync,
     F: Fn() -> bool + Sync,
 {
+    search_with_sort(snapshot, query, SearchSortMode::Score, is_cancelled)
+}
+
+pub fn search_with_sort<S, F>(
+    snapshot: Arc<S>,
+    query: &str,
+    sort_mode: SearchSortMode,
+    is_cancelled: F,
+) -> Option<SearchOutput>
+where
+    S: ItemsSource + Send + Sync,
+    F: Fn() -> bool + Sync,
+{
     let end = snapshot.len();
-    search_range(snapshot, query, 0..end, is_cancelled)
+    search_range_with_sort(snapshot, query, 0..end, sort_mode, is_cancelled)
 }
 
 pub fn search_range<S, F>(
     snapshot: Arc<S>,
     query: &str,
     range: Range<usize>,
+    is_cancelled: F,
+) -> Option<SearchOutput>
+where
+    S: ItemsSource + Send + Sync,
+    F: Fn() -> bool + Sync,
+{
+    search_range_with_sort(snapshot, query, range, SearchSortMode::Score, is_cancelled)
+}
+
+pub fn search_range_with_sort<S, F>(
+    snapshot: Arc<S>,
+    query: &str,
+    range: Range<usize>,
+    sort_mode: SearchSortMode,
     is_cancelled: F,
 ) -> Option<SearchOutput>
 where
@@ -149,217 +290,88 @@ where
     let parse_us = timing::elapsed_us(parse_start);
 
     let match_start = Instant::now();
-    let (
-        candidates,
-        matched,
-        _,
-        _,
-        _,
-        _,
-        utf8_count,
-        timing_samples,
-        path_us,
-        score_us,
-        heap_us,
-        cancelled,
-    ) = (start_index..end_index)
+    let accumulator = (start_index..end_index)
         .into_par_iter()
         .fold(
-            || {
-                (
-                    BinaryHeap::new(),
-                    0usize,
-                    MatchScratch::default(),
-                    Vec::with_capacity(512),
-                    Box::new([0u8; 4096]),
-                    Box::new([0; 256]),
-                    0usize,
-                    0usize,
-                    0u128,
-                    0u128,
-                    0u128,
-                    false,
-                )
-            },
-            |(
-                mut heap,
-                mut matched,
-                mut scratch,
-                mut path_buffer,
-                mut stack_path_buffer,
-                stack_segments,
-                mut utf8_count,
-                mut timing_samples,
-                mut path_us,
-                mut score_us,
-                mut heap_us,
-                mut cancelled,
-            ),
-             node_index| {
-                if cancelled {
-                    return (
-                        heap,
-                        matched,
-                        scratch,
-                        path_buffer,
-                        stack_path_buffer,
-                        stack_segments,
-                        utf8_count,
-                        timing_samples,
-                        path_us,
-                        score_us,
-                        heap_us,
-                        cancelled,
-                    );
+            || SearchAccumulator::new(sort_mode),
+            |mut state, node_index| {
+                if state.cancelled {
+                    return state;
                 }
 
                 if (node_index & 0x3ff) == 0 && is_cancelled() {
-                    cancelled = true;
-                    return (
-                        heap,
-                        matched,
-                        scratch,
-                        path_buffer,
-                        stack_path_buffer,
-                        stack_segments,
-                        utf8_count,
-                        timing_samples,
-                        path_us,
-                        score_us,
-                        heap_us,
-                        cancelled,
-                    );
+                    state.cancelled = true;
+                    return state;
                 }
 
                 let time_sample = (node_index & (SEARCH_TIMING_SAMPLE_RATE - 1)) == 0;
                 let path_start = time_sample.then(Instant::now);
-                let path_bytes =
-                    snapshot.get_string(node_index, &mut stack_path_buffer[..], &mut path_buffer);
+                let path_bytes = snapshot.get_string(
+                    node_index,
+                    &mut state.stack_path_buffer[..],
+                    &mut state.path_buffer,
+                );
                 if let Some(path_start) = path_start {
-                    path_us += timing::elapsed_us(path_start);
-                    timing_samples += 1;
+                    state.path_us += timing::elapsed_us(path_start);
+                    state.timing_samples += 1;
                 }
 
-                utf8_count += 1;
+                state.utf8_count += 1;
                 let score_start = time_sample.then(Instant::now);
                 let score = if path_bytes.is_ascii() {
-                    pattern.score(path_bytes, &mut scratch)
+                    pattern.score(path_bytes, &mut state.scratch)
                 } else {
                     None
                 };
                 if let Some(score_start) = score_start {
-                    score_us += timing::elapsed_us(score_start);
+                    state.score_us += timing::elapsed_us(score_start);
                 }
 
                 if let Some(score) = score {
-                    matched += 1;
-                    let heap_start = time_sample.then(Instant::now);
-                    push_bounded(
-                        &mut heap,
-                        Candidate {
-                            node_index,
-                            length: path_bytes.len(),
-                            score,
-                        },
-                        RESULT_LIMIT,
-                    );
-                    if let Some(heap_start) = heap_start {
-                        heap_us += timing::elapsed_us(heap_start);
+                    state.matched += 1;
+                    let retention_start = time_sample.then(Instant::now);
+                    state.candidates.push(Candidate {
+                        node_index,
+                        length: path_bytes.len(),
+                        score,
+                    });
+                    if let Some(retention_start) = retention_start {
+                        state.retention_us += timing::elapsed_us(retention_start);
                     }
                 }
 
-                (
-                    heap,
-                    matched,
-                    scratch,
-                    path_buffer,
-                    stack_path_buffer,
-                    stack_segments,
-                    utf8_count,
-                    timing_samples,
-                    path_us,
-                    score_us,
-                    heap_us,
-                    cancelled,
-                )
+                state
             },
         )
         .reduce(
-            || {
-                (
-                    BinaryHeap::new(),
-                    0usize,
-                    MatchScratch::default(),
-                    Vec::new(),
-                    Box::new([0u8; 4096]),
-                    Box::new([0; 256]),
-                    0usize,
-                    0usize,
-                    0u128,
-                    0u128,
-                    0u128,
-                    false,
-                )
-            },
-            |(
-                mut left,
-                left_matched,
-                left_scratch,
-                left_path_buffer,
-                left_stack_path_buffer,
-                left_stack_segments,
-                left_utf8_count,
-                left_timing_samples,
-                left_path_us,
-                left_score_us,
-                left_heap_us,
-                left_cancelled,
-            ),
-             (
-                right,
-                right_matched,
-                _,
-                _,
-                _,
-                _,
-                right_utf8_count,
-                right_timing_samples,
-                right_path_us,
-                right_score_us,
-                right_heap_us,
-                right_cancelled,
-            )| {
-                for candidate in right.into_iter().map(|wrapped| wrapped.0) {
-                    push_bounded(&mut left, candidate, RESULT_LIMIT);
-                }
-                (
-                    left,
-                    left_matched + right_matched,
-                    left_scratch,
-                    left_path_buffer,
-                    left_stack_path_buffer,
-                    left_stack_segments,
-                    left_utf8_count + right_utf8_count,
-                    left_timing_samples + right_timing_samples,
-                    left_path_us + right_path_us,
-                    left_score_us + right_score_us,
-                    left_heap_us + right_heap_us,
-                    left_cancelled || right_cancelled,
-                )
+            || SearchAccumulator::new(sort_mode),
+            |mut left, right| {
+                left.merge(right);
+                left
             },
         );
     let match_us = timing::elapsed_us(match_start);
+    let SearchAccumulator {
+        candidates,
+        matched,
+        utf8_count,
+        timing_samples,
+        path_us,
+        score_us,
+        retention_us,
+        cancelled,
+        ..
+    } = accumulator;
     if cancelled || is_cancelled() {
         timing::write(format!(
-            "search_cancelled mode=fuzzy match_us={match_us} matched={matched} total={total}"
+            "search_cancelled mode={} match_us={match_us} matched={matched} total={total}",
+            sort_mode.timing_label()
         ));
         return None;
     }
 
     let sort_start = Instant::now();
-    let mut candidates: Vec<_> = candidates.into_iter().map(|wrapped| wrapped.0).collect();
-    candidates.sort_by(|left, right| right.cmp(left));
-    candidates.truncate(RESULT_LIMIT);
+    let candidates = candidates.into_sorted_candidates();
     let sort_us = timing::elapsed_us(sort_start);
 
     let append_start = Instant::now();
@@ -388,10 +400,11 @@ where
     };
     let utf8_path_estimate_us = path_us * sampled_scale;
     let ascii_score_estimate_us = score_us * sampled_scale;
-    let heap_estimate_us = heap_us * sampled_scale;
+    let retention_estimate_us = retention_us * sampled_scale;
 
     timing::write(format!(
-        "search_detail mode=fuzzy total_us={total_us} parse_us={parse_us} match_us={match_us} sort_us={sort_us} append_us={append_us} utf8_path_estimate_us={utf8_path_estimate_us} ascii_score_estimate_us={ascii_score_estimate_us} char_fallback_estimate_us=0 heap_estimate_us={heap_estimate_us} timing_sample_rate={SEARCH_TIMING_SAMPLE_RATE} timing_samples={timing_samples} utf8_count={utf8_count} fallback_count=0 shown={} matched={matched} total={total}",
+        "search_detail mode={} total_us={total_us} parse_us={parse_us} match_us={match_us} sort_us={sort_us} append_us={append_us} utf8_path_estimate_us={utf8_path_estimate_us} ascii_score_estimate_us={ascii_score_estimate_us} char_fallback_estimate_us=0 retention_estimate_us={retention_estimate_us} timing_sample_rate={SEARCH_TIMING_SAMPLE_RATE} timing_samples={timing_samples} utf8_count={utf8_count} fallback_count=0 shown={} matched={matched} total={total} searched={searched}",
+        sort_mode.timing_label(),
         results.len()
     ));
 
@@ -1346,6 +1359,66 @@ fn no_match() -> FzfResult {
         score: 0,
     }
 }
+
+#[cfg(test)]
+mod search_sort_tests {
+    use super::*;
+    use crate::store::FlatSnapshot;
+
+    #[test]
+    fn source_order_returns_first_matches_up_to_result_limit() {
+        let item_count = RESULT_LIMIT + 25;
+        let snapshot = Arc::new(FlatSnapshot::from_items(
+            (0..item_count).map(|index| (format!("match-{index:04}"), ())),
+        ));
+
+        let output = search_with_sort(snapshot, "match", SearchSortMode::SourceOrder, || false)
+            .expect("search should complete");
+
+        assert_eq!(output.matched, item_count);
+        assert_eq!(output.results.len(), RESULT_LIMIT);
+        assert_eq!(
+            output
+                .results
+                .iter()
+                .map(|result| result.node_index)
+                .collect::<Vec<_>>(),
+            (0..RESULT_LIMIT).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn sort_modes_report_the_same_match_count() {
+        let snapshot = Arc::new(FlatSnapshot::from_items([
+            ("prefix needle", ()),
+            ("not a result", ()),
+            ("needle", ()),
+            ("another needle result", ()),
+        ]));
+
+        let score = search_with_sort(
+            Arc::clone(&snapshot),
+            "needle",
+            SearchSortMode::Score,
+            || false,
+        )
+        .expect("score search should complete");
+        let source_order =
+            search_with_sort(snapshot, "needle", SearchSortMode::SourceOrder, || false)
+                .expect("source-order search should complete");
+
+        assert_eq!(source_order.matched, score.matched);
+        assert_eq!(
+            source_order
+                .results
+                .iter()
+                .map(|result| result.node_index)
+                .collect::<Vec<_>>(),
+            vec![0, 2, 3]
+        );
+    }
+}
+
 #[test]
 fn fuzzy_match_consecutive_at_start_does_not_underflow() {
     let mut scratch = MatchScratch::default();

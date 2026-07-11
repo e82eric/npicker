@@ -4,9 +4,12 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use crossbeam_channel::{bounded, Receiver, Sender};
-use crate::search::{search, search_range, SearchOutput, SearchResult, RESULT_LIMIT};
+use crate::search::{
+    search_range_with_sort, search_with_sort, SearchOutput, SearchResult, SearchSortMode,
+    RESULT_LIMIT,
+};
 use crate::store::ItemsSource;
+use crossbeam_channel::{bounded, Receiver, Sender};
 
 pub trait SearchSnapshotProvider<S>: Send + Sync + 'static
 where
@@ -44,6 +47,7 @@ where
 {
     session_id: u64,
     provider: Arc<P>,
+    sort_mode: SearchSortMode,
     query: Mutex<String>,
     search_version: AtomicU64,
     cancelled: AtomicBool,
@@ -85,11 +89,28 @@ where
         initial_query: String,
         updates_tx: Sender<FuzzySearchUpdate>,
     ) -> Self {
+        Self::new_with_sort(
+            session_id,
+            provider,
+            initial_query,
+            updates_tx,
+            SearchSortMode::Score,
+        )
+    }
+
+    pub fn new_with_sort(
+        session_id: u64,
+        provider: Arc<P>,
+        initial_query: String,
+        updates_tx: Sender<FuzzySearchUpdate>,
+        sort_mode: SearchSortMode,
+    ) -> Self {
         let (signal_tx, signal_rx) = bounded(1);
         Self {
             inner: Arc::new(FuzzySearcherInner {
                 session_id,
                 provider,
+                sort_mode,
                 query: Mutex::new(initial_query),
                 search_version: AtomicU64::new(0),
                 cancelled: AtomicBool::new(false),
@@ -196,17 +217,20 @@ where
 
         let use_incremental = cache.query == query && cache.searched_len <= total;
         let output = if use_incremental {
-            let Some(delta) = search_range(
+            let Some(delta) = search_range_with_sort(
                 Arc::clone(&snapshot),
                 &query,
                 cache.searched_len..total,
+                self.sort_mode,
                 should_cancel,
             ) else {
                 return;
             };
-            merge_cached_search(cache, &query, delta)
+            merge_cached_search(cache, &query, delta, self.sort_mode)
         } else {
-            let Some(output) = search(Arc::clone(&snapshot), &query, should_cancel) else {
+            let Some(output) =
+                search_with_sort(Arc::clone(&snapshot), &query, self.sort_mode, should_cancel)
+            else {
                 return;
             };
             *cache = SearchCache {
@@ -234,7 +258,12 @@ where
     }
 }
 
-fn merge_cached_search(cache: &mut SearchCache, query: &str, delta: SearchOutput) -> SearchOutput {
+fn merge_cached_search(
+    cache: &mut SearchCache,
+    query: &str,
+    delta: SearchOutput,
+    sort_mode: SearchSortMode,
+) -> SearchOutput {
     cache.query = query.to_owned();
     cache.searched_len = delta.total;
     cache.matched += delta.matched;
@@ -248,7 +277,10 @@ fn merge_cached_search(cache: &mut SearchCache, query: &str, delta: SearchOutput
         }
     } else {
         cache.results.extend(delta.results);
-        cache.results.sort_by(compare_search_results);
+        match sort_mode {
+            SearchSortMode::Score => cache.results.sort_by(compare_search_results),
+            SearchSortMode::SourceOrder => cache.results.sort_by_key(|result| result.node_index),
+        }
         cache.results.truncate(RESULT_LIMIT);
     }
 
