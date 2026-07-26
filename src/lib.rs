@@ -1,7 +1,6 @@
-pub mod d2d_ui;
+#[cfg(windows)]
 pub mod ffi;
-pub mod ipc;
-#[cfg(feature = "skia")]
+pub mod request;
 pub mod skia_ui;
 pub mod source_store;
 pub mod view_model;

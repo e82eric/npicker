@@ -226,7 +226,7 @@ impl ItemsSource for StreamingItemSnapshot {
     }
 }
 
-impl<T : Copy> ItemsSource for StreamingItemSnapshotWithPayload<T> {
+impl<T: Copy> ItemsSource for StreamingItemSnapshotWithPayload<T> {
     fn version(&self) -> u64 {
         self.version
     }
@@ -277,7 +277,7 @@ impl<T : Copy> ItemsSource for StreamingItemSnapshotWithPayload<T> {
     }
 }
 
-pub struct StreamingItemSnapshotWithPayload<T : Copy> {
+pub struct StreamingItemSnapshotWithPayload<T: Copy> {
     items: ChunkedSnapshot<FlatItem>,
     items_count: usize,
     payloads: ChunkedSnapshot<T>,
@@ -286,7 +286,7 @@ pub struct StreamingItemSnapshotWithPayload<T : Copy> {
     version: u64,
 }
 
-impl<T : Copy> StreamingItemSnapshotWithPayload<T> {
+impl<T: Copy> StreamingItemSnapshotWithPayload<T> {
     fn empty() -> Self {
         Self {
             items: ChunkedSnapshot::empty(),
@@ -323,7 +323,7 @@ impl<T : Copy> StreamingItemSnapshotWithPayload<T> {
     }
 }
 
-pub struct StreamingItemStoreWithPayload<T : Copy + Default> {
+pub struct StreamingItemStoreWithPayload<T: Copy + Default> {
     items: ChunkedStorage<FlatItem>,
     bytes: ChunkedStorage<u8>,
     payloads: ChunkedStorage<T>,
@@ -337,7 +337,7 @@ pub struct AddItemResult {
     pub published: bool,
 }
 
-impl<T : Copy + Default> StreamingItemStoreWithPayload<T> {
+impl<T: Copy + Default> StreamingItemStoreWithPayload<T> {
     pub fn new() -> Self {
         Self {
             items: ChunkedStorage::new(ITEM_CHUNK_SIZE),
@@ -434,7 +434,10 @@ impl<T: Copy + Default> PublishingStreamingItemStoreWithPayload<T> {
     }
 }
 
-impl<T : Copy + Default + Send + Sync + 'static> SearchSnapshotProvider<StreamingItemSnapshotWithPayload<T>> for StreamingItemStoreWithPayload<T> {
+impl<T: Copy + Default + Send + Sync + 'static>
+    SearchSnapshotProvider<StreamingItemSnapshotWithPayload<T>>
+    for StreamingItemStoreWithPayload<T>
+{
     fn snapshot(&self) -> Option<Arc<StreamingItemSnapshotWithPayload<T>>> {
         Some(StreamingItemStoreWithPayload::snapshot(self))
     }

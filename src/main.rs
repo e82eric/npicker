@@ -2,48 +2,48 @@ use std::io::Write;
 use std::sync::Arc;
 
 use anyhow::Result;
-use rust_nfm::ipc::StdInRequest;
-#[cfg(feature = "skia")]
+use crossbeam_channel::bounded;
+#[cfg(windows)]
+use rust_nfm::request::FileSystemPickerRequest;
+use rust_nfm::request::{PickerResponse, StdinRequest};
 use rust_nfm::skia_ui;
 use rust_nfm::view_model::ViewModel;
-use rust_nfm::{d2d_ui, ipc};
 
-fn output_debug_string(line: &str) {
-    use windows::core::PCWSTR;
-    use windows::Win32::System::Diagnostics::Debug::OutputDebugStringW;
+fn output_timing(line: &str) {
+    #[cfg(windows)]
+    {
+        use windows::core::PCWSTR;
+        use windows::Win32::System::Diagnostics::Debug::OutputDebugStringW;
 
-    let wide: Vec<u16> = line.encode_utf16().chain(std::iter::once(0)).collect();
-    unsafe {
-        OutputDebugStringW(PCWSTR(wide.as_ptr()));
+        let wide: Vec<u16> = line.encode_utf16().chain(std::iter::once(0)).collect();
+        unsafe {
+            OutputDebugStringW(PCWSTR(wide.as_ptr()));
+        }
     }
+    #[cfg(not(windows))]
+    eprintln!("{line}");
 }
 
 fn main() -> Result<()> {
     let options = app_options();
-    let view_model = ViewModel::new();
-
     if options.debug_wait {
         debug_wait();
     }
 
-    nfm_search_core::timing::set_sink(output_debug_string);
-
-    if options.stdin {
-        run_stdin_request(Arc::clone(&view_model))?;
-    } else {
-        let server_view_model = Arc::clone(&view_model);
-        std::thread::spawn(move || {
-            if let Err(error) = ipc::run_pipe_server(server_view_model) {
-                eprintln!("pipe server stopped: {error:?}");
-            }
-        });
+    nfm_search_core::timing::set_sink(output_timing);
+    let view_model = ViewModel::new();
+    let (completion_tx, completion_rx) = bounded(1);
+    match options.input {
+        InputMode::Stdin => run_stdin_request(Arc::clone(&view_model), completion_tx),
+        InputMode::FileWalker(roots) => {
+            run_filewalker_request(Arc::clone(&view_model), roots, completion_tx)?
+        }
     }
-
-    match options.ui {
-        UiBackend::D2d => d2d_ui::run(view_model),
-        #[cfg(feature = "skia")]
-        UiBackend::Skia => skia_ui::run(view_model),
+    let code = skia_ui::run(view_model, Some(completion_rx))?;
+    if code != 0 {
+        std::process::exit(code);
     }
+    Ok(())
 }
 
 fn debug_wait() {
@@ -52,74 +52,118 @@ fn debug_wait() {
     std::thread::sleep(std::time::Duration::from_secs(20));
 }
 
-fn run_stdin_request(view_model: Arc<ViewModel>) -> Result<()> {
+fn run_stdin_request(view_model: Arc<ViewModel>, completion: crossbeam_channel::Sender<i32>) {
     std::thread::spawn(move || {
-        let request = StdInRequest::new(None);
-
-        let code = match view_model.run_request(&request) {
-            Ok(response) if response.status == "selected" => {
-                if let Some(item) = response.selected_item {
-                    let mut stdout = std::io::stdout().lock();
-                    if writeln!(stdout, "{item}").is_err() || stdout.flush().is_err() {
-                        1
-                    } else {
-                        0
-                    }
-                } else {
-                    0
-                }
-            }
-            Ok(response) if response.status == "cancelled" => 0,
-            Ok(response) => {
-                if let Some(message) = response.error_message {
-                    eprintln!("{message}");
-                }
-                1
-            }
-            Err(error) => {
-                eprintln!("{error:?}");
-                1
-            }
-        };
-        std::process::exit(code);
+        let request = StdinRequest::new(None);
+        let code = response_exit_code(view_model.run_request(&request));
+        let _ = completion.send(code);
     });
+}
 
+#[cfg(windows)]
+fn run_filewalker_request(
+    view_model: Arc<ViewModel>,
+    roots: Vec<String>,
+    completion: crossbeam_channel::Sender<i32>,
+) -> Result<()> {
+    let roots = if roots.is_empty() {
+        vec![default_home_directory()?]
+    } else {
+        roots
+    };
+    std::thread::spawn(move || {
+        let request = FileSystemPickerRequest {
+            root_directories: roots,
+            max_depth: i32::MAX,
+            directories_only: false,
+            files_only: false,
+            search_string: None,
+        };
+        let code = response_exit_code(view_model.run_request(&request));
+        let _ = completion.send(code);
+    });
     Ok(())
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum UiBackend {
-    D2d,
-    #[cfg(feature = "skia")]
-    Skia,
+#[cfg(not(windows))]
+fn run_filewalker_request(
+    _view_model: Arc<ViewModel>,
+    _roots: Vec<String>,
+    _completion: crossbeam_channel::Sender<i32>,
+) -> Result<()> {
+    anyhow::bail!("the filewalker input mode is currently available only on Windows")
+}
+
+#[cfg(windows)]
+fn default_home_directory() -> Result<String> {
+    if let Some(profile) = std::env::var_os("USERPROFILE").filter(|value| !value.is_empty()) {
+        return Ok(profile.to_string_lossy().into_owned());
+    }
+    if let (Some(drive), Some(path)) = (std::env::var_os("HOMEDRIVE"), std::env::var_os("HOMEPATH"))
+    {
+        let mut home = std::path::PathBuf::from(drive);
+        home.push(path);
+        return Ok(home.to_string_lossy().into_owned());
+    }
+    Ok(std::env::current_dir()?.to_string_lossy().into_owned())
+}
+
+fn response_exit_code(response: Result<PickerResponse>) -> i32 {
+    match response {
+        Ok(response) if response.status == "selected" => {
+            if let Some(item) = response.selected_item {
+                let mut stdout = std::io::stdout().lock();
+                if writeln!(stdout, "{item}").is_err() || stdout.flush().is_err() {
+                    1
+                } else {
+                    0
+                }
+            } else {
+                0
+            }
+        }
+        Ok(response) if response.status == "cancelled" => 0,
+        Ok(response) => {
+            if let Some(message) = response.error_message {
+                eprintln!("{message}");
+            }
+            1
+        }
+        Err(error) => {
+            eprintln!("{error:?}");
+            1
+        }
+    }
+}
+
+enum InputMode {
+    Stdin,
+    FileWalker(Vec<String>),
 }
 
 struct AppOptions {
-    ui: UiBackend,
-    stdin: bool,
     debug_wait: bool,
+    input: InputMode,
 }
 
 fn app_options() -> AppOptions {
     let mut options = AppOptions {
-        ui: UiBackend::D2d,
-        stdin: false,
         debug_wait: false,
+        input: InputMode::Stdin,
     };
-    let mut args = std::env::args().skip(1);
-    while let Some(arg) = args.next() {
-        if arg == "--ui" {
-            options.ui = match args.next().as_deref() {
-                #[cfg(feature = "skia")]
-                Some("skia") => UiBackend::Skia,
-                Some("d2d") | _ => UiBackend::D2d,
-            };
-        } else if arg == "--stdin" {
-            options.stdin = true;
-        } else if arg == "--debug-wait" {
-            options.debug_wait = true;
+    let mut filewalker = false;
+    let mut roots = Vec::new();
+    for arg in std::env::args().skip(1) {
+        match arg.as_str() {
+            "filewalker" if !filewalker => filewalker = true,
+            "--stdin" if !filewalker => {}
+            "--debug-wait" => options.debug_wait = true,
+            _ if filewalker => roots.push(arg),
+            _ => eprintln!("ignoring unsupported argument: {arg}"),
         }
     }
-
+    if filewalker {
+        options.input = InputMode::FileWalker(roots);
+    }
     options
 }

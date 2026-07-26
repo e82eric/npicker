@@ -2,10 +2,7 @@ use std::ffi::{c_char, c_int, c_void, CStr, CString};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::OnceLock;
 
-#[cfg(not(feature = "skia"))]
-use crate::d2d_ui as picker_ui;
-use crate::ipc::{FileSystemPickerRequest, FlatItemsPickerRequest};
-#[cfg(feature = "skia")]
+use crate::request::{FileSystemPickerRequest, FlatItemsPickerRequest};
 use crate::skia_ui as picker_ui;
 use crate::view_model::ViewModel;
 use std::sync::Arc;
@@ -50,7 +47,6 @@ pub extern "C" fn RustNfmShowProgramsList(
 
         thread::spawn(move || {
             let request = FileSystemPickerRequest {
-                command: "filesystem".to_string(),
                 root_directories,
                 max_depth: 5,
                 directories_only: false,
@@ -165,7 +161,7 @@ fn ensure_initialized() -> Arc<ViewModel> {
         let view_model = ViewModel::new();
         let ui_view_model = Arc::clone(&view_model);
         std::thread::spawn(move || {
-            if let Err(error) = picker_ui::run(ui_view_model) {
+            if let Err(error) = picker_ui::run(ui_view_model, None) {
                 eprintln!("RustNfm UI stopped: {error:?}");
             }
         });

@@ -5,8 +5,10 @@ edition = "2021"
 
 [dependencies]
 crossbeam-channel = "0.5.15"
+
+[target.'cfg(windows)'.dependencies]
 windows = { version = "0.62.2", features = [
     "Win32_Foundation",
     "Win32_Storage_FileSystem",
 ] }
-nfm_search_core = {  path = "../nfm-search-core" }
+nfm_search_core = { path = "../nfm-search-core" }

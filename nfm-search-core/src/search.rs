@@ -1423,13 +1423,7 @@ mod search_sort_tests {
 fn fuzzy_match_consecutive_at_start_does_not_underflow() {
     let mut scratch = MatchScratch::default();
 
-    let result = fzf_fuzzy_match_v2_ascii(
-        false,
-        b"rights",
-        b"ri",
-        &mut scratch,
-        None,
-    );
+    let result = fzf_fuzzy_match_v2_ascii(false, b"rights", b"ri", &mut scratch, None);
 
     assert!(result.score > 0);
     assert_eq!(result.start, 0);
@@ -1517,9 +1511,7 @@ mod tests_from_fzf {
                 false,
                 b"/man1/zshcompctl.1",
                 b"zshc",
-                SCORE_MATCH * 4
-                    + BOUNDARY_BONUS * BONUS_FIRST_CHAR_MULTIPLIER
-                    + BOUNDARY_BONUS * 3,
+                SCORE_MATCH * 4 + BOUNDARY_BONUS * BONUS_FIRST_CHAR_MULTIPLIER + BOUNDARY_BONUS * 3,
             );
             assert_score(
                 algorithm,
@@ -1611,9 +1603,7 @@ mod tests_from_fzf {
             false,
             b"/.oh-my-zsh/cache",
             b"zsh/c",
-            SCORE_MATCH * 5
-                + BOUNDARY_BONUS * (BONUS_FIRST_CHAR_MULTIPLIER + 3)
-                + BOUNDARY_BONUS,
+            SCORE_MATCH * 5 + BOUNDARY_BONUS * (BONUS_FIRST_CHAR_MULTIPLIER + 3) + BOUNDARY_BONUS,
         );
     }
 
@@ -1630,9 +1620,8 @@ mod tests_from_fzf {
 
     #[test]
     fn prefix_match_scores_match_fzf_cases() {
-        let score = SCORE_MATCH * 3
-            + BOUNDARY_BONUS * BONUS_FIRST_CHAR_MULTIPLIER
-            + BOUNDARY_BONUS * 2;
+        let score =
+            SCORE_MATCH * 3 + BOUNDARY_BONUS * BONUS_FIRST_CHAR_MULTIPLIER + BOUNDARY_BONUS * 2;
 
         assert_score(Algorithm::Prefix, true, b"fooBarbaz", b"Foo", 0);
         assert_score(Algorithm::Prefix, false, b"fooBarBaz", b"baz", 0);

@@ -1,57 +1,48 @@
-#![allow(unsafe_op_in_unsafe_fn, unused_unsafe)]
-
-use std::ffi::c_void;
+use std::num::NonZeroU32;
 use std::sync::atomic::{AtomicI32, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
+use crossbeam_channel::Receiver;
 use skia_safe::{
     surfaces, Canvas, Color, Font, FontMgr, FontStyle, Paint, PaintStyle, RRect, Rect as SkRect,
     Surface,
 };
-use windows::core::PCWSTR;
-use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
-use windows::Win32::Graphics::Gdi::{
-    BeginPaint, EndPaint, GetMonitorInfoW, InvalidateRect, MonitorFromPoint, MonitorFromWindow,
-    StretchDIBits, BITMAPINFO, BITMAPINFOHEADER, DIB_RGB_COLORS, MONITORINFO,
-    MONITOR_DEFAULTTONEAREST, PAINTSTRUCT, SRCCOPY,
-};
-use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::UI::Input::KeyboardAndMouse::{
-    keybd_event, GetKeyState, SendInput, SetFocus, INPUT, INPUT_MOUSE, KEYEVENTF_KEYUP, VK_CONTROL,
-    VK_MENU, VK_SHIFT,
-};
-use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DispatchMessageW, GetCaretBlinkTime, GetClientRect,
-    GetForegroundWindow, GetMessageW, GetWindowLongPtrW, LoadCursorW, PostMessageW, RegisterClassW,
-    SetForegroundWindow, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow, TranslateMessage,
-    CREATESTRUCTW, GWLP_USERDATA, IDC_ARROW, MSG, SWP_NOACTIVATE, SWP_NOZORDER, SWP_SHOWWINDOW,
-    SW_HIDE, WM_APP, WM_CHAR, WM_DESTROY, WM_KEYDOWN, WM_NCCREATE, WM_PAINT, WM_TIMER, WNDCLASSW,
-    WS_EX_TOPMOST, WS_POPUP,
-};
+use softbuffer::{Context as SoftContext, Surface as SoftSurface};
+use winit::application::ApplicationHandler;
+use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
+use winit::event::{ElementState, Ime, Modifiers, WindowEvent};
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
+use winit::keyboard::{Key, NamedKey};
+use winit::window::{Window, WindowAttributes, WindowId, WindowLevel};
 
-use crate::view_model::{KeyModifiers, UiCounters, UiEvent, ViewModel};
+use crate::view_model::{InputCommand, KeyModifiers, UiCounters, UiEvent, ViewModel};
 use nfm_search_core::search::SearchResult;
 
 const DEFAULT_WIDTH: i32 = 1600;
 const MIN_WIDTH: i32 = 480;
-const MIN_HEIGHT: i32 = 360;
+const MIN_HEIGHT: i32 = 240;
 const MONITOR_HORIZONTAL_MARGIN: i32 = 80;
 const MONITOR_VERTICAL_MARGIN: i32 = 160;
-const ROW_HEIGHT: f32 = 24.0;
-const DISPLAY_ROWS: i32 = 15;
+const DISPLAY_ROWS: i32 = 7;
 const PADDING: f32 = 8.0;
-const COUNTER_WIDTH: f32 = 300.0;
-const WM_UI_UPDATE: u32 = WM_APP + 21;
-const WM_UI_BRING_TO_FOREGROUND: u32 = WM_APP + 22;
-const WM_CURSOR_BLINK: u32 = WM_APP + 23;
-const WM_SHOW_ROOT: u32 = WM_APP + 24;
-const DEFAULT_HEIGHT: i32 = 48 + 15 * ROW_HEIGHT as i32 + 10 + (8 * 4);
+const PANEL_BORDER: f32 = 2.0;
+const PANEL_HORIZONTAL_PADDING: f32 = 16.0;
+const PANEL_VERTICAL_PADDING: f32 = 10.0;
+const PANEL_GAP: f32 = 12.0;
+const QUERY_VERTICAL_PADDING: f32 = 8.0;
+const RESULT_HORIZONTAL_PADDING: f32 = 12.0;
+const RESULT_VERTICAL_PADDING: f32 = 5.0;
+const RESULT_GAP: f32 = 3.0;
+const SELECTED_ACCENT_WIDTH: f32 = 3.0;
+const DEFAULT_HEIGHT: i32 = 320;
 const COLOR_BACKGROUND: u32 = 0x282828;
-const COLOR_TEXT: u32 = 0xa89984;
-const COLOR_HIGHLIGHT: u32 = 0xffa500;
-const COLOR_SELECTED: u32 = 0x504945;
-const SKIA_BADGE_TEXT: &str = "SKIA";
+const COLOR_TEXT: u32 = 0xebdbb2;
+const COLOR_BORDER: u32 = 0x928374;
+const COLOR_MATCH: u32 = 0xfb4934;
+const COLOR_SELECTED: u32 = 0x3c3836;
+const COLOR_SELECTED_ACCENT: u32 = 0xb8bb26;
 const DEFAULT_LOCATION_VALUE: i32 = i32::MIN;
 
 static PREFERRED_CENTER_X: AtomicI32 = AtomicI32::new(DEFAULT_LOCATION_VALUE);
@@ -63,99 +54,52 @@ pub fn set_preferred_center(x: i32, y: i32) {
     PREFERRED_CENTER_Y.store(y, Ordering::Relaxed);
 }
 
-pub fn run(view_model: Arc<ViewModel>) -> Result<()> {
-    unsafe {
-        let class_name = wide_null("NfmRustSkiaPicker");
-        let hinstance = GetModuleHandleW(None)?;
-        let cursor = LoadCursorW(None, IDC_ARROW)?;
-        let wnd_class = WNDCLASSW {
-            hCursor: cursor,
-            hInstance: hinstance.into(),
-            lpszClassName: PCWSTR(class_name.as_ptr()),
-            lpfnWndProc: Some(wnd_proc),
-            ..Default::default()
-        };
+#[derive(Debug)]
+enum AppEvent {
+    Ui(UiEvent),
+    Exit(i32),
+}
 
-        if RegisterClassW(&wnd_class) == 0 {
-            return Err(anyhow!("RegisterClassW failed"));
-        }
-
-        let screen_location = calculate_window_location();
-        let shared = Arc::new(Mutex::new(SharedUiState::default()));
-        let state = Box::new(WindowState::new(
-            Arc::clone(&view_model),
-            Arc::clone(&shared),
-            screen_location.x as f32,
-            screen_location.y as f32,
-            screen_location.width as f32,
-            screen_location.height as f32,
-        )?);
-        let state_ptr = Box::into_raw(state);
-        let hwnd = CreateWindowExW(
-            WS_EX_TOPMOST,
-            PCWSTR(class_name.as_ptr()),
-            PCWSTR(wide_null("nfm rust skia picker").as_ptr()),
-            WS_POPUP,
-            screen_location.x,
-            screen_location.y,
-            screen_location.width,
-            screen_location.height,
-            None,
-            None,
-            Some(hinstance.into()),
-            Some(state_ptr as *const c_void),
-        )
-        .context("CreateWindowExW failed")?;
-
-        let events = view_model.subscribe();
-        let raw_hwnd = hwnd.0 as usize;
-        std::thread::spawn(move || {
-            while let Ok(event) = events.recv() {
-                let hwnd = HWND(raw_hwnd as *mut c_void);
-                {
-                    let mut shared = shared.lock().expect("shared UI state poisoned");
-                    match event {
-                        UiEvent::Show => {
-                            shared.visible = true;
-                            unsafe {
-                                let _ =
-                                    PostMessageW(Some(hwnd), WM_SHOW_ROOT, WPARAM(0), LPARAM(0));
-                            }
-                        }
-                        UiEvent::Results(update) => {
-                            shared.results = update.results;
-                            shared.counters = update.counters;
-                            shared.selected_row = update.selected_row;
-                            unsafe {
-                                let _ =
-                                    PostMessageW(Some(hwnd), WM_UI_UPDATE, WPARAM(0), LPARAM(0));
-                            }
-                        }
-                        UiEvent::Close => {
-                            shared.visible = false;
-                            unsafe {
-                                let _ =
-                                    PostMessageW(Some(hwnd), WM_UI_UPDATE, WPARAM(0), LPARAM(0));
-                            }
-                        }
-                    }
-                }
-            }
-        });
-
-        let mut msg = MSG::default();
-        while GetMessageW(&mut msg, None, 0, 0).as_bool() {
-            let _ = TranslateMessage(&msg);
-            DispatchMessageW(&msg);
-        }
+pub fn run(view_model: Arc<ViewModel>, completion: Option<Receiver<i32>>) -> Result<i32> {
+    let mut builder = EventLoop::<AppEvent>::with_user_event();
+    #[cfg(windows)]
+    {
+        use winit::platform::windows::EventLoopBuilderExtWindows;
+        builder.with_any_thread(true);
+    }
+    let event_loop = builder.build()?;
+    event_loop.set_control_flow(ControlFlow::Wait);
+    let proxy = event_loop.create_proxy();
+    forward_ui_events(view_model.subscribe(), proxy.clone());
+    if let Some(completion) = completion {
+        forward_completion(completion, proxy);
     }
 
-    Ok(())
+    let mut app = PickerApp::new(view_model)?;
+    event_loop.run_app(&mut app)?;
+    Ok(app.exit_code)
+}
+
+fn forward_ui_events(events: Receiver<UiEvent>, proxy: EventLoopProxy<AppEvent>) {
+    std::thread::spawn(move || {
+        while let Ok(event) = events.recv() {
+            if proxy.send_event(AppEvent::Ui(event)).is_err() {
+                break;
+            }
+        }
+    });
+}
+
+fn forward_completion(completion: Receiver<i32>, proxy: EventLoopProxy<AppEvent>) {
+    std::thread::spawn(move || {
+        if let Ok(code) = completion.recv() {
+            let _ = proxy.send_event(AppEvent::Exit(code));
+        }
+    });
 }
 
 struct WindowState {
     view_model: Arc<ViewModel>,
-    shared: Arc<Mutex<SharedUiState>>,
     surface: Option<Surface>,
     font: Font,
     counter_font: Font,
@@ -163,15 +107,13 @@ struct WindowState {
     muted_paint: Paint,
     highlight_paint: Paint,
     selected_paint: Paint,
+    selected_accent_paint: Paint,
     stroke_paint: Paint,
     results: Vec<SearchResult>,
     counters: UiCounters,
     selected_row: usize,
-    visible: bool,
-    last_window_location: Option<ScreenLocation>,
-    queued_foreground_after_first_paint: bool,
-    logged_first_items_paint: bool,
     cursor_visible: bool,
+    scale_factor: f64,
     layout: Layout,
 }
 
@@ -201,47 +143,42 @@ struct Layout {
     text_height: f32,
 }
 
-#[derive(Default)]
-struct SharedUiState {
-    visible: bool,
-    results: Vec<SearchResult>,
-    counters: UiCounters,
-    selected_row: usize,
-}
-
 fn calculate_layout(window: Rect, padding: f32, number_of_items: i32, text_height: f32) -> Layout {
-    let search_border = Rect {
-        x: padding,
-        y: padding,
-        width: (window.width - (padding * 2.0)).max(0.0),
-        height: text_height + (padding * 2.0),
-    };
-
-    let search_box = Rect {
-        x: search_border.x + padding,
-        y: search_border.y + padding,
-        width: (search_border.width - (padding * 2.0)).max(0.0),
-        height: search_border.height - (padding * 2.0),
-    };
-
     let list_border_width = (window.width - (padding * 2.0)).max(0.0);
     let row_size = Size {
-        height: text_height + padding,
-        width: (list_border_width - (padding * 2.0)).max(0.0),
+        height: text_height + (RESULT_VERTICAL_PADDING * 2.0) + RESULT_GAP,
+        width: (list_border_width - ((PANEL_BORDER + PANEL_HORIZONTAL_PADDING) * 2.0)).max(0.0),
     };
 
     let list_border = Rect {
         x: padding,
-        y: search_border.y + search_border.height + padding,
+        y: padding,
         width: (window.width - (padding * 2.0)).max(0.0),
-        height: (number_of_items as f32 * row_size.height) + (padding * 2.0),
+        height: (number_of_items as f32 * (text_height + RESULT_VERTICAL_PADDING * 2.0))
+            + ((number_of_items - 1).max(0) as f32 * RESULT_GAP)
+            + (PANEL_VERTICAL_PADDING * 2.0)
+            + (PANEL_BORDER * 2.0),
     };
 
     let list_box = Rect {
-        x: list_border.x + padding,
-        y: list_border.y + padding,
-        width: (list_border.width - (padding * 2.0)).max(0.0),
-        height: (list_border.height - (padding * 2.0)).max(0.0),
+        x: list_border.x + PANEL_BORDER + PANEL_HORIZONTAL_PADDING,
+        y: list_border.y + PANEL_BORDER + PANEL_VERTICAL_PADDING,
+        width: row_size.width,
+        height: (list_border.height - ((PANEL_BORDER + PANEL_VERTICAL_PADDING) * 2.0)).max(0.0),
+    };
+
+    let search_border = Rect {
+        x: padding,
+        y: list_border.y + list_border.height + PANEL_GAP,
+        width: (window.width - (padding * 2.0)).max(0.0),
+        height: text_height + (QUERY_VERTICAL_PADDING * 2.0) + (PANEL_BORDER * 2.0),
+    };
+
+    let search_box = Rect {
+        x: search_border.x + PANEL_BORDER + PANEL_HORIZONTAL_PADDING,
+        y: search_border.y + PANEL_BORDER + QUERY_VERTICAL_PADDING,
+        width: (search_border.width - ((PANEL_BORDER + PANEL_HORIZONTAL_PADDING) * 2.0)).max(0.0),
+        height: text_height,
     };
 
     Layout {
@@ -257,21 +194,17 @@ fn calculate_layout(window: Rect, padding: f32, number_of_items: i32, text_heigh
 }
 
 fn desired_window_height(text_height: f32, padding: f32, number_of_items: i32) -> i32 {
-    let search_border_height = text_height + (padding * 2.0);
-    let row_height = text_height + padding;
-    let list_border_height = (number_of_items as f32 * row_height) + (padding * 2.0);
-    (padding + search_border_height + padding + list_border_height + padding).ceil() as i32
+    let search_border_height = text_height + (QUERY_VERTICAL_PADDING * 2.0) + (PANEL_BORDER * 2.0);
+    let list_border_height = (number_of_items as f32
+        * (text_height + RESULT_VERTICAL_PADDING * 2.0))
+        + ((number_of_items - 1).max(0) as f32 * RESULT_GAP)
+        + (PANEL_VERTICAL_PADDING * 2.0)
+        + (PANEL_BORDER * 2.0);
+    (padding + list_border_height + PANEL_GAP + search_border_height + padding).ceil() as i32
 }
 
 impl WindowState {
-    fn new(
-        view_model: Arc<ViewModel>,
-        shared: Arc<Mutex<SharedUiState>>,
-        left: f32,
-        top: f32,
-        width: f32,
-        _height: f32,
-    ) -> Result<Self> {
+    fn new(view_model: Arc<ViewModel>, width: f32, scale_factor: f64) -> Result<Self> {
         let typeface = FontMgr::default()
             .legacy_make_typeface("Cascadia Mono", FontStyle::normal())
             .or_else(|| FontMgr::default().legacy_make_typeface(None, FontStyle::normal()))
@@ -285,8 +218,8 @@ impl WindowState {
         DESIRED_WINDOW_HEIGHT.store(desired_height, Ordering::Relaxed);
 
         let window = Rect {
-            x: left,
-            y: top,
+            x: 0.0,
+            y: 0.0,
             width,
             height: desired_height as f32,
         };
@@ -295,89 +228,33 @@ impl WindowState {
 
         Ok(Self {
             view_model,
-            shared,
             surface: None,
             font,
             counter_font,
             text_paint: fill_paint(COLOR_TEXT),
             muted_paint: fill_paint(COLOR_TEXT),
-            highlight_paint: fill_paint(COLOR_HIGHLIGHT),
+            highlight_paint: fill_paint(COLOR_MATCH),
             selected_paint: fill_paint(COLOR_SELECTED),
-            stroke_paint: stroke_paint(COLOR_HIGHLIGHT, 1.2),
+            selected_accent_paint: fill_paint(COLOR_SELECTED_ACCENT),
+            stroke_paint: stroke_paint(COLOR_BORDER, PANEL_BORDER),
             results: Vec::new(),
             counters: UiCounters::default(),
             selected_row: 0,
-            visible: false,
-            last_window_location: None,
-            queued_foreground_after_first_paint: false,
-            logged_first_items_paint: false,
             cursor_visible: false,
+            scale_factor,
             layout: app_layout,
         })
     }
 
-    fn apply_pending(&mut self, hwnd: HWND) {
-        {
-            let pending = self.shared.lock().expect("shared UI state poisoned");
-            self.visible = pending.visible;
-            self.results = pending.results.clone();
-            self.counters = pending.counters.clone();
-            self.selected_row = pending.selected_row;
-        }
-
-        unsafe {
-            if self.visible {
-                // self.show_root(hwnd);
-            } else {
-                let _ = ShowWindow(hwnd, SW_HIDE);
-                self.queued_foreground_after_first_paint = false;
-                self.logged_first_items_paint = false;
-            }
-            let _ = InvalidateRect(Some(hwnd), None, false);
-        }
+    fn apply_update(&mut self, update: crate::view_model::UiUpdate) {
+        self.results = update.results;
+        self.counters = update.counters;
+        self.selected_row = update.selected_row;
     }
 
-    unsafe fn show_root(&mut self, hwnd: HWND) {
-        let location = calculate_window_location();
-        if self.last_window_location != Some(location) {
-            self.surface = None;
-            self.last_window_location = Some(location);
-            self.layout = calculate_layout(
-                Rect {
-                    x: location.x as f32,
-                    y: location.y as f32,
-                    width: location.width as f32,
-                    height: location.height as f32,
-                },
-                PADDING,
-                DISPLAY_ROWS,
-                self.layout.text_height,
-            );
-        }
-
-        let _ = SetWindowPos(
-            hwnd,
-            None,
-            location.x,
-            location.y,
-            location.width,
-            location.height,
-            SWP_SHOWWINDOW | SWP_NOZORDER | SWP_NOACTIVATE,
-        );
-
-        bring_to_foreground(hwnd);
-        let _ = SetFocus(Some(hwnd));
-
-        let blink_ms = GetCaretBlinkTime();
-        if SetTimer(Some(hwnd), WM_CURSOR_BLINK as usize, blink_ms, None) != 0 {}
-    }
-
-    unsafe fn ensure_surface(&mut self, hwnd: HWND) -> Result<()> {
-        let mut rect = RECT::default();
-        GetClientRect(hwnd, &mut rect)?;
-        let width = (rect.right - rect.left).max(1);
-        let height = (rect.bottom - rect.top).max(1);
-
+    fn ensure_surface(&mut self, size: PhysicalSize<u32>, scale_factor: f64) -> Result<()> {
+        let width = size.width.max(1) as i32;
+        let height = size.height.max(1) as i32;
         let needs_surface = self
             .surface
             .as_ref()
@@ -392,17 +269,33 @@ impl WindowState {
             if self.surface.is_none() {
                 return Err(anyhow!("failed to create Skia raster surface"));
             }
-            self.layout.window.width = width as f32;
-            self.layout.window.height = height as f32;
+            self.scale_factor = scale_factor;
+            let logical_width = width as f32 / scale_factor as f32;
+            let logical_height = height as f32 / scale_factor as f32;
+            self.layout = calculate_layout(
+                Rect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: logical_width,
+                    height: logical_height,
+                },
+                PADDING,
+                DISPLAY_ROWS,
+                self.layout.text_height,
+            );
         }
-
         Ok(())
     }
 
-    unsafe fn paint(&mut self, hwnd: HWND, paint_struct: &PAINTSTRUCT) -> Result<()> {
-        self.ensure_surface(hwnd)?;
+    fn paint(
+        &mut self,
+        size: PhysicalSize<u32>,
+        scale_factor: f64,
+        soft_surface: &mut SoftSurface<Arc<Window>, Arc<Window>>,
+    ) -> Result<()> {
+        self.ensure_surface(size, scale_factor)?;
         self.draw_to_surface()?;
-        self.blit_surface(paint_struct);
+        self.present(size, soft_surface)?;
         Ok(())
     }
 
@@ -413,11 +306,38 @@ impl WindowState {
 
         let canvas = surface.canvas();
         canvas.clear(skia_color(COLOR_BACKGROUND));
+        let frame_save_count = canvas.save();
+        canvas.reset_matrix();
+        canvas.scale((self.scale_factor as f32, self.scale_factor as f32));
 
         let search_state = self.view_model.current_search_text();
         let search_string = search_state.text;
-
         let radius = 8.0;
+        let counter_text = if self.counters.scanning {
+            format!("… {}/{}", self.counters.matched, self.counters.published)
+        } else {
+            format!("{}/{}", self.counters.matched, self.counters.published)
+        };
+        let counter_width =
+            measure_text_width(&self.counter_font, &self.muted_paint, &counter_text);
+        let counter_rect = Rect {
+            x: self.layout.search_box.x + self.layout.search_box.width - counter_width,
+            y: self.layout.search_box.y,
+            width: counter_width,
+            height: self.layout.text_height,
+        };
+        let prompt_prefix = "> ";
+        let prompt_prefix_width = measure_text_width(&self.font, &self.text_paint, prompt_prefix);
+        let query_rect = Rect {
+            x: self.layout.search_box.x + prompt_prefix_width,
+            y: self.layout.search_box.y,
+            width: (counter_rect.x
+                - self.layout.search_box.x
+                - prompt_prefix_width
+                - PANEL_HORIZONTAL_PADDING)
+                .max(0.0),
+            height: self.layout.search_box.height,
+        };
 
         draw_rounded_rectangle(
             canvas,
@@ -432,10 +352,10 @@ impl WindowState {
             let prefix_width = measure_text_width(&self.font, &self.text_paint, prefix);
             let selected_width = measure_text_width(&self.font, &self.text_paint, selected_text);
             let rect = Rect {
-                x: self.layout.search_box.x + prefix_width,
-                y: self.layout.search_box.y,
+                x: query_rect.x + prefix_width,
+                y: query_rect.y,
                 width: selected_width,
-                height: self.layout.search_box.height,
+                height: query_rect.height,
             };
             draw_filled_rectangle(canvas, &self.selected_paint, rect);
         }
@@ -444,8 +364,16 @@ impl WindowState {
             canvas,
             &self.font,
             &self.text_paint,
-            &search_string,
+            prompt_prefix,
             self.layout.search_box,
+            TextAlign::Left,
+        );
+        draw_text(
+            canvas,
+            &self.font,
+            &self.text_paint,
+            &search_string,
+            query_rect,
             TextAlign::Left,
         );
 
@@ -453,27 +381,21 @@ impl WindowState {
             let search_up_to_cursor = &search_string[..search_state.cursor_position];
             let cursor_prefix_width =
                 measure_text_width(&self.font, &self.text_paint, search_up_to_cursor);
-
-            canvas.draw_line(
-                (
-                    self.layout.search_box.x + cursor_prefix_width + 1.5,
-                    self.layout.search_box.y,
-                ),
-                (
-                    self.layout.search_box.x + cursor_prefix_width + 1.5,
-                    self.layout.search_box.y + self.layout.search_box.height,
-                ),
+            draw_text(
+                canvas,
+                &self.font,
                 &self.text_paint,
+                "_",
+                Rect {
+                    x: query_rect.x + cursor_prefix_width,
+                    y: query_rect.y,
+                    width: query_rect.width - cursor_prefix_width,
+                    height: query_rect.height,
+                },
+                TextAlign::Left,
             );
         }
 
-        let counter_text = format!("{}/{}", self.counters.matched, self.counters.published);
-        let counter_rect = Rect {
-            x: self.layout.search_box.x + self.layout.search_box.width - COUNTER_WIDTH,
-            y: self.layout.search_box.y,
-            width: COUNTER_WIDTH,
-            height: self.layout.text_height,
-        };
         draw_text(
             canvas,
             &self.counter_font,
@@ -483,40 +405,42 @@ impl WindowState {
             TextAlign::Right,
         );
 
-        let badge_rect = Rect {
-            x: self.layout.search_box.x + self.layout.search_box.width - COUNTER_WIDTH - 56.0,
-            y: self.layout.search_box.y,
-            width: 48.0,
-            height: self.layout.text_height,
-        };
-        draw_text(
-            canvas,
-            &self.counter_font,
-            &self.highlight_paint,
-            SKIA_BADGE_TEXT,
-            badge_rect,
-            TextAlign::Right,
-        );
-
         draw_rounded_rectangle(canvas, &self.stroke_paint, self.layout.list_border, radius);
 
-        for (index, result) in self.results.iter().enumerate() {
-            let top = self.layout.list_box.y + index as f32 * self.layout.row_size.height;
-            let text_top = top + ((self.layout.row_size.height - self.layout.text_height) / 2.0);
-            if index == self.selected_row {
+        for visual_row in 0..DISPLAY_ROWS as usize {
+            let result_index = DISPLAY_ROWS as usize - visual_row - 1;
+            let result = self.results.get(result_index);
+            let top = self.layout.list_box.y + visual_row as f32 * self.layout.row_size.height;
+            let row_height = self.layout.row_size.height - RESULT_GAP;
+            let text_top = top + RESULT_VERTICAL_PADDING;
+            if result.is_some() && result_index == self.selected_row {
                 let rect = Rect {
                     x: self.layout.list_box.x,
                     y: top,
                     width: self.layout.row_size.width,
-                    height: self.layout.row_size.height,
+                    height: row_height,
                 };
-                draw_filled_rectangle(canvas, &self.selected_paint, rect);
+                draw_rounded_rectangle(canvas, &self.selected_paint, rect, 6.0);
+                draw_rounded_rectangle(
+                    canvas,
+                    &self.selected_accent_paint,
+                    Rect {
+                        x: rect.x,
+                        y: rect.y + RESULT_VERTICAL_PADDING,
+                        width: SELECTED_ACCENT_WIDTH,
+                        height: (rect.height - RESULT_VERTICAL_PADDING * 2.0).max(0.0),
+                    },
+                    SELECTED_ACCENT_WIDTH / 2.0,
+                );
             }
 
+            let Some(result) = result else {
+                continue;
+            };
             let item_text_rect = Rect {
-                x: self.layout.list_box.x,
+                x: self.layout.list_box.x + RESULT_HORIZONTAL_PADDING,
                 y: text_top,
-                width: self.layout.search_box.x + self.layout.search_box.width,
+                width: (self.layout.list_box.width - RESULT_HORIZONTAL_PADDING * 2.0).max(0.0),
                 height: self.layout.text_height,
             };
 
@@ -535,228 +459,507 @@ impl WindowState {
                 &self.highlight_paint,
                 &result.path,
                 &result.positions,
-                self.layout.list_box.x,
+                item_text_rect.x,
                 text_top,
-                self.layout.list_box.width,
+                item_text_rect.width,
                 self.layout.text_height,
             );
         }
 
+        canvas.restore_to_count(frame_save_count);
         Ok(())
     }
 
-    unsafe fn blit_surface(&mut self, paint_struct: &PAINTSTRUCT) {
+    fn present(
+        &mut self,
+        size: PhysicalSize<u32>,
+        soft_surface: &mut SoftSurface<Arc<Window>, Arc<Window>>,
+    ) -> Result<()> {
         let Some(surface) = self.surface.as_mut() else {
-            return;
+            return Ok(());
         };
         let Some(pixmap) = surface.peek_pixels() else {
-            return;
+            return Ok(());
         };
-
-        let width = pixmap.width();
-        let height = pixmap.height();
-        if width <= 0 || height <= 0 {
-            return;
-        }
-
-        let bitmap_info = bitmap_info(width, height);
-        let _ = StretchDIBits(
-            paint_struct.hdc,
-            0,
-            0,
-            width,
-            height,
-            0,
-            0,
-            width,
-            height,
-            Some(pixmap.addr()),
-            &bitmap_info,
-            DIB_RGB_COLORS,
-            SRCCOPY,
-        );
+        let width = NonZeroU32::new(size.width.max(1)).expect("nonzero width");
+        let height = NonZeroU32::new(size.height.max(1)).expect("nonzero height");
+        soft_surface
+            .resize(width, height)
+            .map_err(|error| anyhow!("softbuffer resize failed: {error}"))?;
+        let mut buffer = soft_surface
+            .buffer_mut()
+            .map_err(|error| anyhow!("softbuffer buffer acquisition failed: {error}"))?;
+        let bytes = pixmap
+            .bytes()
+            .ok_or_else(|| anyhow!("Skia raster pixels are not readable"))?;
+        let row_bytes = pixmap.row_bytes();
+        let pixel_width = size.width as usize;
+        copy_bgra_to_softbuffer(
+            bytes,
+            row_bytes,
+            pixel_width,
+            size.height as usize,
+            &mut buffer,
+        )?;
+        buffer
+            .present()
+            .map_err(|error| anyhow!("softbuffer present failed: {error}"))?;
+        Ok(())
     }
 }
 
-fn is_key_down(vkey: i32) -> bool {
-    unsafe { (GetKeyState(vkey) as u16 & 0x8000) != 0 }
-}
+#[cfg(windows)]
+unsafe extern "system" fn windows_popup_subclass(
+    hwnd: windows::Win32::Foundation::HWND,
+    message: u32,
+    wparam: windows::Win32::Foundation::WPARAM,
+    lparam: windows::Win32::Foundation::LPARAM,
+    _subclass_id: usize,
+    _reference_data: usize,
+) -> windows::Win32::Foundation::LRESULT {
+    use windows::Win32::Foundation::LRESULT;
+    use windows::Win32::UI::Shell::DefSubclassProc;
+    use windows::Win32::UI::WindowsAndMessaging::{WM_NCACTIVATE, WM_NCPAINT};
 
-fn current_modifiers() -> KeyModifiers {
-    KeyModifiers {
-        ctrl: is_key_down(VK_CONTROL.0 as i32),
-        shift: is_key_down(VK_SHIFT.0 as i32),
-        alt: is_key_down(VK_MENU.0 as i32),
+    match message {
+        // This borderless popup has no non-client area. Windows can otherwise
+        // briefly paint an active caption when the user clicks the window.
+        WM_NCPAINT => LRESULT(0),
+        WM_NCACTIVATE => LRESULT(1),
+        _ => unsafe { DefSubclassProc(hwnd, message, wparam, lparam) },
     }
 }
 
-unsafe extern "system" fn wnd_proc(
-    hwnd: HWND,
-    msg: u32,
-    wparam: WPARAM,
-    lparam: LPARAM,
-) -> LRESULT {
-    match msg {
-        WM_NCCREATE => {
-            let create = lparam.0 as *const CREATESTRUCTW;
-            let state = (*create).lpCreateParams as *mut WindowState;
-            SetWindowLongPtrW(hwnd, GWLP_USERDATA, state as isize);
-            LRESULT(1)
-        }
-        WM_PAINT => {
-            let state = window_state(hwnd);
-            if !state.is_null() {
-                let mut paint = PAINTSTRUCT::default();
-                BeginPaint(hwnd, &mut paint);
-                let _ = (*state).paint(hwnd, &paint);
-                let _ = EndPaint(hwnd, &paint);
-            }
-            LRESULT(0)
-        }
-        WM_UI_UPDATE => {
-            let state = window_state(hwnd);
-            if !state.is_null() {
-                (*state).apply_pending(hwnd);
-            }
-            LRESULT(0)
-        }
-        WM_SHOW_ROOT => {
-            let state = window_state(hwnd);
-            if !state.is_null() {
-                (*state).show_root(hwnd);
-            }
-            LRESULT(0)
-        }
-        WM_TIMER => {
-            if wparam.0 == WM_CURSOR_BLINK as usize {
-                let state = window_state(hwnd);
-                if !state.is_null() {
-                    let state = &mut *state;
-                    state.cursor_visible = !state.cursor_visible;
-                    let _ = InvalidateRect(Some(hwnd), None, false);
-                }
-            }
-            LRESULT(0)
-        }
-        WM_UI_BRING_TO_FOREGROUND => {
-            bring_to_foreground(hwnd);
-            let _ = SetFocus(Some(hwnd));
-
-            let blink_ms = GetCaretBlinkTime();
-            if SetTimer(Some(hwnd), WM_CURSOR_BLINK as usize, blink_ms, None) != 0 {}
-
-            LRESULT(0)
-        }
-        WM_CHAR => {
-            let state = window_state(hwnd);
-            if !state.is_null() {
-                (*state).view_model.handle_char(wparam.0);
-            }
-            LRESULT(0)
-        }
-        WM_KEYDOWN => {
-            let state = window_state(hwnd);
-            if !state.is_null() {
-                let modifiers = current_modifiers();
-                (*state).view_model.handle_key(wparam.0, modifiers);
-                let _ = InvalidateRect(Some(hwnd), None, false);
-            }
-            LRESULT(0)
-        }
-        WM_DESTROY => {
-            let state = window_state(hwnd);
-            if !state.is_null() {
-                let _ = Box::from_raw(state);
-                SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
-            }
-            LRESULT(0)
-        }
-        _ => DefWindowProcW(hwnd, msg, wparam, lparam),
-    }
-}
-
-unsafe fn window_state(hwnd: HWND) -> *mut WindowState {
-    GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut WindowState
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct ScreenLocation {
-    x: i32,
-    y: i32,
-    width: i32,
-    height: i32,
-}
-
-unsafe fn calculate_window_location() -> ScreenLocation {
-    let preferred_x = PREFERRED_CENTER_X.load(Ordering::Relaxed);
-    let preferred_y = PREFERRED_CENTER_Y.load(Ordering::Relaxed);
-    let monitor = if preferred_x != DEFAULT_LOCATION_VALUE && preferred_y != DEFAULT_LOCATION_VALUE
-    {
-        MonitorFromPoint(
-            POINT {
-                x: preferred_x,
-                y: preferred_y,
-            },
-            MONITOR_DEFAULTTONEAREST,
-        )
-    } else {
-        MonitorFromWindow(GetForegroundWindow(), MONITOR_DEFAULTTONEAREST)
+#[cfg(windows)]
+fn configure_windows_popup(window: &Window, visible: bool) -> Result<()> {
+    use windows::Win32::Graphics::Dwm::{
+        DwmSetWindowAttribute, DWMNCRP_DISABLED, DWMWA_NCRENDERING_POLICY,
     };
+    use windows::Win32::UI::Shell::SetWindowSubclass;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetWindowLongPtrW, SetWindowLongPtrW, SetWindowPos, GWL_EXSTYLE, GWL_STYLE,
+        SET_WINDOW_POS_FLAGS, SWP_FRAMECHANGED, SWP_HIDEWINDOW, SWP_NOACTIVATE, SWP_NOMOVE,
+        SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, WINDOW_EX_STYLE, WINDOW_STYLE, WS_CLIPCHILDREN,
+        WS_CLIPSIBLINGS, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    };
+    use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
-    if !monitor.is_invalid() {
-        let mut info = MONITORINFO {
-            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+    let handle = window
+        .window_handle()
+        .context("failed to get the Win32 window handle")?;
+    let RawWindowHandle::Win32(handle) = handle.as_raw() else {
+        return Err(anyhow!("winit did not return a Win32 window handle"));
+    };
+    let hwnd = windows::Win32::Foundation::HWND(handle.hwnd.get() as *mut _);
+    let style = WINDOW_STYLE(WS_POPUP.0 | WS_CLIPSIBLINGS.0 | WS_CLIPCHILDREN.0);
+    let ex_style = WINDOW_EX_STYLE(WS_EX_TOPMOST.0 | WS_EX_TOOLWINDOW.0);
+    let visibility = if visible {
+        SWP_SHOWWINDOW
+    } else {
+        SWP_HIDEWINDOW
+    };
+    unsafe {
+        SetWindowLongPtrW(hwnd, GWL_STYLE, style.0 as isize);
+        SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex_style.0 as isize);
+        SetWindowSubclass(hwnd, Some(windows_popup_subclass), 1, 0)
+            .ok()
+            .context("failed to install the Win32 popup subclass")?;
+        let non_client_policy = DWMNCRP_DISABLED;
+        DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_NCRENDERING_POLICY,
+            &non_client_policy as *const _ as *const std::ffi::c_void,
+            std::mem::size_of_val(&non_client_policy) as u32,
+        )
+        .context("failed to disable DWM non-client rendering")?;
+        SetWindowPos(
+            hwnd,
+            None,
+            0,
+            0,
+            0,
+            0,
+            SET_WINDOW_POS_FLAGS(
+                SWP_FRAMECHANGED.0
+                    | SWP_NOMOVE.0
+                    | SWP_NOSIZE.0
+                    | SWP_NOZORDER.0
+                    | SWP_NOACTIVATE.0
+                    | visibility.0,
+            ),
+        )
+        .context("failed to apply the Win32 popup style")?;
+        let applied_style = GetWindowLongPtrW(hwnd, GWL_STYLE) as u32;
+        let applied_ex_style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32;
+        if applied_style & WS_POPUP.0 == 0 || applied_ex_style & WS_EX_TOOLWINDOW.0 == 0 {
+            return Err(anyhow!(
+                "Win32 rejected popup styles (style={applied_style:#010x}, \
+                 ex_style={applied_ex_style:#010x})"
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn focus_windows_popup(window: &Window) -> Result<()> {
+    use windows::Win32::UI::Input::KeyboardAndMouse::{
+        keybd_event, SendInput, SetFocus, INPUT, INPUT_MOUSE, KEYEVENTF_KEYUP, VK_MENU,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::SetForegroundWindow;
+    use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+
+    let handle = window
+        .window_handle()
+        .context("failed to get the Win32 window handle")?;
+    let RawWindowHandle::Win32(handle) = handle.as_raw() else {
+        return Err(anyhow!("winit did not return a Win32 window handle"));
+    };
+    let hwnd = windows::Win32::Foundation::HWND(handle.hwnd.get() as *mut _);
+
+    unsafe {
+        keybd_event(VK_MENU.0 as u8, 0, Default::default(), 0);
+        keybd_event(VK_MENU.0 as u8, 0, KEYEVENTF_KEYUP, 0);
+        SetForegroundWindow(hwnd)
+            .ok()
+            .context("SetForegroundWindow failed")?;
+        SetFocus(Some(hwnd)).context("SetFocus failed")?;
+        let input = INPUT {
+            r#type: INPUT_MOUSE,
             ..Default::default()
         };
+        SendInput(&[input], std::mem::size_of::<INPUT>() as i32);
+    }
+    Ok(())
+}
 
-        if GetMonitorInfoW(monitor, &mut info).as_bool() {
-            let work = info.rcWork;
-            let mon_width = work.right - work.left;
-            let mon_height = work.bottom - work.top;
-            let width = DEFAULT_WIDTH.min((mon_width - MONITOR_HORIZONTAL_MARGIN).max(MIN_WIDTH));
-            let desired_height = DESIRED_WINDOW_HEIGHT.load(Ordering::Relaxed);
-            let height = desired_height.min((mon_height - MONITOR_VERTICAL_MARGIN).max(MIN_HEIGHT));
-            let center_x = if preferred_x != DEFAULT_LOCATION_VALUE {
-                preferred_x
-            } else {
-                work.left + mon_width / 2
-            };
-            let center_y = if preferred_y != DEFAULT_LOCATION_VALUE {
-                preferred_y
-            } else {
-                work.top + mon_height / 2
-            };
-            let x = (center_x - width / 2).clamp(work.left, work.right - width);
-            let y = (center_y - height / 2).clamp(work.top, work.bottom - height);
+fn copy_bgra_to_softbuffer(
+    source: &[u8],
+    source_row_bytes: usize,
+    width: usize,
+    height: usize,
+    target: &mut [u32],
+) -> Result<()> {
+    let required_source = source_row_bytes
+        .checked_mul(height)
+        .ok_or_else(|| anyhow!("Skia pixel dimensions overflow"))?;
+    let required_target = width
+        .checked_mul(height)
+        .ok_or_else(|| anyhow!("softbuffer dimensions overflow"))?;
+    if source.len() < required_source || target.len() < required_target {
+        return Err(anyhow!(
+            "pixel buffer is smaller than its declared dimensions"
+        ));
+    }
+    for y in 0..height {
+        let source = &source[y * source_row_bytes..y * source_row_bytes + width * 4];
+        let target = &mut target[y * width..(y + 1) * width];
+        for (pixel, bgra) in target.iter_mut().zip(source.chunks_exact(4)) {
+            *pixel = u32::from(bgra[2]) << 16 | u32::from(bgra[1]) << 8 | u32::from(bgra[0]);
+        }
+    }
+    Ok(())
+}
 
-            return ScreenLocation {
-                x,
-                y,
-                width,
-                height,
-            };
+struct PickerApp {
+    view_model: Arc<ViewModel>,
+    renderer: WindowState,
+    window: Option<Arc<Window>>,
+    soft_context: Option<SoftContext<Arc<Window>>>,
+    soft_surface: Option<SoftSurface<Arc<Window>, Arc<Window>>>,
+    modifiers: Modifiers,
+    next_blink: Instant,
+    input_ready_at: Instant,
+    visible: bool,
+    exit_code: i32,
+}
+
+impl PickerApp {
+    fn new(view_model: Arc<ViewModel>) -> Result<Self> {
+        Ok(Self {
+            renderer: WindowState::new(Arc::clone(&view_model), DEFAULT_WIDTH as f32, 1.0)?,
+            view_model,
+            window: None,
+            soft_context: None,
+            soft_surface: None,
+            modifiers: Modifiers::default(),
+            next_blink: Instant::now() + Duration::from_millis(530),
+            input_ready_at: Instant::now(),
+            visible: false,
+            exit_code: 0,
+        })
+    }
+
+    fn create_window(&mut self, event_loop: &ActiveEventLoop) -> Result<()> {
+        if self.window.is_some() {
+            return Ok(());
+        }
+        let height = DESIRED_WINDOW_HEIGHT
+            .load(Ordering::Relaxed)
+            .max(MIN_HEIGHT);
+        let attributes = WindowAttributes::default()
+            .with_title("")
+            .with_visible(false)
+            .with_decorations(false)
+            .with_resizable(false)
+            .with_window_level(WindowLevel::AlwaysOnTop)
+            .with_inner_size(LogicalSize::new(DEFAULT_WIDTH as f64, height as f64));
+        #[cfg(windows)]
+        let attributes = {
+            use winit::platform::windows::WindowAttributesExtWindows;
+            attributes.with_skip_taskbar(true)
+        };
+        let window = Arc::new(event_loop.create_window(attributes)?);
+        #[cfg(windows)]
+        configure_windows_popup(&window, false)?;
+        window.set_ime_allowed(true);
+        let context = SoftContext::new(Arc::clone(&window))
+            .map_err(|error| anyhow!("softbuffer context creation failed: {error}"))?;
+        let surface = SoftSurface::new(&context, Arc::clone(&window))
+            .map_err(|error| anyhow!("softbuffer surface creation failed: {error}"))?;
+        self.renderer.scale_factor = window.scale_factor();
+        self.soft_surface = Some(surface);
+        self.soft_context = Some(context);
+        self.window = Some(window);
+        if self.visible {
+            self.show();
+        }
+        Ok(())
+    }
+
+    fn show(&mut self) {
+        self.visible = true;
+        self.center_window();
+        if let Some(window) = &self.window {
+            #[cfg(windows)]
+            if let Err(error) = configure_windows_popup(window, true) {
+                eprintln!("failed to enforce Win32 popup styles: {error:#}");
+            }
+            #[cfg(windows)]
+            if let Err(error) = focus_windows_popup(window) {
+                eprintln!("failed to focus Win32 popup: {error:#}");
+            }
+            #[cfg(not(windows))]
+            {
+                window.set_visible(true);
+                window.focus_window();
+            }
+            window.request_redraw();
+        }
+        self.next_blink = Instant::now() + Duration::from_millis(530);
+        self.input_ready_at = Instant::now() + Duration::from_millis(150);
+    }
+
+    fn hide(&mut self) {
+        self.visible = false;
+        if let Some(window) = &self.window {
+            #[cfg(windows)]
+            if let Err(error) = configure_windows_popup(window, false) {
+                eprintln!("failed to hide Win32 popup: {error:#}");
+            }
+            #[cfg(not(windows))]
+            window.set_visible(false);
         }
     }
 
-    ScreenLocation {
-        x: 100,
-        y: 100,
-        width: DEFAULT_WIDTH,
-        height: DEFAULT_HEIGHT,
+    fn center_window(&self) {
+        let Some(window) = &self.window else {
+            return;
+        };
+        let monitor = preferred_monitor(window).or_else(|| window.current_monitor());
+        let Some(monitor) = monitor else {
+            return;
+        };
+        let scale = monitor.scale_factor();
+        let monitor_size = monitor.size();
+        let width = ((DEFAULT_WIDTH as f64 * scale) as u32)
+            .min(
+                monitor_size
+                    .width
+                    .saturating_sub(MONITOR_HORIZONTAL_MARGIN as u32),
+            )
+            .max((MIN_WIDTH as f64 * scale) as u32);
+        let desired_height = DESIRED_WINDOW_HEIGHT.load(Ordering::Relaxed) as f64;
+        let height = ((desired_height * scale) as u32)
+            .min(
+                monitor_size
+                    .height
+                    .saturating_sub(MONITOR_VERTICAL_MARGIN as u32),
+            )
+            .max((MIN_HEIGHT as f64 * scale) as u32);
+        let _ = window.request_inner_size(PhysicalSize::new(width, height));
+        let position = monitor.position();
+        let preferred_x = PREFERRED_CENTER_X.load(Ordering::Relaxed);
+        let preferred_y = PREFERRED_CENTER_Y.load(Ordering::Relaxed);
+        let center_x = if preferred_x == DEFAULT_LOCATION_VALUE {
+            position.x + monitor_size.width as i32 / 2
+        } else {
+            preferred_x
+        };
+        let center_y = if preferred_y == DEFAULT_LOCATION_VALUE {
+            position.y + monitor_size.height as i32 / 2
+        } else {
+            preferred_y
+        };
+        let max_x = position.x + monitor_size.width.saturating_sub(width) as i32;
+        let max_y = position.y + monitor_size.height.saturating_sub(height) as i32;
+        let x = (center_x - width as i32 / 2).clamp(position.x, max_x.max(position.x));
+        let y = (center_y - height as i32 / 2).clamp(position.y, max_y.max(position.y));
+        window.set_outer_position(PhysicalPosition::new(x, y));
+    }
+
+    fn handle_keyboard(&mut self, event: winit::event::KeyEvent) {
+        if event.state != ElementState::Pressed {
+            return;
+        }
+        if Instant::now() < self.input_ready_at {
+            return;
+        }
+        let command = match &event.logical_key {
+            Key::Named(NamedKey::Enter) => Some(InputCommand::Accept),
+            Key::Named(NamedKey::Escape) => Some(InputCommand::Cancel),
+            Key::Named(NamedKey::ArrowUp) => Some(InputCommand::MoveUp),
+            Key::Named(NamedKey::ArrowDown) => Some(InputCommand::MoveDown),
+            Key::Named(NamedKey::ArrowLeft) => Some(InputCommand::MoveLeft),
+            Key::Named(NamedKey::ArrowRight) => Some(InputCommand::MoveRight),
+            Key::Named(NamedKey::Home) => Some(InputCommand::MoveHome),
+            Key::Named(NamedKey::End) => Some(InputCommand::MoveEnd),
+            Key::Named(NamedKey::Backspace) => Some(InputCommand::Backspace),
+            Key::Named(NamedKey::Delete) => Some(InputCommand::Delete),
+            _ => None,
+        };
+        if let Some(command) = command {
+            if event.repeat && matches!(command, InputCommand::Accept | InputCommand::Cancel) {
+                return;
+            }
+            self.view_model
+                .handle_command(command, key_modifiers(self.modifiers));
+        } else if let Some(text) = event.text {
+            self.view_model.insert_text(&text);
+        }
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
     }
 }
 
-unsafe fn bring_to_foreground(hwnd: HWND) {
-    const VK_MENU: u8 = 0x12;
-    keybd_event(VK_MENU, 0, Default::default(), 0);
-    keybd_event(VK_MENU, 0, KEYEVENTF_KEYUP, 0);
-    let _ = SetForegroundWindow(hwnd);
+impl ApplicationHandler<AppEvent> for PickerApp {
+    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        if let Err(error) = self.create_window(event_loop) {
+            eprintln!("failed to create picker window: {error:#}");
+            self.exit_code = 1;
+            event_loop.exit();
+        }
+    }
 
-    let input = INPUT {
-        r#type: INPUT_MOUSE,
-        ..Default::default()
-    };
-    let _ = SendInput(&[input], std::mem::size_of::<INPUT>() as i32);
+    fn user_event(&mut self, event_loop: &ActiveEventLoop, event: AppEvent) {
+        match event {
+            AppEvent::Ui(UiEvent::Show) => self.show(),
+            AppEvent::Ui(UiEvent::Results(update)) => {
+                self.renderer.apply_update(update);
+                if let Some(window) = &self.window {
+                    window.request_redraw();
+                }
+            }
+            AppEvent::Ui(UiEvent::Close) => self.hide(),
+            AppEvent::Exit(code) => {
+                self.exit_code = code;
+                event_loop.exit();
+            }
+        }
+    }
+
+    fn window_event(
+        &mut self,
+        _event_loop: &ActiveEventLoop,
+        window_id: WindowId,
+        event: WindowEvent,
+    ) {
+        let Some(window) = self.window.as_ref().map(Arc::clone) else {
+            return;
+        };
+        if window.id() != window_id {
+            return;
+        }
+        match event {
+            WindowEvent::RedrawRequested => {
+                if let Some(surface) = self.soft_surface.as_mut() {
+                    if let Err(error) =
+                        self.renderer
+                            .paint(window.inner_size(), window.scale_factor(), surface)
+                    {
+                        eprintln!("picker render failed: {error:#}");
+                    }
+                }
+            }
+            WindowEvent::KeyboardInput { event, .. } => self.handle_keyboard(event),
+            WindowEvent::Ime(Ime::Commit(text)) => {
+                self.view_model.insert_text(&text);
+                window.request_redraw();
+            }
+            WindowEvent::ModifiersChanged(modifiers) => self.modifiers = modifiers,
+            WindowEvent::Resized(_) | WindowEvent::ScaleFactorChanged { .. } => {
+                self.renderer.surface = None;
+                window.request_redraw();
+            }
+            WindowEvent::CloseRequested => self.view_model.cancel(),
+            _ => {}
+        }
+    }
+
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        if !self.visible {
+            event_loop.set_control_flow(ControlFlow::Wait);
+            return;
+        }
+        let now = Instant::now();
+        if now >= self.next_blink {
+            self.renderer.cursor_visible = !self.renderer.cursor_visible;
+            self.next_blink = now + Duration::from_millis(530);
+            if let Some(window) = &self.window {
+                window.request_redraw();
+            }
+        }
+        event_loop.set_control_flow(ControlFlow::WaitUntil(self.next_blink));
+    }
+}
+
+fn key_modifiers(modifiers: Modifiers) -> KeyModifiers {
+    let state = modifiers.state();
+    KeyModifiers {
+        ctrl: state.control_key(),
+        shift: state.shift_key(),
+        alt: state.alt_key(),
+    }
+}
+
+fn preferred_monitor(window: &Window) -> Option<winit::monitor::MonitorHandle> {
+    let x = PREFERRED_CENTER_X.load(Ordering::Relaxed);
+    let y = PREFERRED_CENTER_Y.load(Ordering::Relaxed);
+    if x == DEFAULT_LOCATION_VALUE || y == DEFAULT_LOCATION_VALUE {
+        return window.current_monitor();
+    }
+    window.available_monitors().min_by_key(|monitor| {
+        let position = monitor.position();
+        let size = monitor.size();
+        let max_x = position.x + size.width as i32;
+        let max_y = position.y + size.height as i32;
+        let dx = if x < position.x {
+            position.x - x
+        } else if x > max_x {
+            x - max_x
+        } else {
+            0
+        };
+        let dy = if y < position.y {
+            position.y - y
+        } else if y > max_y {
+            y - max_y
+        } else {
+            0
+        };
+        i64::from(dx) * i64::from(dx) + i64::from(dy) * i64::from(dy)
+    })
 }
 
 fn draw_position_highlights(
@@ -893,22 +1096,18 @@ fn skia_color(value: u32) -> Color {
     )
 }
 
-fn bitmap_info(width: i32, height: i32) -> BITMAPINFO {
-    BITMAPINFO {
-        bmiHeader: BITMAPINFOHEADER {
-            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
-            biWidth: width,
-            biHeight: -height,
-            biPlanes: 1,
-            biBitCount: 32,
-            biCompression: 0,
-            biSizeImage: (width.max(0) as u32) * (height.max(0) as u32) * 4,
-            ..Default::default()
-        },
-        ..Default::default()
-    }
-}
+#[cfg(test)]
+mod tests {
+    use super::copy_bgra_to_softbuffer;
 
-fn wide_null(value: &str) -> Vec<u16> {
-    value.encode_utf16().chain(std::iter::once(0)).collect()
+    #[test]
+    fn pixel_copy_converts_bgra_and_honors_row_stride() {
+        let source = [
+            0x33, 0x22, 0x11, 0xff, 0x66, 0x55, 0x44, 0xff, 0xaa, 0xaa, 0xaa, 0xaa, 0x99, 0x88,
+            0x77, 0xff, 0xcc, 0xbb, 0xaa, 0xff, 0xbb, 0xbb, 0xbb, 0xbb,
+        ];
+        let mut target = [0; 4];
+        copy_bgra_to_softbuffer(&source, 12, 2, 2, &mut target).unwrap();
+        assert_eq!(target, [0x112233, 0x445566, 0x778899, 0xaabbcc]);
+    }
 }

@@ -1,7 +1,7 @@
-﻿use std::sync::{Arc, RwLock};
-use std::sync::atomic::{AtomicBool, Ordering};
 use crate::fuzzy_search_session::SearchSnapshotProvider;
 use crate::store::ItemsSource;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, RwLock};
 
 pub struct SnapshotStore<S: ItemsSource> {
     snapshot: RwLock<Option<Arc<S>>>,
@@ -17,7 +17,10 @@ impl<S: ItemsSource> SnapshotStore<S> {
     }
 
     pub fn snapshot(&self) -> Option<Arc<S>> {
-        self.snapshot.read().expect("snapshot store poisoned").clone()
+        self.snapshot
+            .read()
+            .expect("snapshot store poisoned")
+            .clone()
     }
 
     pub fn publish(&self, snapshot: Arc<S>) {
@@ -33,14 +36,17 @@ impl<S: ItemsSource> SnapshotStore<S> {
             .read()
             .expect("snapshot store poisoned")
             .as_ref()
-            .map_or(0, |snapshot| {snapshot.version()})
+            .map_or(0, |snapshot| snapshot.version())
     }
 
     pub fn is_done(&self) -> bool {
         self.done.load(Ordering::Acquire)
     }
 }
-impl<S> SearchSnapshotProvider<S> for SnapshotStore<S> where S: ItemsSource + Send + Sync + 'static {
+impl<S> SearchSnapshotProvider<S> for SnapshotStore<S>
+where
+    S: ItemsSource + Send + Sync + 'static,
+{
     fn snapshot(&self) -> Option<Arc<S>> {
         SnapshotStore::snapshot(self)
     }

@@ -3,16 +3,15 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-use nfm_search_core::fuzzy_search_session::{FuzzySearchSession, FuzzySearchUpdate};
-use crate::ipc::{PickerRequest, PickerResponse};
+use crate::request::{PickerRequest, PickerResponse};
 use crate::source_store::{AnyItemSource, SharedStore};
 use anyhow::{bail, Result};
 use crossbeam_channel::{unbounded, Receiver, Sender};
-use nfm_search_core::search::{SearchResult, DISPLAY_LIMIT};
+use nfm_search_core::fuzzy_search_session::{FuzzySearchSession, FuzzySearchUpdate};
+use nfm_search_core::search::SearchResult;
 use nfm_search_core::timing;
-use windows::Win32::UI::Input::KeyboardAndMouse::{
-    VK_BACK, VK_DELETE, VK_DOWN, VK_END, VK_ESCAPE, VK_HOME, VK_LEFT, VK_RETURN, VK_RIGHT, VK_UP,
-};
+
+const PICKER_DISPLAY_LIMIT: usize = 7;
 
 #[derive(Clone, Debug)]
 pub enum UiEvent {
@@ -68,6 +67,20 @@ pub struct KeyModifiers {
     pub ctrl: bool,
     pub shift: bool,
     pub alt: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InputCommand {
+    Accept,
+    Cancel,
+    MoveUp,
+    MoveDown,
+    MoveLeft,
+    MoveRight,
+    MoveHome,
+    MoveEnd,
+    Backspace,
+    Delete,
 }
 
 struct ActiveRequest {
@@ -195,54 +208,55 @@ impl ViewModel {
         }
     }
 
-    pub fn handle_char(self: &Arc<Self>, ch: usize) {
-        match ch as u32 {
-            0x7f => {}
-            13 | 27 => {}
-            ch if ch >= 0x20 => {
-                let Some(ch) = char::from_u32(ch) else {
-                    return;
-                };
-
-                self.update_search_text(|state| {
-                    let cursor = state.cursor_position;
-
-                    if cursor > state.search_text.len()
-                        || !state.search_text.is_char_boundary(cursor)
-                    {
-                        return false;
-                    }
-
-                    state.search_text.insert(cursor, ch);
-                    state.cursor_position = cursor + ch.len_utf8();
-
-                    true
-                });
-            }
-
-            _ => {}
+    pub fn insert_text(self: &Arc<Self>, text: &str) {
+        let text: String = text
+            .chars()
+            .filter(|ch| !ch.is_control() && *ch != '\u{7f}')
+            .collect();
+        if text.is_empty() {
+            return;
         }
+        self.update_search_text(|state| {
+            let cursor = state.cursor_position;
+            if cursor > state.search_text.len() || !state.search_text.is_char_boundary(cursor) {
+                return false;
+            }
+            if let Some(anchor) = state.cursor_selection_anchor.take() {
+                let start = anchor.min(cursor);
+                let end = anchor.max(cursor);
+                if !state.search_text.is_char_boundary(start)
+                    || !state.search_text.is_char_boundary(end)
+                {
+                    return false;
+                }
+                state.search_text.replace_range(start..end, &text);
+                state.cursor_position = start + text.len();
+            } else {
+                state.search_text.insert_str(cursor, &text);
+                state.cursor_position = cursor + text.len();
+            }
+            true
+        });
     }
 
-    pub fn handle_key(self: &Arc<Self>, key: usize, modifiers: KeyModifiers) {
-        match key as u16 {
-            key if key == VK_RETURN.0 => self.select_current(),
-            key if key == VK_ESCAPE.0 => self.cancel(),
-            key if key == VK_UP.0 => self.move_selection(-1),
-            key if key == VK_DOWN.0 => self.move_selection(1),
-            key if key == VK_LEFT.0 && modifiers.ctrl => {
+    pub fn handle_command(self: &Arc<Self>, command: InputCommand, modifiers: KeyModifiers) {
+        match command {
+            InputCommand::Accept => self.select_current(),
+            InputCommand::Cancel => self.cancel(),
+            InputCommand::MoveUp => self.move_selection(1),
+            InputCommand::MoveDown => self.move_selection(-1),
+            InputCommand::MoveLeft if modifiers.ctrl => {
                 self.move_cursor_previous_word(modifiers.shift)
             }
-            key if key == VK_LEFT.0 => self.move_cursor_left(modifiers.shift),
-            key if key == VK_RIGHT.0 && modifiers.ctrl => {
+            InputCommand::MoveLeft => self.move_cursor_left(modifiers.shift),
+            InputCommand::MoveRight if modifiers.ctrl => {
                 self.move_cursor_next_word(modifiers.shift)
             }
-            key if key == VK_RIGHT.0 => self.move_cursor_right(modifiers.shift),
-            key if key == VK_END.0 => self.move_cursor_end(modifiers.shift),
-            key if key == VK_HOME.0 => self.move_cursor_start(modifiers.shift),
-            key if key == VK_BACK.0 => self.handle_backspace(modifiers),
-            key if key == VK_DELETE.0 => self.handle_delete(modifiers),
-            _ => {}
+            InputCommand::MoveRight => self.move_cursor_right(modifiers.shift),
+            InputCommand::MoveEnd => self.move_cursor_end(modifiers.shift),
+            InputCommand::MoveHome => self.move_cursor_start(modifiers.shift),
+            InputCommand::Backspace => self.handle_backspace(modifiers),
+            InputCommand::Delete => self.handle_delete(modifiers),
         }
     }
 
@@ -587,13 +601,13 @@ impl State {
             return;
         }
 
-        let max_viewport_start = self.results.len().saturating_sub(DISPLAY_LIMIT);
+        let max_viewport_start = self.results.len().saturating_sub(PICKER_DISPLAY_LIMIT);
         self.viewport_start = self.viewport_start.min(max_viewport_start);
 
         if self.selected < self.viewport_start {
             self.viewport_start = self.selected;
-        } else if self.selected >= self.viewport_start + DISPLAY_LIMIT {
-            self.viewport_start = self.selected + 1 - DISPLAY_LIMIT;
+        } else if self.selected >= self.viewport_start + PICKER_DISPLAY_LIMIT {
+            self.viewport_start = self.selected + 1 - PICKER_DISPLAY_LIMIT;
         }
     }
 
@@ -602,7 +616,7 @@ impl State {
             .results
             .iter()
             .skip(self.viewport_start)
-            .take(DISPLAY_LIMIT)
+            .take(PICKER_DISPLAY_LIMIT)
             .cloned()
             .collect();
         let selected_row = if visible_results.is_empty() {
@@ -614,10 +628,47 @@ impl State {
         UiUpdate {
             results: visible_results,
             counters: UiCounters {
-                displayed: self.results.len().min(DISPLAY_LIMIT),
+                displayed: self.results.len().min(PICKER_DISPLAY_LIMIT),
                 ..self.counters.clone()
             },
             selected_row,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn modifiers(ctrl: bool, shift: bool) -> KeyModifiers {
+        KeyModifiers {
+            ctrl,
+            shift,
+            alt: false,
+        }
+    }
+
+    #[test]
+    fn semantic_input_inserts_unicode_and_replaces_selection() {
+        let view_model = ViewModel::new();
+        view_model.insert_text("ab");
+        view_model.handle_command(InputCommand::MoveLeft, modifiers(false, true));
+        view_model.insert_text("é");
+
+        let state = view_model.current_search_text();
+        assert_eq!(state.text, "aé");
+        assert_eq!(state.cursor_position, "aé".len());
+        assert_eq!(state.selection, None);
+    }
+
+    #[test]
+    fn semantic_input_moves_and_deletes_by_word() {
+        let view_model = ViewModel::new();
+        view_model.insert_text("one two");
+        view_model.handle_command(InputCommand::Backspace, modifiers(true, false));
+        assert_eq!(view_model.current_search_text().text, "one ");
+        view_model.handle_command(InputCommand::MoveHome, modifiers(false, false));
+        view_model.handle_command(InputCommand::Delete, modifiers(true, false));
+        assert_eq!(view_model.current_search_text().text, " ");
     }
 }

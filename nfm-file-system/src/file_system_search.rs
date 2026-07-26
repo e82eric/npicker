@@ -1,8 +1,8 @@
-﻿use std::sync::Arc;
-use crossbeam_channel::Sender;
-use nfm_search_core::fuzzy_search_session::{FuzzySearchSession, FuzzySearchUpdate};
 use crate::walker::{start_scan, FileWalkerScan, PublishedSnapshot, ScanOptions};
 use crate::walker_search_store::FileSystemSearchStore;
+use crossbeam_channel::Sender;
+use nfm_search_core::fuzzy_search_session::{FuzzySearchSession, FuzzySearchUpdate};
+use std::sync::Arc;
 
 pub struct FileSystemSearch {
     search: FuzzySearchSession<PublishedSnapshot, FileSystemSearchStore>,
@@ -21,19 +21,15 @@ impl FileSystemSearch {
 
         let scan = start_scan(options, Arc::clone(&store));
 
-        let search = FuzzySearchSession::new(
-            session_id,
-            Arc::clone(&store),
-            initial_query,
-            updates_tx,
-        );
+        let search =
+            FuzzySearchSession::new(session_id, Arc::clone(&store), initial_query, updates_tx);
 
         search.start();
 
         Self {
             search,
             scan,
-            _store: store
+            _store: store,
         }
     }
 
