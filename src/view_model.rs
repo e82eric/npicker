@@ -3,6 +3,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
+use crate::preview::{PreviewController, PreviewUpdate};
 use crate::request::{PickerRequest, PickerResponse};
 use crate::source_store::{AnyItemSource, SharedStore};
 use anyhow::{bail, Result};
@@ -17,6 +18,7 @@ const PICKER_DISPLAY_LIMIT: usize = 7;
 pub enum UiEvent {
     Show,
     Results(UiUpdate),
+    Preview(PreviewUpdate),
     Close,
 }
 
@@ -42,6 +44,7 @@ pub struct ViewModel {
     search_update_rx: Receiver<FuzzySearchUpdate>,
     events_tx: Sender<UiEvent>,
     events_rx: Receiver<UiEvent>,
+    preview: Option<PreviewController>,
 }
 
 struct State {
@@ -53,6 +56,7 @@ struct State {
     counters: UiCounters,
     selected: usize,
     viewport_start: usize,
+    preview_item: Option<String>,
 }
 
 #[derive(Clone)]
@@ -91,8 +95,24 @@ struct ActiveRequest {
 
 impl ViewModel {
     pub fn new() -> Arc<Self> {
+        Self::new_with_preview(None)
+    }
+
+    pub fn new_with_preview(preview_command: Option<String>) -> Arc<Self> {
         let (events_tx, events_rx) = unbounded();
         let (search_update_tx, search_update_rx) = unbounded();
+        let preview = preview_command.map(|command| {
+            let (preview_tx, preview_rx) = unbounded();
+            let ui_events = events_tx.clone();
+            thread::spawn(move || {
+                while let Ok(update) = preview_rx.recv() {
+                    if ui_events.send(UiEvent::Preview(update)).is_err() {
+                        break;
+                    }
+                }
+            });
+            PreviewController::new(command, preview_tx)
+        });
 
         let this = Arc::new(Self {
             state: Mutex::new(State {
@@ -104,12 +124,14 @@ impl ViewModel {
                 viewport_start: 0,
                 cursor_position: 0,
                 cursor_selection_anchor: None,
+                preview_item: None,
             }),
             request_generation: AtomicU64::new(0),
             search_update_tx,
             search_update_rx,
             events_tx,
             events_rx,
+            preview,
         });
 
         this.spawn_search_update_thread();
@@ -173,6 +195,7 @@ impl ViewModel {
                 search_session: session.clone(),
             });
         }
+        self.update_preview_selection(None);
 
         let _ = self.events_tx.send(UiEvent::Show);
         session.start();
@@ -204,6 +227,7 @@ impl ViewModel {
         };
 
         if let Some((search_session, search_text)) = search_update {
+            self.update_preview_selection(None);
             search_session.set_query(search_text);
         }
     }
@@ -347,18 +371,20 @@ impl ViewModel {
     }
 
     pub fn move_selection(&self, delta: isize) {
-        let mut state = self.state.lock().expect("view model poisoned");
-        if state.results.is_empty() {
-            state.selected = 0;
-            state.viewport_start = 0;
-            return;
-        }
+        let update = {
+            let mut state = self.state.lock().expect("view model poisoned");
+            if state.results.is_empty() {
+                state.selected = 0;
+                state.viewport_start = 0;
+                return;
+            }
 
-        let next = state.selected as isize + delta;
-        state.selected = next.clamp(0, state.results.len() as isize - 1) as usize;
-        state.ensure_selection_visible();
-        let update = state.visible_update();
-        let _ = self.events_tx.send(UiEvent::Results(update));
+            let next = state.selected as isize + delta;
+            state.selected = next.clamp(0, state.results.len() as isize - 1) as usize;
+            state.ensure_selection_visible();
+            state.visible_update()
+        };
+        self.publish_results(update);
     }
 
     fn update_cursor_selection_anchor(state: &mut State, extend_selection: bool) {
@@ -516,6 +542,7 @@ impl ViewModel {
             session_to_stop.stop();
         }
 
+        self.update_preview_selection(None);
         let _ = self.events_tx.send(UiEvent::Close);
     }
 
@@ -534,6 +561,7 @@ impl ViewModel {
             session_to_stop.stop();
         }
 
+        self.update_preview_selection(None);
         let _ = self.events_tx.send(UiEvent::Close);
     }
 
@@ -589,7 +617,41 @@ impl ViewModel {
             let ui_update = state.visible_update();
             ui_update
         };
-        let _ = self.events_tx.send(UiEvent::Results(ui_update));
+        self.publish_results(ui_update);
+    }
+
+    fn publish_results(&self, update: UiUpdate) {
+        let selected_item = update
+            .results
+            .get(update.selected_row)
+            .map(|result| result.path.clone());
+        self.update_preview_selection(selected_item);
+        let _ = self.events_tx.send(UiEvent::Results(update));
+    }
+
+    fn update_preview_selection(&self, selected_item: Option<String>) {
+        let changed = {
+            let mut state = self.state.lock().expect("view model poisoned");
+            if state.preview_item == selected_item {
+                false
+            } else {
+                state.preview_item = selected_item.clone();
+                true
+            }
+        };
+        if !changed {
+            return;
+        }
+        if let Some(preview) = &self.preview {
+            let generation = if let Some(selected_item) = selected_item {
+                preview.request(selected_item)
+            } else {
+                preview.cancel()
+            };
+            let _ = self
+                .events_tx
+                .send(UiEvent::Preview(PreviewUpdate::Clear { generation }));
+        }
     }
 }
 

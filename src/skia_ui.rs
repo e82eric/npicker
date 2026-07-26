@@ -17,6 +17,7 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy}
 use winit::keyboard::{Key, NamedKey};
 use winit::window::{Window, WindowAttributes, WindowId, WindowLevel};
 
+use crate::preview::PreviewUpdate;
 use crate::view_model::{InputCommand, KeyModifiers, UiCounters, UiEvent, ViewModel};
 use nfm_search_core::search::SearchResult;
 
@@ -26,6 +27,8 @@ const MIN_HEIGHT: i32 = 240;
 const MONITOR_HORIZONTAL_MARGIN: i32 = 80;
 const MONITOR_VERTICAL_MARGIN: i32 = 160;
 const DISPLAY_ROWS: i32 = 7;
+const PREVIEW_ROWS: i32 = 20;
+const PREVIEW_OUTPUT_LIMIT: usize = 1024 * 1024;
 const PADDING: f32 = 8.0;
 const PANEL_BORDER: f32 = 2.0;
 const PANEL_HORIZONTAL_PADDING: f32 = 16.0;
@@ -60,7 +63,11 @@ enum AppEvent {
     Exit(i32),
 }
 
-pub fn run(view_model: Arc<ViewModel>, completion: Option<Receiver<i32>>) -> Result<i32> {
+pub fn run(
+    view_model: Arc<ViewModel>,
+    completion: Option<Receiver<i32>>,
+    preview_enabled: bool,
+) -> Result<i32> {
     let mut builder = EventLoop::<AppEvent>::with_user_event();
     #[cfg(windows)]
     {
@@ -72,10 +79,10 @@ pub fn run(view_model: Arc<ViewModel>, completion: Option<Receiver<i32>>) -> Res
     let proxy = event_loop.create_proxy();
     forward_ui_events(view_model.subscribe(), proxy.clone());
     if let Some(completion) = completion {
-        forward_completion(completion, proxy);
+        forward_completion(completion, proxy.clone());
     }
 
-    let mut app = PickerApp::new(view_model)?;
+    let mut app = PickerApp::new(view_model, preview_enabled)?;
     event_loop.run_app(&mut app)?;
     Ok(app.exit_code)
 }
@@ -113,6 +120,9 @@ struct WindowState {
     counters: UiCounters,
     selected_row: usize,
     cursor_visible: bool,
+    preview_enabled: bool,
+    preview_generation: u64,
+    preview_output: String,
     scale_factor: f64,
     layout: Layout,
 }
@@ -134,6 +144,8 @@ struct Rect {
 #[allow(dead_code)]
 struct Layout {
     window: Rect,
+    preview_border: Option<Rect>,
+    preview_box: Option<Rect>,
     search_border: Rect,
     search_box: Rect,
     list_border: Rect,
@@ -143,7 +155,36 @@ struct Layout {
     text_height: f32,
 }
 
-fn calculate_layout(window: Rect, padding: f32, number_of_items: i32, text_height: f32) -> Layout {
+fn calculate_layout(
+    window: Rect,
+    padding: f32,
+    number_of_items: i32,
+    text_height: f32,
+    preview_enabled: bool,
+) -> Layout {
+    let preview_border = preview_enabled.then(|| {
+        let maximum_height =
+            PREVIEW_ROWS as f32 * text_height + PANEL_VERTICAL_PADDING * 2.0 + PANEL_BORDER * 2.0;
+        let minimum_height = text_height + PANEL_VERTICAL_PADDING * 2.0 + PANEL_BORDER * 2.0;
+        let height_without_preview =
+            desired_window_height(text_height, padding, number_of_items, false) as f32;
+        let available_height = window.height - height_without_preview - PANEL_GAP;
+        Rect {
+            x: padding,
+            y: padding,
+            width: (window.width - padding * 2.0).max(0.0),
+            height: available_height.clamp(minimum_height, maximum_height),
+        }
+    });
+    let preview_box = preview_border.map(|border| Rect {
+        x: border.x + PANEL_BORDER + PANEL_HORIZONTAL_PADDING,
+        y: border.y + PANEL_BORDER + PANEL_VERTICAL_PADDING,
+        width: (border.width - (PANEL_BORDER + PANEL_HORIZONTAL_PADDING) * 2.0).max(0.0),
+        height: (border.height - (PANEL_BORDER + PANEL_VERTICAL_PADDING) * 2.0).max(0.0),
+    });
+    let list_top = preview_border
+        .map(|border| border.y + border.height + PANEL_GAP)
+        .unwrap_or(padding);
     let list_border_width = (window.width - (padding * 2.0)).max(0.0);
     let row_size = Size {
         height: text_height + (RESULT_VERTICAL_PADDING * 2.0) + RESULT_GAP,
@@ -152,7 +193,7 @@ fn calculate_layout(window: Rect, padding: f32, number_of_items: i32, text_heigh
 
     let list_border = Rect {
         x: padding,
-        y: padding,
+        y: list_top,
         width: (window.width - (padding * 2.0)).max(0.0),
         height: (number_of_items as f32 * (text_height + RESULT_VERTICAL_PADDING * 2.0))
             + ((number_of_items - 1).max(0) as f32 * RESULT_GAP)
@@ -183,6 +224,8 @@ fn calculate_layout(window: Rect, padding: f32, number_of_items: i32, text_heigh
 
     Layout {
         window,
+        preview_border,
+        preview_box,
         search_border,
         search_box,
         list_border,
@@ -193,18 +236,37 @@ fn calculate_layout(window: Rect, padding: f32, number_of_items: i32, text_heigh
     }
 }
 
-fn desired_window_height(text_height: f32, padding: f32, number_of_items: i32) -> i32 {
+fn desired_window_height(
+    text_height: f32,
+    padding: f32,
+    number_of_items: i32,
+    preview_enabled: bool,
+) -> i32 {
     let search_border_height = text_height + (QUERY_VERTICAL_PADDING * 2.0) + (PANEL_BORDER * 2.0);
     let list_border_height = (number_of_items as f32
         * (text_height + RESULT_VERTICAL_PADDING * 2.0))
         + ((number_of_items - 1).max(0) as f32 * RESULT_GAP)
         + (PANEL_VERTICAL_PADDING * 2.0)
         + (PANEL_BORDER * 2.0);
-    (padding + list_border_height + PANEL_GAP + search_border_height + padding).ceil() as i32
+    let preview_height = if preview_enabled {
+        PREVIEW_ROWS as f32 * text_height
+            + PANEL_VERTICAL_PADDING * 2.0
+            + PANEL_BORDER * 2.0
+            + PANEL_GAP
+    } else {
+        0.0
+    };
+    (padding + preview_height + list_border_height + PANEL_GAP + search_border_height + padding)
+        .ceil() as i32
 }
 
 impl WindowState {
-    fn new(view_model: Arc<ViewModel>, width: f32, scale_factor: f64) -> Result<Self> {
+    fn new(
+        view_model: Arc<ViewModel>,
+        width: f32,
+        scale_factor: f64,
+        preview_enabled: bool,
+    ) -> Result<Self> {
         let typeface = FontMgr::default()
             .legacy_make_typeface("Cascadia Mono", FontStyle::normal())
             .or_else(|| FontMgr::default().legacy_make_typeface(None, FontStyle::normal()))
@@ -214,7 +276,8 @@ impl WindowState {
         let counter_font = Font::new(typeface, 15.0);
         let text_height = font.metrics().0;
 
-        let desired_height = desired_window_height(text_height, PADDING, DISPLAY_ROWS);
+        let desired_height =
+            desired_window_height(text_height, PADDING, DISPLAY_ROWS, preview_enabled);
         DESIRED_WINDOW_HEIGHT.store(desired_height, Ordering::Relaxed);
 
         let window = Rect {
@@ -224,7 +287,8 @@ impl WindowState {
             height: desired_height as f32,
         };
 
-        let app_layout = calculate_layout(window, PADDING, DISPLAY_ROWS, text_height);
+        let app_layout =
+            calculate_layout(window, PADDING, DISPLAY_ROWS, text_height, preview_enabled);
 
         Ok(Self {
             view_model,
@@ -241,6 +305,9 @@ impl WindowState {
             counters: UiCounters::default(),
             selected_row: 0,
             cursor_visible: false,
+            preview_enabled,
+            preview_generation: 0,
+            preview_output: String::new(),
             scale_factor,
             layout: app_layout,
         })
@@ -250,6 +317,27 @@ impl WindowState {
         self.results = update.results;
         self.counters = update.counters;
         self.selected_row = update.selected_row;
+    }
+
+    fn begin_preview(&mut self, generation: u64) {
+        self.preview_generation = generation;
+        self.preview_output.clear();
+    }
+
+    fn append_preview(&mut self, generation: u64, text: &str) {
+        if generation == self.preview_generation && self.preview_output.len() < PREVIEW_OUTPUT_LIMIT
+        {
+            let remaining = PREVIEW_OUTPUT_LIMIT - self.preview_output.len();
+            if text.len() <= remaining {
+                self.preview_output.push_str(text);
+            } else {
+                let mut end = remaining;
+                while end > 0 && !text.is_char_boundary(end) {
+                    end -= 1;
+                }
+                self.preview_output.push_str(&text[..end]);
+            }
+        }
     }
 
     fn ensure_surface(&mut self, size: PhysicalSize<u32>, scale_factor: f64) -> Result<()> {
@@ -282,6 +370,7 @@ impl WindowState {
                 PADDING,
                 DISPLAY_ROWS,
                 self.layout.text_height,
+                self.preview_enabled,
             );
         }
         Ok(())
@@ -338,6 +427,28 @@ impl WindowState {
                 .max(0.0),
             height: self.layout.search_box.height,
         };
+
+        if let (Some(preview_border), Some(preview_box)) =
+            (self.layout.preview_border, self.layout.preview_box)
+        {
+            draw_rounded_rectangle(canvas, &self.stroke_paint, preview_border, radius);
+            let visible_rows = (preview_box.height / self.layout.text_height).floor() as usize;
+            for (row, line) in self.preview_output.lines().take(visible_rows).enumerate() {
+                draw_text(
+                    canvas,
+                    &self.font,
+                    &self.text_paint,
+                    line,
+                    Rect {
+                        x: preview_box.x,
+                        y: preview_box.y + row as f32 * self.layout.text_height,
+                        width: preview_box.width,
+                        height: self.layout.text_height,
+                    },
+                    TextAlign::Left,
+                );
+            }
+        }
 
         draw_rounded_rectangle(
             canvas,
@@ -675,9 +786,14 @@ struct PickerApp {
 }
 
 impl PickerApp {
-    fn new(view_model: Arc<ViewModel>) -> Result<Self> {
+    fn new(view_model: Arc<ViewModel>, preview_enabled: bool) -> Result<Self> {
         Ok(Self {
-            renderer: WindowState::new(Arc::clone(&view_model), DEFAULT_WIDTH as f32, 1.0)?,
+            renderer: WindowState::new(
+                Arc::clone(&view_model),
+                DEFAULT_WIDTH as f32,
+                1.0,
+                preview_enabled,
+            )?,
             view_model,
             window: None,
             soft_context: None,
@@ -857,6 +973,28 @@ impl ApplicationHandler<AppEvent> for PickerApp {
             AppEvent::Ui(UiEvent::Show) => self.show(),
             AppEvent::Ui(UiEvent::Results(update)) => {
                 self.renderer.apply_update(update);
+                if let Some(window) = &self.window {
+                    window.request_redraw();
+                }
+            }
+            AppEvent::Ui(UiEvent::Preview(PreviewUpdate::Clear { generation })) => {
+                self.renderer.begin_preview(generation);
+                if let Some(window) = &self.window {
+                    window.request_redraw();
+                }
+            }
+            AppEvent::Ui(UiEvent::Preview(PreviewUpdate::Output { generation, text })) => {
+                self.renderer.append_preview(generation, &text);
+                if let Some(window) = &self.window {
+                    window.request_redraw();
+                }
+            }
+            AppEvent::Ui(UiEvent::Preview(PreviewUpdate::Error {
+                generation,
+                message,
+            })) => {
+                self.renderer
+                    .append_preview(generation, &format!("{message}\n"));
                 if let Some(window) = &self.window {
                     window.request_redraw();
                 }
@@ -1098,7 +1236,7 @@ fn skia_color(value: u32) -> Color {
 
 #[cfg(test)]
 mod tests {
-    use super::copy_bgra_to_softbuffer;
+    use super::{calculate_layout, copy_bgra_to_softbuffer, Rect};
 
     #[test]
     fn pixel_copy_converts_bgra_and_honors_row_stride() {
@@ -1109,5 +1247,25 @@ mod tests {
         let mut target = [0; 4];
         copy_bgra_to_softbuffer(&source, 12, 2, 2, &mut target).unwrap();
         assert_eq!(target, [0x112233, 0x445566, 0x778899, 0xaabbcc]);
+    }
+
+    #[test]
+    fn preview_layout_places_preview_above_results() {
+        let layout = calculate_layout(
+            Rect {
+                x: 0.0,
+                y: 0.0,
+                width: 1200.0,
+                height: 700.0,
+            },
+            8.0,
+            7,
+            18.0,
+            true,
+        );
+        let preview = layout.preview_border.expect("preview border");
+        assert!(preview.y + preview.height < layout.list_border.y);
+        assert!(layout.list_border.y + layout.list_border.height < layout.search_border.y);
+        assert!(layout.search_border.y + layout.search_border.height <= layout.window.height);
     }
 }

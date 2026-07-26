@@ -31,7 +31,8 @@ fn main() -> Result<()> {
     }
 
     nfm_search_core::timing::set_sink(output_timing);
-    let view_model = ViewModel::new();
+    let preview_enabled = options.preview_command.is_some();
+    let view_model = ViewModel::new_with_preview(options.preview_command);
     let (completion_tx, completion_rx) = bounded(1);
     match options.input {
         InputMode::Stdin => run_stdin_request(Arc::clone(&view_model), completion_tx),
@@ -39,7 +40,7 @@ fn main() -> Result<()> {
             run_filewalker_request(Arc::clone(&view_model), roots, completion_tx)?
         }
     }
-    let code = skia_ui::run(view_model, Some(completion_rx))?;
+    let code = skia_ui::run(view_model, Some(completion_rx), preview_enabled)?;
     if code != 0 {
         std::process::exit(code);
     }
@@ -144,20 +145,30 @@ enum InputMode {
 struct AppOptions {
     debug_wait: bool,
     input: InputMode,
+    preview_command: Option<String>,
 }
 
 fn app_options() -> AppOptions {
     let mut options = AppOptions {
         debug_wait: false,
         input: InputMode::Stdin,
+        preview_command: None,
     };
     let mut filewalker = false;
     let mut roots = Vec::new();
-    for arg in std::env::args().skip(1) {
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
         match arg.as_str() {
             "filewalker" if !filewalker => filewalker = true,
             "--stdin" if !filewalker => {}
             "--debug-wait" => options.debug_wait = true,
+            "--preview" => {
+                if let Some(command) = args.next() {
+                    options.preview_command = Some(command);
+                } else {
+                    eprintln!("--preview requires a command");
+                }
+            }
             _ if filewalker => roots.push(arg),
             _ => eprintln!("ignoring unsupported argument: {arg}"),
         }
