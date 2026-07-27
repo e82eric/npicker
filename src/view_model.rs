@@ -19,6 +19,7 @@ pub enum UiEvent {
     Show,
     Results(UiUpdate),
     Preview(PreviewUpdate),
+    PreviewViewport { top_line: usize },
     Close,
 }
 
@@ -57,6 +58,11 @@ struct State {
     selected: usize,
     viewport_start: usize,
     preview_item: Option<String>,
+    preview_generation: u64,
+    preview_line_count: usize,
+    preview_top_line: usize,
+    preview_visible_rows: usize,
+    preview_truncated: bool,
 }
 
 #[derive(Clone)]
@@ -85,6 +91,8 @@ pub enum InputCommand {
     MoveEnd,
     Backspace,
     Delete,
+    PreviewPageUp,
+    PreviewPageDown,
 }
 
 struct ActiveRequest {
@@ -101,18 +109,15 @@ impl ViewModel {
     pub fn new_with_preview(preview_command: Option<String>) -> Arc<Self> {
         let (events_tx, events_rx) = unbounded();
         let (search_update_tx, search_update_rx) = unbounded();
-        let preview = preview_command.map(|command| {
+        let (preview, preview_rx) = if let Some(command) = preview_command {
             let (preview_tx, preview_rx) = unbounded();
-            let ui_events = events_tx.clone();
-            thread::spawn(move || {
-                while let Ok(update) = preview_rx.recv() {
-                    if ui_events.send(UiEvent::Preview(update)).is_err() {
-                        break;
-                    }
-                }
-            });
-            PreviewController::new(command, preview_tx)
-        });
+            (
+                Some(PreviewController::new(command, preview_tx)),
+                Some(preview_rx),
+            )
+        } else {
+            (None, None)
+        };
 
         let this = Arc::new(Self {
             state: Mutex::new(State {
@@ -125,6 +130,11 @@ impl ViewModel {
                 cursor_position: 0,
                 cursor_selection_anchor: None,
                 preview_item: None,
+                preview_generation: 0,
+                preview_line_count: 0,
+                preview_top_line: 0,
+                preview_visible_rows: 0,
+                preview_truncated: false,
             }),
             request_generation: AtomicU64::new(0),
             search_update_tx,
@@ -134,6 +144,20 @@ impl ViewModel {
             preview,
         });
 
+        if let Some(preview_rx) = preview_rx {
+            let weak = Arc::downgrade(&this);
+            thread::spawn(move || {
+                while let Ok(update) = preview_rx.recv() {
+                    let Some(view_model) = weak.upgrade() else {
+                        break;
+                    };
+                    view_model.apply_preview_update(&update);
+                    if view_model.events_tx.send(UiEvent::Preview(update)).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
         this.spawn_search_update_thread();
         this
     }
@@ -281,6 +305,65 @@ impl ViewModel {
             InputCommand::MoveHome => self.move_cursor_start(modifiers.shift),
             InputCommand::Backspace => self.handle_backspace(modifiers),
             InputCommand::Delete => self.handle_delete(modifiers),
+            InputCommand::PreviewPageUp => self.page_preview(-1),
+            InputCommand::PreviewPageDown => self.page_preview(1),
+        }
+    }
+
+    pub fn set_preview_visible_rows(&self, visible_rows: usize) {
+        let top_line = {
+            let mut state = self.state.lock().expect("view model poisoned");
+            if state.preview_visible_rows == visible_rows {
+                return;
+            }
+            state.preview_visible_rows = visible_rows;
+            state.clamp_preview_viewport();
+            state.preview_top_line
+        };
+        let _ = self.events_tx.send(UiEvent::PreviewViewport { top_line });
+    }
+
+    fn page_preview(&self, direction: isize) {
+        let top_line = {
+            let mut state = self.state.lock().expect("view model poisoned");
+            let page = state.preview_content_rows().saturating_sub(1).max(1);
+            let maximum = state
+                .preview_line_count
+                .saturating_sub(state.preview_content_rows());
+            state.preview_top_line = if direction < 0 {
+                state.preview_top_line.saturating_sub(page)
+            } else {
+                state.preview_top_line.saturating_add(page).min(maximum)
+            };
+            state.preview_top_line
+        };
+        let _ = self.events_tx.send(UiEvent::PreviewViewport { top_line });
+    }
+
+    fn apply_preview_update(&self, update: &PreviewUpdate) {
+        let mut state = self.state.lock().expect("view model poisoned");
+        let generation = match update {
+            PreviewUpdate::Clear { generation }
+            | PreviewUpdate::Ready { generation, .. }
+            | PreviewUpdate::Error { generation, .. } => *generation,
+        };
+        if generation != state.preview_generation {
+            return;
+        }
+        match update {
+            PreviewUpdate::Clear { .. } | PreviewUpdate::Error { .. } => {
+                state.preview_line_count = 0;
+                state.preview_top_line = 0;
+                state.preview_truncated = false;
+            }
+            PreviewUpdate::Ready {
+                lines, truncated, ..
+            } => {
+                state.preview_line_count = lines.len();
+                state.preview_top_line = 0;
+                state.preview_truncated = *truncated;
+                state.clamp_preview_viewport();
+            }
         }
     }
 
@@ -648,6 +731,13 @@ impl ViewModel {
             } else {
                 preview.cancel()
             };
+            {
+                let mut state = self.state.lock().expect("view model poisoned");
+                state.preview_generation = generation;
+                state.preview_line_count = 0;
+                state.preview_top_line = 0;
+                state.preview_truncated = false;
+            }
             let _ = self
                 .events_tx
                 .send(UiEvent::Preview(PreviewUpdate::Clear { generation }));
@@ -656,6 +746,21 @@ impl ViewModel {
 }
 
 impl State {
+    fn preview_content_rows(&self) -> usize {
+        if self.preview_truncated {
+            self.preview_visible_rows.saturating_sub(1)
+        } else {
+            self.preview_visible_rows
+        }
+    }
+
+    fn clamp_preview_viewport(&mut self) {
+        self.preview_top_line = self.preview_top_line.min(
+            self.preview_line_count
+                .saturating_sub(self.preview_content_rows()),
+        );
+    }
+
     fn ensure_selection_visible(&mut self) {
         if self.results.is_empty() {
             self.selected = 0;
@@ -732,5 +837,34 @@ mod tests {
         view_model.handle_command(InputCommand::MoveHome, modifiers(false, false));
         view_model.handle_command(InputCommand::Delete, modifiers(true, false));
         assert_eq!(view_model.current_search_text().text, " ");
+    }
+
+    #[test]
+    fn preview_paging_overlaps_one_row_and_clamps_to_document() {
+        let view_model = ViewModel::new();
+        view_model.set_preview_visible_rows(20);
+        while view_model.events_rx.try_recv().is_ok() {}
+        {
+            let mut state = view_model.state.lock().unwrap();
+            state.preview_line_count = 50;
+        }
+
+        view_model.handle_command(InputCommand::PreviewPageDown, KeyModifiers::default());
+        assert!(matches!(
+            view_model.events_rx.try_recv(),
+            Ok(UiEvent::PreviewViewport { top_line: 19 })
+        ));
+
+        view_model.handle_command(InputCommand::PreviewPageDown, KeyModifiers::default());
+        assert!(matches!(
+            view_model.events_rx.try_recv(),
+            Ok(UiEvent::PreviewViewport { top_line: 30 })
+        ));
+
+        view_model.handle_command(InputCommand::PreviewPageUp, KeyModifiers::default());
+        assert!(matches!(
+            view_model.events_rx.try_recv(),
+            Ok(UiEvent::PreviewViewport { top_line: 11 })
+        ));
     }
 }

@@ -1,19 +1,42 @@
-use std::io::{BufRead, BufReader};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use crossbeam_channel::Sender;
+use crossbeam_channel::{bounded, RecvTimeoutError, Sender};
+
+use crate::preview_document::PreviewDocument;
+pub use crate::preview_document::PreviewLine;
 
 const OUTPUT_LIMIT: usize = 1024 * 1024;
+const OUTPUT_CHANNEL_CAPACITY: usize = 32;
 const DEBOUNCE: Duration = Duration::from_millis(75);
 
 #[derive(Clone, Debug)]
 pub enum PreviewUpdate {
-    Clear { generation: u64 },
-    Output { generation: u64, text: String },
-    Error { generation: u64, message: String },
+    Clear {
+        generation: u64,
+    },
+    Ready {
+        generation: u64,
+        lines: Arc<[PreviewLine]>,
+        truncated: bool,
+    },
+    Error {
+        generation: u64,
+        message: String,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PreviewStream {
+    Stdout,
+    Stderr,
+}
+
+struct OutputChunk {
+    stream: PreviewStream,
+    bytes: Vec<u8>,
 }
 
 pub struct PreviewController {
@@ -92,76 +115,91 @@ fn run_process(
         }
     };
 
-    let bytes_sent = Arc::new(AtomicUsize::new(0));
-    let output_limit_reached = Arc::new(AtomicBool::new(false));
+    let (output_tx, output_rx) = bounded(OUTPUT_CHANNEL_CAPACITY);
     if let Some(stdout) = child.stdout.take() {
-        forward_output(
-            stdout,
-            generation,
-            Arc::clone(&bytes_sent),
-            Arc::clone(&output_limit_reached),
-            updates.clone(),
-        );
+        forward_output(stdout, PreviewStream::Stdout, output_tx.clone());
     }
     if let Some(stderr) = child.stderr.take() {
-        forward_output(
-            stderr,
-            generation,
-            bytes_sent,
-            Arc::clone(&output_limit_reached),
-            updates.clone(),
-        );
+        forward_output(stderr, PreviewStream::Stderr, output_tx.clone());
     }
+    drop(output_tx);
 
+    let mut document = PreviewDocument::default();
+    let mut bytes_received = 0;
+    let mut truncated = false;
+    let mut child_finished = false;
+    let mut readers_finished = false;
     loop {
-        if current_generation.load(Ordering::Acquire) != generation
-            || output_limit_reached.load(Ordering::Acquire)
-        {
+        if current_generation.load(Ordering::Acquire) != generation {
             let _ = child.kill();
             let _ = child.wait();
-            break;
+            return;
         }
-        match child.try_wait() {
-            Ok(Some(_)) => break,
-            Ok(None) => std::thread::sleep(Duration::from_millis(20)),
-            Err(error) => {
-                let _ = updates.send(PreviewUpdate::Error {
-                    generation,
-                    message: format!("preview process error: {error}"),
-                });
-                break;
+
+        if !readers_finished {
+            match output_rx.recv_timeout(Duration::from_millis(20)) {
+                Ok(chunk) => {
+                    let remaining = OUTPUT_LIMIT.saturating_sub(bytes_received);
+                    let allowed = remaining.min(chunk.bytes.len());
+                    if allowed > 0 {
+                        document.push(chunk.stream, &chunk.bytes[..allowed]);
+                        bytes_received += allowed;
+                    }
+                    if allowed < chunk.bytes.len() || document.line_limit_reached() {
+                        truncated = true;
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        break;
+                    }
+                }
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => readers_finished = true,
             }
         }
+
+        if !child_finished {
+            match child.try_wait() {
+                Ok(Some(_)) => child_finished = true,
+                Ok(None) => {}
+                Err(error) => {
+                    let _ = updates.send(PreviewUpdate::Error {
+                        generation,
+                        message: format!("preview process error: {error}"),
+                    });
+                    return;
+                }
+            }
+        }
+
+        if child_finished && readers_finished {
+            break;
+        }
     }
+
+    let _ = updates.send(PreviewUpdate::Ready {
+        generation,
+        lines: document.into_lines().into(),
+        truncated,
+    });
 }
 
 fn forward_output(
     reader: impl std::io::Read + Send + 'static,
-    generation: u64,
-    bytes_sent: Arc<AtomicUsize>,
-    output_limit_reached: Arc<AtomicBool>,
-    updates: Sender<PreviewUpdate>,
+    stream: PreviewStream,
+    output: Sender<OutputChunk>,
 ) {
     std::thread::spawn(move || {
-        let mut reader = BufReader::new(reader);
-        let mut bytes = Vec::new();
+        let mut reader = reader;
+        let mut buffer = [0_u8; 8192];
         loop {
-            bytes.clear();
-            match reader.read_until(b'\n', &mut bytes) {
+            match reader.read(&mut buffer) {
                 Ok(0) | Err(_) => break,
-                Ok(_) => {
-                    let previous = bytes_sent.fetch_add(bytes.len(), Ordering::AcqRel);
-                    if previous >= OUTPUT_LIMIT {
-                        output_limit_reached.store(true, Ordering::Release);
-                        break;
-                    }
-                    let allowed = (OUTPUT_LIMIT - previous).min(bytes.len());
-                    if allowed < bytes.len() {
-                        output_limit_reached.store(true, Ordering::Release);
-                    }
-                    let text = String::from_utf8_lossy(&bytes[..allowed]).into_owned();
-                    if updates
-                        .send(PreviewUpdate::Output { generation, text })
+                Ok(read) => {
+                    if output
+                        .send(OutputChunk {
+                            stream,
+                            bytes: buffer[..read].to_vec(),
+                        })
                         .is_err()
                     {
                         break;
@@ -182,6 +220,41 @@ fn shell_command(preview_command: &str) -> Command {
     command.args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command"]);
     command.arg(script);
     command
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn process_publishes_one_completed_document() {
+        let (updates, receiver) = bounded(4);
+        let generation = 7;
+        let current_generation = Arc::new(AtomicU64::new(generation));
+        #[cfg(windows)]
+        let command = "Write-Output 'first'; Write-Output 'second'";
+        #[cfg(not(windows))]
+        let command = "printf 'first\\nsecond\\n'";
+
+        run_process(command, "", generation, current_generation, updates);
+
+        let update = receiver.recv().expect("preview update");
+        let PreviewUpdate::Ready {
+            generation: result_generation,
+            lines,
+            truncated,
+        } = update
+        else {
+            panic!("expected completed preview");
+        };
+        assert_eq!(result_generation, generation);
+        assert!(!truncated);
+        let text: Vec<String> = lines
+            .iter()
+            .map(|line| line.spans.iter().map(|span| span.text.as_str()).collect())
+            .collect();
+        assert_eq!(&text[..2], ["first", "second"]);
+    }
 }
 
 #[cfg(not(windows))]

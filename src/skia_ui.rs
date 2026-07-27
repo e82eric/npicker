@@ -17,7 +17,8 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy}
 use winit::keyboard::{Key, NamedKey};
 use winit::window::{Window, WindowAttributes, WindowId, WindowLevel};
 
-use crate::preview::PreviewUpdate;
+use crate::preview::{PreviewLine, PreviewUpdate};
+use crate::preview_document::PreviewStyle;
 use crate::view_model::{InputCommand, KeyModifiers, UiCounters, UiEvent, ViewModel};
 use nfm_search_core::search::SearchResult;
 
@@ -28,7 +29,6 @@ const MONITOR_HORIZONTAL_MARGIN: i32 = 80;
 const MONITOR_VERTICAL_MARGIN: i32 = 160;
 const DISPLAY_ROWS: i32 = 7;
 const PREVIEW_ROWS: i32 = 20;
-const PREVIEW_OUTPUT_LIMIT: usize = 1024 * 1024;
 const PADDING: f32 = 8.0;
 const PANEL_BORDER: f32 = 2.0;
 const PANEL_HORIZONTAL_PADDING: f32 = 16.0;
@@ -109,6 +109,9 @@ struct WindowState {
     view_model: Arc<ViewModel>,
     surface: Option<Surface>,
     font: Font,
+    bold_font: Font,
+    italic_font: Font,
+    bold_italic_font: Font,
     counter_font: Font,
     text_paint: Paint,
     muted_paint: Paint,
@@ -122,7 +125,11 @@ struct WindowState {
     cursor_visible: bool,
     preview_enabled: bool,
     preview_generation: u64,
-    preview_output: String,
+    preview_lines: Arc<[PreviewLine]>,
+    preview_top_line: usize,
+    preview_loading: bool,
+    preview_truncated: bool,
+    preview_error: Option<String>,
     scale_factor: f64,
     layout: Layout,
 }
@@ -267,12 +274,34 @@ impl WindowState {
         scale_factor: f64,
         preview_enabled: bool,
     ) -> Result<Self> {
-        let typeface = FontMgr::default()
+        let font_manager = FontMgr::default();
+        let typeface = font_manager
             .legacy_make_typeface("Cascadia Mono", FontStyle::normal())
-            .or_else(|| FontMgr::default().legacy_make_typeface(None, FontStyle::normal()))
+            .or_else(|| font_manager.legacy_make_typeface(None, FontStyle::normal()))
             .context("failed to create Skia typeface")?;
         let mut font = Font::new(typeface.clone(), 15.0);
         font.set_subpixel(true);
+        let mut bold_font = Font::new(
+            font_manager
+                .legacy_make_typeface("Cascadia Mono", FontStyle::bold())
+                .unwrap_or_else(|| typeface.clone()),
+            15.0,
+        );
+        bold_font.set_subpixel(true);
+        let mut italic_font = Font::new(
+            font_manager
+                .legacy_make_typeface("Cascadia Mono", FontStyle::italic())
+                .unwrap_or_else(|| typeface.clone()),
+            15.0,
+        );
+        italic_font.set_subpixel(true);
+        let mut bold_italic_font = Font::new(
+            font_manager
+                .legacy_make_typeface("Cascadia Mono", FontStyle::bold_italic())
+                .unwrap_or_else(|| typeface.clone()),
+            15.0,
+        );
+        bold_italic_font.set_subpixel(true);
         let counter_font = Font::new(typeface, 15.0);
         let text_height = font.metrics().0;
 
@@ -289,11 +318,19 @@ impl WindowState {
 
         let app_layout =
             calculate_layout(window, PADDING, DISPLAY_ROWS, text_height, preview_enabled);
+        let preview_visible_rows = app_layout
+            .preview_box
+            .map(|preview| (preview.height / text_height).floor() as usize)
+            .unwrap_or(0);
+        view_model.set_preview_visible_rows(preview_visible_rows);
 
         Ok(Self {
             view_model,
             surface: None,
             font,
+            bold_font,
+            italic_font,
+            bold_italic_font,
             counter_font,
             text_paint: fill_paint(COLOR_TEXT),
             muted_paint: fill_paint(COLOR_TEXT),
@@ -307,7 +344,11 @@ impl WindowState {
             cursor_visible: false,
             preview_enabled,
             preview_generation: 0,
-            preview_output: String::new(),
+            preview_lines: Arc::from([]),
+            preview_top_line: 0,
+            preview_loading: false,
+            preview_truncated: false,
+            preview_error: None,
             scale_factor,
             layout: app_layout,
         })
@@ -321,22 +362,30 @@ impl WindowState {
 
     fn begin_preview(&mut self, generation: u64) {
         self.preview_generation = generation;
-        self.preview_output.clear();
+        self.preview_lines = Arc::from([]);
+        self.preview_top_line = 0;
+        self.preview_loading = true;
+        self.preview_truncated = false;
+        self.preview_error = None;
     }
 
-    fn append_preview(&mut self, generation: u64, text: &str) {
-        if generation == self.preview_generation && self.preview_output.len() < PREVIEW_OUTPUT_LIMIT
-        {
-            let remaining = PREVIEW_OUTPUT_LIMIT - self.preview_output.len();
-            if text.len() <= remaining {
-                self.preview_output.push_str(text);
-            } else {
-                let mut end = remaining;
-                while end > 0 && !text.is_char_boundary(end) {
-                    end -= 1;
-                }
-                self.preview_output.push_str(&text[..end]);
-            }
+    fn finish_preview(&mut self, generation: u64, lines: Arc<[PreviewLine]>, truncated: bool) {
+        if generation == self.preview_generation {
+            self.preview_lines = lines;
+            self.preview_top_line = 0;
+            self.preview_loading = false;
+            self.preview_truncated = truncated;
+            self.preview_error = None;
+        }
+    }
+
+    fn fail_preview(&mut self, generation: u64, message: String) {
+        if generation == self.preview_generation {
+            self.preview_lines = Arc::from([]);
+            self.preview_top_line = 0;
+            self.preview_loading = false;
+            self.preview_truncated = false;
+            self.preview_error = Some(message);
         }
     }
 
@@ -372,6 +421,13 @@ impl WindowState {
                 self.layout.text_height,
                 self.preview_enabled,
             );
+            let preview_visible_rows = self
+                .layout
+                .preview_box
+                .map(|preview| (preview.height / self.layout.text_height).floor() as usize)
+                .unwrap_or(0);
+            self.view_model
+                .set_preview_visible_rows(preview_visible_rows);
         }
         Ok(())
     }
@@ -433,12 +489,56 @@ impl WindowState {
         {
             draw_rounded_rectangle(canvas, &self.stroke_paint, preview_border, radius);
             let visible_rows = (preview_box.height / self.layout.text_height).floor() as usize;
-            for (row, line) in self.preview_output.lines().take(visible_rows).enumerate() {
+            let content_rows = if self.preview_truncated {
+                visible_rows.saturating_sub(1)
+            } else {
+                visible_rows
+            };
+            for (row, line) in self
+                .preview_lines
+                .iter()
+                .skip(self.preview_top_line)
+                .take(content_rows)
+                .enumerate()
+            {
+                draw_preview_line(
+                    canvas,
+                    &self.font,
+                    &self.bold_font,
+                    &self.italic_font,
+                    &self.bold_italic_font,
+                    line,
+                    Rect {
+                        x: preview_box.x,
+                        y: preview_box.y + row as f32 * self.layout.text_height,
+                        width: preview_box.width,
+                        height: self.layout.text_height,
+                    },
+                );
+            }
+            let status = if self.preview_loading {
+                Some(("Loading preview…", &self.muted_paint))
+            } else if let Some(error) = self.preview_error.as_deref() {
+                Some((error, &self.highlight_paint))
+            } else if self.preview_truncated {
+                Some((
+                    "… preview truncated at 4,000 lines or 1 MiB",
+                    &self.muted_paint,
+                ))
+            } else {
+                None
+            };
+            if let Some((text, paint)) = status {
+                let row = if self.preview_truncated {
+                    content_rows
+                } else {
+                    0
+                };
                 draw_text(
                     canvas,
                     &self.font,
-                    &self.text_paint,
-                    line,
+                    paint,
+                    text,
                     Rect {
                         x: preview_box.x,
                         y: preview_box.y + row as f32 * self.layout.text_height,
@@ -931,6 +1031,7 @@ impl PickerApp {
         if Instant::now() < self.input_ready_at {
             return;
         }
+        let modifiers = key_modifiers(self.modifiers);
         let command = match &event.logical_key {
             Key::Named(NamedKey::Enter) => Some(InputCommand::Accept),
             Key::Named(NamedKey::Escape) => Some(InputCommand::Cancel),
@@ -942,14 +1043,15 @@ impl PickerApp {
             Key::Named(NamedKey::End) => Some(InputCommand::MoveEnd),
             Key::Named(NamedKey::Backspace) => Some(InputCommand::Backspace),
             Key::Named(NamedKey::Delete) => Some(InputCommand::Delete),
+            Key::Named(NamedKey::PageUp) if modifiers.ctrl => Some(InputCommand::PreviewPageUp),
+            Key::Named(NamedKey::PageDown) if modifiers.ctrl => Some(InputCommand::PreviewPageDown),
             _ => None,
         };
         if let Some(command) = command {
             if event.repeat && matches!(command, InputCommand::Accept | InputCommand::Cancel) {
                 return;
             }
-            self.view_model
-                .handle_command(command, key_modifiers(self.modifiers));
+            self.view_model.handle_command(command, modifiers);
         } else if let Some(text) = event.text {
             self.view_model.insert_text(&text);
         }
@@ -983,8 +1085,12 @@ impl ApplicationHandler<AppEvent> for PickerApp {
                     window.request_redraw();
                 }
             }
-            AppEvent::Ui(UiEvent::Preview(PreviewUpdate::Output { generation, text })) => {
-                self.renderer.append_preview(generation, &text);
+            AppEvent::Ui(UiEvent::Preview(PreviewUpdate::Ready {
+                generation,
+                lines,
+                truncated,
+            })) => {
+                self.renderer.finish_preview(generation, lines, truncated);
                 if let Some(window) = &self.window {
                     window.request_redraw();
                 }
@@ -993,8 +1099,13 @@ impl ApplicationHandler<AppEvent> for PickerApp {
                 generation,
                 message,
             })) => {
-                self.renderer
-                    .append_preview(generation, &format!("{message}\n"));
+                self.renderer.fail_preview(generation, message);
+                if let Some(window) = &self.window {
+                    window.request_redraw();
+                }
+            }
+            AppEvent::Ui(UiEvent::PreviewViewport { top_line }) => {
+                self.renderer.preview_top_line = top_line;
                 if let Some(window) = &self.window {
                     window.request_redraw();
                 }
@@ -1149,6 +1260,106 @@ fn draw_rounded_rectangle(canvas: &Canvas, paint: &Paint, rect: Rect, radius: f3
 
 fn draw_filled_rectangle(canvas: &Canvas, paint: &Paint, rect: Rect) {
     canvas.draw_rect(sk_rect(rect), paint);
+}
+
+fn draw_preview_line(
+    canvas: &Canvas,
+    normal_font: &Font,
+    bold_font: &Font,
+    italic_font: &Font,
+    bold_italic_font: &Font,
+    line: &PreviewLine,
+    rect: Rect,
+) {
+    let mut x = rect.x;
+    let right = rect.x + rect.width;
+    for span in &line.spans {
+        if x >= right {
+            break;
+        }
+        let font = match (span.style.bold, span.style.italic) {
+            (true, true) => bold_italic_font,
+            (true, false) => bold_font,
+            (false, true) => italic_font,
+            (false, false) => normal_font,
+        };
+        let (foreground, background) = resolved_preview_colors(&span.style);
+        let text_paint = fill_paint(foreground);
+        let width = measure_text_width(font, &text_paint, &span.text);
+        let visible_width = width.min((right - x).max(0.0));
+        if visible_width <= 0.0 {
+            break;
+        }
+        let span_rect = Rect {
+            x,
+            y: rect.y,
+            width: visible_width,
+            height: rect.height,
+        };
+        if let Some(background) = background {
+            draw_filled_rectangle(canvas, &fill_paint(background), span_rect);
+        }
+        if !span.style.hidden {
+            draw_text(
+                canvas,
+                font,
+                &text_paint,
+                &span.text,
+                span_rect,
+                TextAlign::Left,
+            );
+            let decoration_height = 1.0;
+            if span.style.underline {
+                draw_filled_rectangle(
+                    canvas,
+                    &text_paint,
+                    Rect {
+                        x,
+                        y: rect.y + rect.height - 2.0,
+                        width: visible_width,
+                        height: decoration_height,
+                    },
+                );
+            }
+            if span.style.strikethrough {
+                draw_filled_rectangle(
+                    canvas,
+                    &text_paint,
+                    Rect {
+                        x,
+                        y: rect.y + rect.height * 0.55,
+                        width: visible_width,
+                        height: decoration_height,
+                    },
+                );
+            }
+        }
+        x += width;
+    }
+}
+
+fn resolved_preview_colors(style: &PreviewStyle) -> (u32, Option<u32>) {
+    let mut foreground = style.foreground.map(ansi_color_value).unwrap_or(COLOR_TEXT);
+    let mut background = style.background.map(ansi_color_value);
+    if style.inverse {
+        let inverse_foreground = background.unwrap_or(COLOR_BACKGROUND);
+        background = Some(foreground);
+        foreground = inverse_foreground;
+    }
+    if style.dim {
+        foreground = dim_color(foreground);
+    }
+    (foreground, background)
+}
+
+fn ansi_color_value(color: crate::preview_document::AnsiColor) -> u32 {
+    let (red, green, blue) = color.rgb();
+    u32::from(red) << 16 | u32::from(green) << 8 | u32::from(blue)
+}
+
+fn dim_color(color: u32) -> u32 {
+    let dim = |component: u32| component * 3 / 5;
+    dim((color >> 16) & 0xff) << 16 | dim((color >> 8) & 0xff) << 8 | dim(color & 0xff)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

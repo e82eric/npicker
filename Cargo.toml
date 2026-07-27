@@ -18,6 +18,7 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 nfm_search_core = { path = "nfm-search-core" }
+anstyle-parse = "1.0"
 anyhow = "1"
 crossbeam-channel = "0.5"
 skia-safe = "0.97.2"

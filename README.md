@@ -53,6 +53,19 @@ To preview file contents:
 nfm-rust-win32host filewalker --preview 'Get-Content -LiteralPath $env:NFM_PREVIEW_ITEM'
 ```
 
+ANSI SGR colors and styling are rendered in the preview. Because preview output
+is captured through a pipe rather than a terminal, commands must be told to
+emit colors. For example, use `bat` with color forced and paging disabled:
+
+```powershell
+nfm-rust-win32host filewalker --preview 'Get-Content -LiteralPath $env:NFM_PREVIEW_ITEM | bat --color=always --paging=never'
+```
+
+The preview supports standard and bright ANSI colors, 256-color and truecolor
+sequences, backgrounds, bold, dim, italic, underline, strikethrough, hidden,
+and inverse styling. It does not emulate an interactive terminal or implement
+cursor-positioning and alternate-screen controls.
+
 On other platforms, preview commands run through `/bin/sh`:
 
 ```sh
@@ -60,5 +73,7 @@ some-command-producing-lines | nfm-rust-win32host --preview 'cat "$NFM_PREVIEW_I
 ```
 
 Preview commands are debounced as the selection moves. Older processes are
-cancelled, late output is ignored, and captured stdout/stderr is limited to
-1 MiB per selection.
+cancelled and late output is ignored. Output is accumulated and ANSI-parsed
+off the UI thread, then displayed when the command finishes. A preview is
+truncated and its process stopped after 4,000 lines or 1 MiB of combined
+stdout/stderr.
