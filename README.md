@@ -65,6 +65,15 @@ nfm-rust-win32host filewalker
 
 Pass one or more roots after `filewalker` to scan different directories.
 
+On Windows, list the visible Alt-Tab application windows:
+
+```text
+nfm-rust-win32host listwindows
+```
+
+Rows contain the window handle, process ID, executable name, and title. The
+selected row is written to stdout.
+
 Add a non-blocking preview pane above the results with `--preview`. The selected
 item is passed only to the preview child process in `NFM_PREVIEW_ITEM`.
 

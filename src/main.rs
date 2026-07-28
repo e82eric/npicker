@@ -3,12 +3,12 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use crossbeam_channel::bounded;
-#[cfg(windows)]
-use rust_nfm::request::FileSystemPickerRequest;
 use rust_nfm::request::{
     DelimitedInputOptions, DelimitedStdinRequest, DelimitedTextSelector, DelimitedValueSelector,
     PickerResponse, StdinRequest,
 };
+#[cfg(windows)]
+use rust_nfm::request::{FileSystemPickerRequest, FlatItemsPickerRequest};
 use rust_nfm::skia_ui;
 use rust_nfm::view_model::ViewModel;
 
@@ -46,6 +46,7 @@ fn main() -> Result<()> {
         InputMode::FileWalker(roots) => {
             run_filewalker_request(Arc::clone(&view_model), roots, completion_tx)?
         }
+        InputMode::ListWindows => run_list_windows_request(Arc::clone(&view_model), completion_tx)?,
     }
     let code = skia_ui::run(view_model, Some(completion_rx), preview_enabled)?;
     if code != 0 {
@@ -78,6 +79,31 @@ fn run_stdin_request(view_model: Arc<ViewModel>, completion: crossbeam_channel::
         let code = response_exit_code(view_model.run_request(&request));
         let _ = completion.send(code);
     });
+}
+
+#[cfg(windows)]
+fn run_list_windows_request(
+    view_model: Arc<ViewModel>,
+    completion: crossbeam_channel::Sender<i32>,
+) -> Result<()> {
+    let items = rust_nfm::list_windows::list_windows()?;
+    std::thread::spawn(move || {
+        let request = FlatItemsPickerRequest {
+            items,
+            search_string: None,
+        };
+        let code = response_exit_code(view_model.run_request(&request));
+        let _ = completion.send(code);
+    });
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn run_list_windows_request(
+    _view_model: Arc<ViewModel>,
+    _completion: crossbeam_channel::Sender<i32>,
+) -> Result<()> {
+    anyhow::bail!("the listwindows command is currently available only on Windows")
 }
 
 #[cfg(windows)]
@@ -159,6 +185,7 @@ fn response_exit_code(response: Result<PickerResponse>) -> i32 {
 enum InputMode {
     Stdin(Option<DelimitedInputOptions>),
     FileWalker(Vec<String>),
+    ListWindows,
 }
 
 struct AppOptions {
@@ -176,6 +203,7 @@ fn app_options() -> AppOptions {
         preview_cwd: None,
     };
     let mut filewalker = false;
+    let mut list_windows = false;
     let mut roots = Vec::new();
     let mut delimiter = None;
     let mut text = DelimitedTextSelector::FullLine;
@@ -186,6 +214,7 @@ fn app_options() -> AppOptions {
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "filewalker" if !filewalker => filewalker = true,
+            "listwindows" | "ListWindows" if !filewalker => list_windows = true,
             "--stdin" if !filewalker => {}
             "--debug-wait" => options.debug_wait = true,
             "--preview" => {
@@ -232,7 +261,9 @@ fn app_options() -> AppOptions {
             _ => eprintln!("ignoring unsupported argument: {arg}"),
         }
     }
-    if filewalker {
+    if list_windows {
+        options.input = InputMode::ListWindows;
+    } else if filewalker {
         options.input = InputMode::FileWalker(roots);
     } else if let Some(delimiter) = delimiter {
         options.input = InputMode::Stdin(Some(DelimitedInputOptions {
