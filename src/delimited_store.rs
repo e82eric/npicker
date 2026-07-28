@@ -96,7 +96,6 @@ impl DelimitedStreamingStore {
             items: self.items.snapshot(),
             items_count: self.items.len(),
             bytes: self.bytes.snapshot(),
-            byte_count: self.bytes.len(),
             version: self.version,
             delimiter: self.delimiter,
             text: self.text,
@@ -111,7 +110,6 @@ pub struct DelimitedStreamingSnapshot {
     items: ChunkedSnapshot<DelimitedItem>,
     items_count: usize,
     bytes: ChunkedSnapshot<u8>,
-    byte_count: usize,
     version: u64,
     delimiter: char,
     text: DelimitedTextSelector,
@@ -121,44 +119,14 @@ pub struct DelimitedStreamingSnapshot {
 }
 
 impl DelimitedStreamingSnapshot {
-    fn copy_range(&self, range: ByteRange, out: &mut [u8]) {
-        let mut remaining = range.length;
-        let mut offset = range.offset;
-        let mut written = 0;
-        while remaining > 0 {
-            let (chunk_index, chunk_offset) = self.bytes.locate_direct(offset);
-            let chunk = &self.bytes.chunks[chunk_index];
-            let readable = remaining.min(chunk.len() - chunk_offset);
-            out[written..written + readable]
-                .copy_from_slice(&chunk[chunk_offset..chunk_offset + readable]);
-            remaining -= readable;
-            offset += readable;
-            written += readable;
-        }
-    }
-
     fn get_range<'a>(
         &'a self,
         range: ByteRange,
         stack_buffer: &'a mut [u8],
         heap_buffer: &'a mut Vec<u8>,
     ) -> &'a [u8] {
-        debug_assert!(range.offset + range.length <= self.byte_count);
-        if range.length == 0 {
-            return &stack_buffer[..0];
-        }
-        let (chunk_index, chunk_offset) = self.bytes.locate_direct(range.offset);
-        let chunk = &self.bytes.chunks[chunk_index];
-        if chunk_offset + range.length <= chunk.len() {
-            return &chunk[chunk_offset..chunk_offset + range.length];
-        }
-        if range.length > stack_buffer.len() {
-            heap_buffer.resize(range.length, 0);
-            self.copy_range(range, heap_buffer);
-            return heap_buffer;
-        }
-        self.copy_range(range, &mut stack_buffer[..range.length]);
-        &stack_buffer[..range.length]
+        self.bytes
+            .get_range(range.offset, range.length, stack_buffer, heap_buffer)
     }
 
     fn full_line(&self, index: usize, out: &mut Vec<u8>) -> String {

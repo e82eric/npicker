@@ -122,7 +122,6 @@ impl StreamingItemStore {
             items: self.items.snapshot(),
             items_count: self.items.len(),
             bytes: self.bytes.snapshot(),
-            byte_count: self.bytes.len(),
             version,
         });
     }
@@ -140,7 +139,6 @@ pub struct StreamingItemSnapshot {
     items: ChunkedSnapshot<FlatItem>,
     items_count: usize,
     bytes: ChunkedSnapshot<u8>,
-    byte_count: usize,
     version: u64,
 }
 
@@ -150,27 +148,7 @@ impl StreamingItemSnapshot {
             items: ChunkedSnapshot::empty(),
             items_count: 0,
             bytes: ChunkedSnapshot::empty(),
-            byte_count: 0,
             version: 0,
-        }
-    }
-
-    fn copy_item_to_slice(&self, item: FlatItem, out: &mut [u8]) {
-        debug_assert!(item.len <= out.len());
-        let mut remaining = item.len;
-        let mut offset = item.offset;
-        let mut written = 0usize;
-
-        while remaining > 0 {
-            let (chunk_index, chunk_offset) = self.bytes.locate_direct(offset);
-            let chunk = &self.bytes.chunks[chunk_index];
-            let readable = remaining.min(chunk.len() - chunk_offset);
-            out[written..written + readable]
-                .copy_from_slice(&chunk[chunk_offset..chunk_offset + readable]);
-
-            remaining -= readable;
-            offset += readable;
-            written += readable;
         }
     }
 }
@@ -196,27 +174,8 @@ impl ItemsSource for StreamingItemSnapshot {
     ) -> &'a [u8] {
         debug_assert!(index < self.items_count);
         let item = self.items[index];
-        debug_assert!(item.offset + item.len <= self.byte_count);
-
-        if item.len == 0 {
-            return &stack_buffer[..0];
-        }
-
-        let (chunk_index, chunk_offset) = self.bytes.locate_direct(item.offset);
-        let chunk = &self.bytes.chunks[chunk_index];
-        let contained_in_single_chunk = chunk_offset + item.len <= chunk.len();
-        if contained_in_single_chunk {
-            return &chunk[chunk_offset..chunk_offset + item.len];
-        }
-
-        if item.len > stack_buffer.len() {
-            heap_buffer.resize(item.len, 0);
-            self.copy_item_to_slice(item, heap_buffer);
-            return heap_buffer.as_slice();
-        }
-
-        self.copy_item_to_slice(item, &mut stack_buffer[..item.len]);
-        &stack_buffer[..item.len]
+        self.bytes
+            .get_range(item.offset, item.len, stack_buffer, heap_buffer)
     }
 
     fn get_string_lossy(&self, node_index: usize, out: &mut Vec<u8>) -> String {
@@ -247,27 +206,8 @@ impl<T: Copy> ItemsSource for StreamingItemSnapshotWithPayload<T> {
     ) -> &'a [u8] {
         debug_assert!(index < self.items_count);
         let item = self.items[index];
-        debug_assert!(item.offset + item.len <= self.byte_count);
-
-        if item.len == 0 {
-            return &stack_buffer[..0];
-        }
-
-        let (chunk_index, chunk_offset) = self.bytes.locate_direct(item.offset);
-        let chunk = &self.bytes.chunks[chunk_index];
-        let contained_in_single_chunk = chunk_offset + item.len <= chunk.len();
-        if contained_in_single_chunk {
-            return &chunk[chunk_offset..chunk_offset + item.len];
-        }
-
-        if item.len > stack_buffer.len() {
-            heap_buffer.resize(item.len, 0);
-            self.copy_item_to_slice(item, heap_buffer);
-            return heap_buffer.as_slice();
-        }
-
-        self.copy_item_to_slice(item, &mut stack_buffer[..item.len]);
-        &stack_buffer[..item.len]
+        self.bytes
+            .get_range(item.offset, item.len, stack_buffer, heap_buffer)
     }
 
     fn get_string_lossy(&self, node_index: usize, out: &mut Vec<u8>) -> String {
@@ -282,7 +222,6 @@ pub struct StreamingItemSnapshotWithPayload<T: Copy> {
     items_count: usize,
     payloads: ChunkedSnapshot<T>,
     bytes: ChunkedSnapshot<u8>,
-    byte_count: usize,
     version: u64,
 }
 
@@ -293,7 +232,6 @@ impl<T: Copy> StreamingItemSnapshotWithPayload<T> {
             items_count: 0,
             payloads: ChunkedSnapshot::empty(),
             bytes: ChunkedSnapshot::empty(),
-            byte_count: 0,
             version: 0,
         }
     }
@@ -301,25 +239,6 @@ impl<T: Copy> StreamingItemSnapshotWithPayload<T> {
     pub fn payload(&self, index: usize) -> &T {
         debug_assert!(index < self.items_count);
         &self.payloads[index]
-    }
-
-    fn copy_item_to_slice(&self, item: FlatItem, out: &mut [u8]) {
-        debug_assert!(item.len <= out.len());
-        let mut remaining = item.len;
-        let mut offset = item.offset;
-        let mut written = 0usize;
-
-        while remaining > 0 {
-            let (chunk_index, chunk_offset) = self.bytes.locate_direct(offset);
-            let chunk = &self.bytes.chunks[chunk_index];
-            let readable = remaining.min(chunk.len() - chunk_offset);
-            out[written..written + readable]
-                .copy_from_slice(&chunk[chunk_offset..chunk_offset + readable]);
-
-            remaining -= readable;
-            offset += readable;
-            written += readable;
-        }
     }
 }
 
@@ -384,7 +303,6 @@ impl<T: Copy + Default> StreamingItemStoreWithPayload<T> {
             items_count: self.items.len(),
             payloads: self.payloads.snapshot(),
             bytes: self.bytes.snapshot(),
-            byte_count: self.bytes.len(),
             version,
         });
     }
@@ -536,6 +454,7 @@ impl<T: Copy + Default> ChunkedStorage<T> {
         ChunkedSnapshot {
             chunks: Arc::new(chunks),
             chunk_size: self.chunk_size,
+            len: self.len,
         }
     }
 
@@ -573,6 +492,7 @@ impl<T: Copy> ChunkedStorage<T> {
 pub struct ChunkedSnapshot<T: Copy> {
     pub chunks: Arc<Vec<Arc<[T]>>>,
     chunk_size: usize,
+    len: usize,
 }
 
 impl<T: Copy> ChunkedSnapshot<T> {
@@ -580,11 +500,53 @@ impl<T: Copy> ChunkedSnapshot<T> {
         Self {
             chunks: Arc::new(Vec::new()),
             chunk_size: 1,
+            len: 0,
         }
     }
 
     pub fn locate_direct(&self, index: usize) -> (usize, usize) {
         (index / self.chunk_size, index % self.chunk_size)
+    }
+}
+
+impl ChunkedSnapshot<u8> {
+    pub fn get_range<'a>(
+        &'a self,
+        offset: usize,
+        length: usize,
+        stack_buffer: &'a mut [u8],
+        heap_buffer: &'a mut Vec<u8>,
+    ) -> &'a [u8] {
+        assert!(offset <= self.len && length <= self.len - offset);
+        if length == 0 {
+            return &stack_buffer[..0];
+        }
+
+        let (chunk_index, chunk_offset) = self.locate_direct(offset);
+        let chunk = &self.chunks[chunk_index];
+        if chunk_offset + length <= chunk.len() {
+            return &chunk[chunk_offset..chunk_offset + length];
+        }
+
+        if length > stack_buffer.len() {
+            heap_buffer.resize(length, 0);
+            self.copy_range_to(offset, heap_buffer);
+            return heap_buffer;
+        }
+
+        self.copy_range_to(offset, &mut stack_buffer[..length]);
+        &stack_buffer[..length]
+    }
+
+    fn copy_range_to(&self, mut offset: usize, mut target: &mut [u8]) {
+        while !target.is_empty() {
+            let (chunk_index, chunk_offset) = self.locate_direct(offset);
+            let chunk = &self.chunks[chunk_index];
+            let readable = target.len().min(chunk.len() - chunk_offset);
+            target[..readable].copy_from_slice(&chunk[chunk_offset..chunk_offset + readable]);
+            offset += readable;
+            target = &mut target[readable..];
+        }
     }
 }
 
@@ -629,5 +591,24 @@ mod tests {
         let mut out = Vec::new();
 
         assert_eq!(snapshot.get_string_lossy(1, &mut out), "two");
+    }
+
+    #[test]
+    fn chunked_byte_snapshot_reads_contiguous_and_cross_chunk_ranges() {
+        let mut storage = ChunkedStorage::new(4);
+        storage.extend_from_slice(b"abcdefghij");
+        let snapshot = storage.snapshot();
+        let mut stack = [0; 8];
+        let mut heap = Vec::new();
+
+        assert_eq!(snapshot.get_range(0, 3, &mut stack, &mut heap), b"abc");
+        assert_eq!(snapshot.get_range(3, 5, &mut stack, &mut heap), b"defgh");
+
+        let mut small_stack = [0; 2];
+        assert_eq!(
+            snapshot.get_range(2, 7, &mut small_stack, &mut heap),
+            b"cdefghi"
+        );
+        assert_eq!(heap, b"cdefghi");
     }
 }
