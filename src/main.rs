@@ -5,7 +5,10 @@ use anyhow::Result;
 use crossbeam_channel::bounded;
 #[cfg(windows)]
 use rust_nfm::request::FileSystemPickerRequest;
-use rust_nfm::request::{PickerResponse, StdinRequest};
+use rust_nfm::request::{
+    DelimitedInputOptions, DelimitedStdinRequest, DelimitedTextSelector, DelimitedValueSelector,
+    PickerResponse, StdinRequest,
+};
 use rust_nfm::skia_ui;
 use rust_nfm::view_model::ViewModel;
 
@@ -32,10 +35,14 @@ fn main() -> Result<()> {
 
     nfm_search_core::timing::set_sink(output_timing);
     let preview_enabled = options.preview_command.is_some();
-    let view_model = ViewModel::new_with_preview(options.preview_command);
+    let view_model =
+        ViewModel::new_with_preview_options(options.preview_command, options.preview_cwd);
     let (completion_tx, completion_rx) = bounded(1);
     match options.input {
-        InputMode::Stdin => run_stdin_request(Arc::clone(&view_model), completion_tx),
+        InputMode::Stdin(None) => run_stdin_request(Arc::clone(&view_model), completion_tx),
+        InputMode::Stdin(Some(options)) => {
+            run_delimited_request(Arc::clone(&view_model), options, completion_tx)
+        }
         InputMode::FileWalker(roots) => {
             run_filewalker_request(Arc::clone(&view_model), roots, completion_tx)?
         }
@@ -45,6 +52,18 @@ fn main() -> Result<()> {
         std::process::exit(code);
     }
     Ok(())
+}
+
+fn run_delimited_request(
+    view_model: Arc<ViewModel>,
+    options: DelimitedInputOptions,
+    completion: crossbeam_channel::Sender<i32>,
+) {
+    std::thread::spawn(move || {
+        let request = DelimitedStdinRequest::new(options, None);
+        let code = response_exit_code(view_model.run_request(&request));
+        let _ = completion.send(code);
+    });
 }
 
 fn debug_wait() {
@@ -138,7 +157,7 @@ fn response_exit_code(response: Result<PickerResponse>) -> i32 {
 }
 
 enum InputMode {
-    Stdin,
+    Stdin(Option<DelimitedInputOptions>),
     FileWalker(Vec<String>),
 }
 
@@ -146,16 +165,23 @@ struct AppOptions {
     debug_wait: bool,
     input: InputMode,
     preview_command: Option<String>,
+    preview_cwd: Option<std::path::PathBuf>,
 }
 
 fn app_options() -> AppOptions {
     let mut options = AppOptions {
         debug_wait: false,
-        input: InputMode::Stdin,
+        input: InputMode::Stdin(None),
         preview_command: None,
+        preview_cwd: None,
     };
     let mut filewalker = false;
     let mut roots = Vec::new();
+    let mut delimiter = None;
+    let mut text = DelimitedTextSelector::FullLine;
+    let mut value = DelimitedValueSelector::FullLine;
+    let mut preview_file_field = None;
+    let mut preview_center_line_field = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -169,12 +195,110 @@ fn app_options() -> AppOptions {
                     eprintln!("--preview requires a command");
                 }
             }
+            "--preview-cwd" => {
+                if let Some(directory) = args.next() {
+                    options.preview_cwd = Some(directory.into());
+                } else {
+                    eprintln!("--preview-cwd requires a directory");
+                }
+            }
+            "--delimiter" if !filewalker => {
+                if let Some(value) = args.next() {
+                    delimiter = parse_delimiter(&value);
+                    if delimiter.is_none() {
+                        eprintln!("--delimiter requires one character or \\\\t");
+                    }
+                } else {
+                    eprintln!("--delimiter requires a value");
+                }
+            }
+            "--text-field" if !filewalker => {
+                if let Some(selector) = parse_text_selector(args.next()) {
+                    text = selector;
+                }
+            }
+            "--value-field" if !filewalker => {
+                if let Some(selector) = parse_value_selector(args.next()) {
+                    value = selector;
+                }
+            }
+            "--preview-file-field" if !filewalker => {
+                preview_file_field = parse_field(args.next(), "--preview-file-field");
+            }
+            "--preview-center-line-field" if !filewalker => {
+                preview_center_line_field = parse_field(args.next(), "--preview-center-line-field");
+            }
             _ if filewalker => roots.push(arg),
             _ => eprintln!("ignoring unsupported argument: {arg}"),
         }
     }
     if filewalker {
         options.input = InputMode::FileWalker(roots);
+    } else if let Some(delimiter) = delimiter {
+        options.input = InputMode::Stdin(Some(DelimitedInputOptions {
+            delimiter,
+            text,
+            value,
+            preview_file_field,
+            preview_center_line_field,
+        }));
     }
     options
+}
+
+fn parse_text_selector(value: Option<String>) -> Option<DelimitedTextSelector> {
+    let Some(value) = value else {
+        eprintln!("--text-field requires 'all' or a one-based field number");
+        return None;
+    };
+    if value.eq_ignore_ascii_case("all") {
+        return Some(DelimitedTextSelector::FullLine);
+    }
+    match value.parse::<usize>() {
+        Ok(field) if field > 0 => Some(DelimitedTextSelector::Field(field - 1)),
+        _ => {
+            eprintln!("--text-field requires 'all' or a positive field number");
+            None
+        }
+    }
+}
+
+fn parse_value_selector(value: Option<String>) -> Option<DelimitedValueSelector> {
+    let Some(value) = value else {
+        eprintln!("--value-field requires 'all' or a one-based field number");
+        return None;
+    };
+    if value.eq_ignore_ascii_case("all") {
+        return Some(DelimitedValueSelector::FullLine);
+    }
+    match value.parse::<usize>() {
+        Ok(field) if field > 0 => Some(DelimitedValueSelector::Field(field - 1)),
+        _ => {
+            eprintln!("--value-field requires 'all' or a positive field number");
+            None
+        }
+    }
+}
+
+fn parse_delimiter(value: &str) -> Option<char> {
+    if value == "\\t" {
+        return Some('\t');
+    }
+    let mut chars = value.chars();
+    let delimiter = chars.next()?;
+    chars.next().is_none().then_some(delimiter)
+}
+
+fn parse_field(value: Option<String>, option: &str) -> Option<usize> {
+    let Some(value) = value else {
+        eprintln!("{option} requires a one-based field number");
+        return None;
+    };
+    match value.parse::<usize>() {
+        Ok(field) if field > 0 => Some(field - 1),
+        _ => {
+            eprintln!("{option} requires a positive field number");
+            None
+        }
+    }
 }

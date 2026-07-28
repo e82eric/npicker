@@ -1,3 +1,5 @@
+use crate::delimited_store::{DelimitedStreamingSnapshot, DelimitedStreamingStore};
+pub use crate::delimited_store::{DelimitedTextSelector, DelimitedValueSelector};
 use crate::source_store::{AnyItemSource, SharedStore};
 use nfm_search_core::store::{
     FlatSnapshot, ItemsSource, StreamingItemSnapshot, StreamingItemStore,
@@ -81,6 +83,109 @@ pub struct StdinRequest {
     search_string: Option<String>,
     shared_store: Arc<SharedStore>,
     reader: Mutex<Option<Box<dyn Read + Send>>>,
+}
+
+#[derive(Clone, Debug)]
+pub struct DelimitedInputOptions {
+    pub delimiter: char,
+    pub text: DelimitedTextSelector,
+    pub value: DelimitedValueSelector,
+    pub preview_file_field: Option<usize>,
+    pub preview_center_line_field: Option<usize>,
+}
+
+pub struct DelimitedStdinRequest {
+    options: DelimitedInputOptions,
+    search_string: Option<String>,
+    shared_store: Arc<SharedStore>,
+    reader: Mutex<Option<Box<dyn Read + Send>>>,
+}
+
+impl DelimitedStdinRequest {
+    pub fn new(options: DelimitedInputOptions, search_string: Option<String>) -> Self {
+        Self {
+            options,
+            search_string,
+            shared_store: Arc::new(SharedStore::new()),
+            reader: Mutex::new(None),
+        }
+    }
+
+    #[cfg(test)]
+    fn with_reader(
+        options: DelimitedInputOptions,
+        search_string: Option<String>,
+        reader: impl Read + Send + 'static,
+    ) -> Self {
+        Self {
+            options,
+            search_string,
+            shared_store: Arc::new(SharedStore::new()),
+            reader: Mutex::new(Some(Box::new(reader))),
+        }
+    }
+
+    fn spawn_reader(&self) {
+        let options = self.options.clone();
+        let shared_store = Arc::clone(&self.shared_store);
+        let reader: Box<dyn Read + Send> = self
+            .reader
+            .lock()
+            .expect("stdin reader poisoned")
+            .take()
+            .unwrap_or_else(|| Box::new(std::io::stdin()));
+
+        thread::spawn(move || {
+            let mut store = DelimitedStreamingStore::new(
+                options.delimiter,
+                options.text,
+                options.value,
+                options.preview_file_field,
+                options.preview_center_line_field,
+            );
+            for line in BufReader::new(reader).lines() {
+                let Ok(line) = line else {
+                    break;
+                };
+                let text = match options.text {
+                    DelimitedTextSelector::FullLine => line.as_str(),
+                    DelimitedTextSelector::Field(field) => {
+                        let Some(text) = line
+                            .splitn(field + 1, options.delimiter)
+                            .nth(field)
+                            .filter(|text| !text.is_empty())
+                        else {
+                            continue;
+                        };
+                        text
+                    }
+                };
+                if text.is_empty() {
+                    continue;
+                }
+                let search_offset = text.as_ptr() as usize - line.as_ptr() as usize;
+                store.add_item(line.as_bytes(), search_offset, text.len());
+                if store.len().is_multiple_of(1_000) {
+                    shared_store.publish(Arc::new(AnyItemSource::Delimited(store.snapshot())));
+                }
+            }
+            shared_store.publish(Arc::new(AnyItemSource::Delimited(store.snapshot())));
+            shared_store.complete();
+        });
+    }
+}
+
+impl PickerRequest for DelimitedStdinRequest {
+    type Source = DelimitedStreamingSnapshot;
+
+    fn search_string(&self) -> Option<&str> {
+        self.search_string.as_deref()
+    }
+
+    fn run(&self) -> Arc<SharedStore> {
+        self.spawn_reader();
+        Arc::clone(&self.shared_store)
+    }
 }
 
 impl StdinRequest {
@@ -184,6 +289,7 @@ impl PickerResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::delimited_store::DelimitedItemMetadata;
     use std::time::Duration;
 
     #[test]
@@ -198,5 +304,146 @@ mod tests {
         }
         let snapshot = store.snapshot().expect("snapshot");
         assert_eq!(snapshot.len(), 2);
+    }
+
+    #[test]
+    fn delimited_request_preserves_the_last_field_and_metadata() {
+        let request = DelimitedStdinRequest::with_reader(
+            DelimitedInputOptions {
+                delimiter: ':',
+                text: DelimitedTextSelector::Field(3),
+                value: DelimitedValueSelector::Field(0),
+                preview_file_field: Some(0),
+                preview_center_line_field: Some(1),
+            },
+            None,
+            b"tmp\\result.txt:639:26:g:\\src\\project\\TODO\n".as_slice(),
+        );
+        let store = request.run();
+        for _ in 0..100 {
+            if store.is_done() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+
+        let snapshot = store.snapshot().expect("snapshot");
+        let mut stack = [0; 128];
+        let mut heap = Vec::new();
+        assert_eq!(
+            snapshot.get_string(0, &mut stack, &mut heap),
+            b"g:\\src\\project\\TODO"
+        );
+        assert_eq!(
+            snapshot.delimited_metadata(0),
+            Some(DelimitedItemMetadata {
+                value: "tmp\\result.txt".into(),
+                preview_item: Some("tmp\\result.txt".into()),
+                preview_center_line: Some(639),
+            })
+        );
+    }
+
+    #[test]
+    fn delimited_request_can_search_the_full_input_line() {
+        let input = b"tmp\\result.txt:639:26:g:\\src\\project\\TODO\n";
+        let request = DelimitedStdinRequest::with_reader(
+            DelimitedInputOptions {
+                delimiter: ':',
+                text: DelimitedTextSelector::FullLine,
+                value: DelimitedValueSelector::Field(0),
+                preview_file_field: Some(0),
+                preview_center_line_field: Some(1),
+            },
+            None,
+            input.as_slice(),
+        );
+        let store = request.run();
+        for _ in 0..100 {
+            if store.is_done() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        let snapshot = store.snapshot().expect("snapshot");
+        let mut stack = [0; 128];
+        let mut heap = Vec::new();
+        assert_eq!(
+            snapshot.get_string(0, &mut stack, &mut heap),
+            &input[..input.len() - 1]
+        );
+        assert_eq!(
+            snapshot.delimited_metadata(0),
+            Some(DelimitedItemMetadata {
+                value: "tmp\\result.txt".into(),
+                preview_item: Some("tmp\\result.txt".into()),
+                preview_center_line: Some(639),
+            })
+        );
+    }
+
+    #[test]
+    fn delimited_request_defaults_value_to_the_full_line() {
+        let input = b"file.txt:42:7:matching text\n";
+        let request = DelimitedStdinRequest::with_reader(
+            DelimitedInputOptions {
+                delimiter: ':',
+                text: DelimitedTextSelector::Field(3),
+                value: DelimitedValueSelector::FullLine,
+                preview_file_field: Some(0),
+                preview_center_line_field: Some(1),
+            },
+            None,
+            input.as_slice(),
+        );
+        let store = request.run();
+        for _ in 0..100 {
+            if store.is_done() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(
+            store
+                .snapshot()
+                .expect("snapshot")
+                .delimited_metadata(0)
+                .expect("metadata")
+                .value,
+            "file.txt:42:7:matching text"
+        );
+    }
+
+    #[test]
+    fn search_field_keeps_delimiters_when_another_selector_is_later() {
+        let request = DelimitedStdinRequest::with_reader(
+            DelimitedInputOptions {
+                delimiter: ':',
+                text: DelimitedTextSelector::Field(3),
+                value: DelimitedValueSelector::Field(4),
+                preview_file_field: Some(0),
+                preview_center_line_field: Some(1),
+            },
+            None,
+            b"file.txt:42:7:matching:text\n".as_slice(),
+        );
+        let store = request.run();
+        for _ in 0..100 {
+            if store.is_done() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        let snapshot = store.snapshot().expect("snapshot");
+        let mut stack = [0; 128];
+        let mut heap = Vec::new();
+        assert_eq!(
+            snapshot.get_string(0, &mut stack, &mut heap),
+            b"matching:text"
+        );
+        assert_eq!(
+            snapshot.delimited_metadata(0).expect("metadata").value,
+            "text"
+        );
     }
 }

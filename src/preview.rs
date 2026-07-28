@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -41,23 +42,30 @@ struct OutputChunk {
 
 pub struct PreviewController {
     command: Arc<str>,
+    working_directory: Option<Arc<PathBuf>>,
     generation: Arc<AtomicU64>,
     updates: Sender<PreviewUpdate>,
 }
 
 impl PreviewController {
-    pub fn new(command: String, updates: Sender<PreviewUpdate>) -> Self {
+    pub fn new(
+        command: String,
+        working_directory: Option<PathBuf>,
+        updates: Sender<PreviewUpdate>,
+    ) -> Self {
         Self {
             command: Arc::from(command),
+            working_directory: working_directory.map(Arc::new),
             generation: Arc::new(AtomicU64::new(0)),
             updates,
         }
     }
 
-    pub fn request(&self, selected_item: String) -> u64 {
+    pub fn request(&self, target: PreviewTarget) -> u64 {
         let generation = self.next_generation();
         let current_generation = Arc::clone(&self.generation);
         let command = Arc::clone(&self.command);
+        let working_directory = self.working_directory.clone();
         let updates = self.updates.clone();
         std::thread::spawn(move || {
             std::thread::sleep(DEBOUNCE);
@@ -66,7 +74,8 @@ impl PreviewController {
             }
             run_process(
                 &command,
-                &selected_item,
+                working_directory.as_deref(),
+                &target,
                 generation,
                 current_generation,
                 updates,
@@ -84,16 +93,33 @@ impl PreviewController {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PreviewTarget {
+    pub item: String,
+    pub center_line: Option<usize>,
+}
+
 fn run_process(
     preview_command: &str,
-    selected_item: &str,
+    working_directory: Option<&PathBuf>,
+    target: &PreviewTarget,
     generation: u64,
     current_generation: Arc<AtomicU64>,
     updates: Sender<PreviewUpdate>,
 ) {
     let mut command = shell_command(preview_command);
+    if let Some(working_directory) = working_directory {
+        command.current_dir(working_directory);
+    }
     command
-        .env("NFM_PREVIEW_ITEM", selected_item)
+        .env("NFM_PREVIEW_ITEM", &target.item)
+        .env(
+            "NFM_PREVIEW_LINE",
+            target
+                .center_line
+                .map(|line| line.to_string())
+                .unwrap_or_default(),
+        )
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -232,11 +258,22 @@ mod tests {
         let generation = 7;
         let current_generation = Arc::new(AtomicU64::new(generation));
         #[cfg(windows)]
-        let command = "Write-Output 'first'; Write-Output 'second'";
+        let command =
+            "Write-Output 'first'; Write-Output 'second'; Write-Output $env:NFM_PREVIEW_LINE";
         #[cfg(not(windows))]
-        let command = "printf 'first\\nsecond\\n'";
+        let command = "printf 'first\\nsecond\\n%s\\n' \"$NFM_PREVIEW_LINE\"";
 
-        run_process(command, "", generation, current_generation, updates);
+        run_process(
+            command,
+            None,
+            &PreviewTarget {
+                item: String::new(),
+                center_line: Some(42),
+            },
+            generation,
+            current_generation,
+            updates,
+        );
 
         let update = receiver.recv().expect("preview update");
         let PreviewUpdate::Ready {
@@ -253,7 +290,7 @@ mod tests {
             .iter()
             .map(|line| line.spans.iter().map(|span| span.text.as_str()).collect())
             .collect();
-        assert_eq!(&text[..2], ["first", "second"]);
+        assert_eq!(&text[..3], ["first", "second", "42"]);
     }
 }
 

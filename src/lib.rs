@@ -1,3 +1,4 @@
+mod delimited_store;
 #[cfg(windows)]
 pub mod ffi;
 pub mod preview;

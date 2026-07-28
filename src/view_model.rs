@@ -1,9 +1,10 @@
 use std::ops::Range;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-use crate::preview::{PreviewController, PreviewUpdate};
+use crate::preview::{PreviewController, PreviewTarget, PreviewUpdate};
 use crate::request::{PickerRequest, PickerResponse};
 use crate::source_store::{AnyItemSource, SharedStore};
 use anyhow::{bail, Result};
@@ -57,12 +58,13 @@ struct State {
     counters: UiCounters,
     selected: usize,
     viewport_start: usize,
-    preview_item: Option<String>,
+    preview_item: Option<PreviewTarget>,
     preview_generation: u64,
     preview_line_count: usize,
     preview_top_line: usize,
     preview_visible_rows: usize,
     preview_truncated: bool,
+    preview_center_line: Option<usize>,
 }
 
 #[derive(Clone)]
@@ -99,6 +101,7 @@ struct ActiveRequest {
     id: u64,
     response_tx: Sender<PickerResponse>,
     search_session: FuzzySearchSession<AnyItemSource, SharedStore>,
+    store: Arc<SharedStore>,
 }
 
 impl ViewModel {
@@ -107,12 +110,23 @@ impl ViewModel {
     }
 
     pub fn new_with_preview(preview_command: Option<String>) -> Arc<Self> {
+        Self::new_with_preview_options(preview_command, None)
+    }
+
+    pub fn new_with_preview_options(
+        preview_command: Option<String>,
+        preview_working_directory: Option<PathBuf>,
+    ) -> Arc<Self> {
         let (events_tx, events_rx) = unbounded();
         let (search_update_tx, search_update_rx) = unbounded();
         let (preview, preview_rx) = if let Some(command) = preview_command {
             let (preview_tx, preview_rx) = unbounded();
             (
-                Some(PreviewController::new(command, preview_tx)),
+                Some(PreviewController::new(
+                    command,
+                    preview_working_directory,
+                    preview_tx,
+                )),
                 Some(preview_rx),
             )
         } else {
@@ -135,6 +149,7 @@ impl ViewModel {
                 preview_top_line: 0,
                 preview_visible_rows: 0,
                 preview_truncated: false,
+                preview_center_line: None,
             }),
             request_generation: AtomicU64::new(0),
             search_update_tx,
@@ -155,6 +170,14 @@ impl ViewModel {
                     if view_model.events_tx.send(UiEvent::Preview(update)).is_err() {
                         break;
                     }
+                    let top_line = view_model
+                        .state
+                        .lock()
+                        .expect("view model poisoned")
+                        .preview_top_line;
+                    let _ = view_model
+                        .events_tx
+                        .send(UiEvent::PreviewViewport { top_line });
                 }
             });
         }
@@ -217,6 +240,7 @@ impl ViewModel {
                 id: request_id,
                 response_tx,
                 search_session: session.clone(),
+                store: Arc::clone(&store),
             });
         }
         self.update_preview_selection(None);
@@ -360,8 +384,14 @@ impl ViewModel {
                 lines, truncated, ..
             } => {
                 state.preview_line_count = lines.len();
-                state.preview_top_line = 0;
                 state.preview_truncated = *truncated;
+                state.preview_top_line = state
+                    .preview_center_line
+                    .map(|line| {
+                        line.saturating_sub(1)
+                            .saturating_sub(state.preview_content_rows() / 2)
+                    })
+                    .unwrap_or(0);
                 state.clamp_preview_viewport();
             }
         }
@@ -612,7 +642,14 @@ impl ViewModel {
                 let response = state
                     .results
                     .get(state.selected)
-                    .map(|result| PickerResponse::selected(result.path.clone()))
+                    .map(|result| {
+                        let value = active
+                            .store
+                            .snapshot()
+                            .and_then(|source| source.delimited_metadata(result.node_index))
+                            .map_or_else(|| result.path.clone(), |metadata| metadata.value);
+                        PickerResponse::selected(value)
+                    })
                     .unwrap_or_else(PickerResponse::cancelled);
                 let _ = active.response_tx.send(response);
                 Some(active.search_session)
@@ -704,15 +741,33 @@ impl ViewModel {
     }
 
     fn publish_results(&self, update: UiUpdate) {
-        let selected_item = update
-            .results
-            .get(update.selected_row)
-            .map(|result| result.path.clone());
+        let selected_item = {
+            let state = self.state.lock().expect("view model poisoned");
+            update.results.get(update.selected_row).map(|result| {
+                state
+                    .active
+                    .as_ref()
+                    .and_then(|active| active.store.snapshot())
+                    .and_then(|source| source.delimited_metadata(result.node_index))
+                    .map_or_else(
+                        || PreviewTarget {
+                            item: result.path.clone(),
+                            center_line: None,
+                        },
+                        |metadata| PreviewTarget {
+                            item: metadata
+                                .preview_item
+                                .unwrap_or_else(|| metadata.value.clone()),
+                            center_line: metadata.preview_center_line,
+                        },
+                    )
+            })
+        };
         self.update_preview_selection(selected_item);
         let _ = self.events_tx.send(UiEvent::Results(update));
     }
 
-    fn update_preview_selection(&self, selected_item: Option<String>) {
+    fn update_preview_selection(&self, selected_item: Option<PreviewTarget>) {
         let changed = {
             let mut state = self.state.lock().expect("view model poisoned");
             if state.preview_item == selected_item {
@@ -737,6 +792,10 @@ impl ViewModel {
                 state.preview_line_count = 0;
                 state.preview_top_line = 0;
                 state.preview_truncated = false;
+                state.preview_center_line = state
+                    .preview_item
+                    .as_ref()
+                    .and_then(|target| target.center_line);
             }
             let _ = self
                 .events_tx
@@ -806,6 +865,7 @@ impl State {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::preview::PreviewLine;
 
     fn modifiers(ctrl: bool, shift: bool) -> KeyModifiers {
         KeyModifiers {
@@ -866,5 +926,25 @@ mod tests {
             view_model.events_rx.try_recv(),
             Ok(UiEvent::PreviewViewport { top_line: 11 })
         ));
+    }
+
+    #[test]
+    fn completed_preview_centers_the_requested_line() {
+        let view_model = ViewModel::new();
+        {
+            let mut state = view_model.state.lock().unwrap();
+            state.preview_generation = 7;
+            state.preview_visible_rows = 20;
+            state.preview_center_line = Some(42);
+        }
+        let lines: Arc<[PreviewLine]> = (0..100).map(|_| PreviewLine::default()).collect();
+
+        view_model.apply_preview_update(&PreviewUpdate::Ready {
+            generation: 7,
+            lines,
+            truncated: false,
+        });
+
+        assert_eq!(view_model.state.lock().unwrap().preview_top_line, 31);
     }
 }

@@ -30,6 +30,33 @@ Run the picker by piping candidates to stdin. The selected item is printed to st
 some-command-producing-lines | nfm-rust-win32host
 ```
 
+Delimited stdin can map separate fields to the searchable text, accepted value,
+preview file, and one-based preview center line. Field numbers are one-based,
+and the highest selected field consumes the rest of the line:
+
+```powershell
+rg --vimgrep TODO |
+    nfm-rust-win32host `
+        --delimiter ':' `
+        --text-field all `
+        --value-field 1 `
+        --preview-file-field 1 `
+        --preview-center-line-field 2 `
+        --preview-cwd $PWD `
+        --preview 'bat --color=always --paging=never --highlight-line $env:NFM_PREVIEW_LINE $env:NFM_PREVIEW_ITEM'
+```
+
+`--text-field all` searches and displays the original input record; it is the
+default in delimiter mode. `--value-field all` returns the original input
+record and is also the default. A one-based field number can be used for either
+option. The text field consumes the rest of the line when a numbered text field
+is used.
+
+`--preview-cwd` sets only the preview child's working directory, so relative
+preview filenames remain relative to the producer's directory. The selected
+preview file and center line are exposed to that child as `NFM_PREVIEW_ITEM`
+and `NFM_PREVIEW_LINE`. Use `--delimiter '\t'` for tab-delimited input.
+
 On Windows, scan the current user's home directory without stdin:
 
 ```text

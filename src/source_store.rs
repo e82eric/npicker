@@ -5,11 +5,14 @@ use nfm_search_core::store::{FlatSnapshot, ItemsSource, StreamingItemSnapshot};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 
+use crate::delimited_store::{DelimitedItemMetadata, DelimitedStreamingSnapshot};
+
 pub enum AnyItemSource {
     #[cfg(windows)]
     FileSystem(Arc<PublishedSnapshot>),
     Flat(Arc<FlatSnapshot<()>>),
     Streaming(Arc<StreamingItemSnapshot>),
+    Delimited(Arc<DelimitedStreamingSnapshot>),
 }
 
 impl ItemsSource for AnyItemSource {
@@ -19,6 +22,7 @@ impl ItemsSource for AnyItemSource {
             AnyItemSource::FileSystem(source) => source.version(),
             AnyItemSource::Flat(source) => source.version(),
             AnyItemSource::Streaming(source) => source.version(),
+            AnyItemSource::Delimited(source) => source.version(),
         }
     }
 
@@ -28,6 +32,7 @@ impl ItemsSource for AnyItemSource {
             AnyItemSource::FileSystem(source) => source.len(),
             AnyItemSource::Flat(source) => source.len(),
             AnyItemSource::Streaming(source) => source.len(),
+            AnyItemSource::Delimited(source) => source.len(),
         }
     }
 
@@ -37,6 +42,7 @@ impl ItemsSource for AnyItemSource {
             AnyItemSource::FileSystem(source) => source.is_empty(),
             AnyItemSource::Flat(source) => source.is_empty(),
             AnyItemSource::Streaming(source) => source.is_empty(),
+            AnyItemSource::Delimited(source) => source.is_empty(),
         }
     }
 
@@ -53,6 +59,7 @@ impl ItemsSource for AnyItemSource {
             }
             AnyItemSource::Flat(source) => source.get_string(index, stack_buffer, heap_buffer),
             AnyItemSource::Streaming(source) => source.get_string(index, stack_buffer, heap_buffer),
+            AnyItemSource::Delimited(source) => source.get_string(index, stack_buffer, heap_buffer),
         }
     }
 
@@ -62,7 +69,17 @@ impl ItemsSource for AnyItemSource {
             AnyItemSource::FileSystem(source) => source.get_string_lossy(node_index, out),
             AnyItemSource::Flat(source) => source.get_string_lossy(node_index, out),
             AnyItemSource::Streaming(source) => source.get_string_lossy(node_index, out),
+            AnyItemSource::Delimited(source) => source.get_string_lossy(node_index, out),
         }
+    }
+}
+
+impl AnyItemSource {
+    pub fn delimited_metadata(&self, node_index: usize) -> Option<DelimitedItemMetadata> {
+        let Self::Delimited(source) = self else {
+            return None;
+        };
+        Some(source.metadata(node_index))
     }
 }
 
