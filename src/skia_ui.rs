@@ -17,9 +17,9 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy}
 use winit::keyboard::{Key, NamedKey};
 use winit::window::{Window, WindowAttributes, WindowId, WindowLevel};
 
-use crate::preview::{PreviewLine, PreviewUpdate};
+use crate::preview::{NativeWindowId, PreviewLine, PreviewUpdate};
 use crate::preview_document::PreviewStyle;
-use crate::view_model::{InputCommand, KeyModifiers, UiCounters, UiEvent, ViewModel};
+use crate::view_model::{InputCommand, KeyModifiers, PreviewView, UiCounters, UiEvent, ViewModel};
 use nfm_search_core::search::SearchResult;
 
 const DEFAULT_WIDTH: i32 = 1600;
@@ -47,6 +47,8 @@ const COLOR_MATCH: u32 = 0xfb4934;
 const COLOR_SELECTED: u32 = 0x3c3836;
 const COLOR_SELECTED_ACCENT: u32 = 0xb8bb26;
 const DEFAULT_LOCATION_VALUE: i32 = i32::MIN;
+#[cfg(windows)]
+const THUMBNAIL_PADDING: f32 = 8.0;
 
 static PREFERRED_CENTER_X: AtomicI32 = AtomicI32::new(DEFAULT_LOCATION_VALUE);
 static PREFERRED_CENTER_Y: AtomicI32 = AtomicI32::new(DEFAULT_LOCATION_VALUE);
@@ -387,6 +389,18 @@ impl WindowState {
             self.preview_truncated = false;
             self.preview_error = Some(message);
         }
+    }
+
+    #[cfg(windows)]
+    fn set_native_preview_error(&mut self, message: String) {
+        self.preview_loading = false;
+        self.preview_lines = Arc::from([]);
+        self.preview_error = Some(message);
+    }
+
+    #[cfg(windows)]
+    fn clear_native_preview_error(&mut self) {
+        self.preview_error = None;
     }
 
     fn ensure_surface(&mut self, size: PhysicalSize<u32>, scale_factor: f64) -> Result<()> {
@@ -872,6 +886,129 @@ fn copy_bgra_to_softbuffer(
     Ok(())
 }
 
+#[cfg(windows)]
+struct DwmThumbnailPreview {
+    destination: windows::Win32::Foundation::HWND,
+    source: Option<isize>,
+    thumbnail: Option<isize>,
+}
+
+#[cfg(windows)]
+impl DwmThumbnailPreview {
+    fn new(window: &Window) -> Result<Self> {
+        use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+
+        let handle = window
+            .window_handle()
+            .context("failed to get thumbnail destination HWND")?;
+        let RawWindowHandle::Win32(handle) = handle.as_raw() else {
+            return Err(anyhow!("winit did not return a Win32 window handle"));
+        };
+        Ok(Self {
+            destination: windows::Win32::Foundation::HWND(handle.hwnd.get() as *mut _),
+            source: None,
+            thumbnail: None,
+        })
+    }
+
+    fn source(&self) -> Option<isize> {
+        self.source
+    }
+
+    fn set_source(&mut self, source: Option<isize>) -> Result<()> {
+        use windows::Win32::Foundation::HWND;
+        use windows::Win32::Graphics::Dwm::DwmRegisterThumbnail;
+        use windows::Win32::UI::WindowsAndMessaging::IsWindow;
+
+        self.unregister();
+        let Some(source) = source else {
+            return Ok(());
+        };
+        let source_hwnd = HWND(source as *mut _);
+        if !unsafe { IsWindow(Some(source_hwnd)) }.as_bool() {
+            return Err(anyhow!("source window no longer exists"));
+        }
+        let thumbnail = unsafe { DwmRegisterThumbnail(self.destination, source_hwnd) }
+            .context("DwmRegisterThumbnail failed")?;
+        self.source = Some(source);
+        self.thumbnail = Some(thumbnail);
+        Ok(())
+    }
+
+    fn update_layout(&mut self, preview_box: Rect, scale_factor: f64) -> Result<()> {
+        use windows::Win32::Foundation::RECT;
+        use windows::Win32::Graphics::Dwm::{
+            DwmQueryThumbnailSourceSize, DwmUpdateThumbnailProperties, DWM_THUMBNAIL_PROPERTIES,
+            DWM_TNP_RECTDESTINATION, DWM_TNP_SOURCECLIENTAREAONLY, DWM_TNP_VISIBLE,
+        };
+
+        let Some(thumbnail) = self.thumbnail else {
+            return Ok(());
+        };
+        let scale = scale_factor as f32;
+        let padding = THUMBNAIL_PADDING;
+        let container = RECT {
+            left: ((preview_box.x + padding) * scale).round() as i32,
+            top: ((preview_box.y + padding) * scale).round() as i32,
+            right: ((preview_box.x + preview_box.width - padding) * scale).round() as i32,
+            bottom: ((preview_box.y + preview_box.height - padding) * scale).round() as i32,
+        };
+        let source_size = unsafe { DwmQueryThumbnailSourceSize(thumbnail) }
+            .context("DwmQueryThumbnailSourceSize failed")?;
+        let destination = fit_thumbnail_rect(container, source_size)
+            .ok_or_else(|| anyhow!("thumbnail source or destination has no area"))?;
+        let properties = DWM_THUMBNAIL_PROPERTIES {
+            dwFlags: DWM_TNP_RECTDESTINATION | DWM_TNP_VISIBLE | DWM_TNP_SOURCECLIENTAREAONLY,
+            rcDestination: destination,
+            fVisible: true.into(),
+            fSourceClientAreaOnly: true.into(),
+            ..Default::default()
+        };
+        unsafe { DwmUpdateThumbnailProperties(thumbnail, &properties) }
+            .context("DwmUpdateThumbnailProperties failed")
+    }
+
+    fn unregister(&mut self) {
+        if let Some(thumbnail) = self.thumbnail.take() {
+            let _ = unsafe { windows::Win32::Graphics::Dwm::DwmUnregisterThumbnail(thumbnail) };
+        }
+        self.source = None;
+    }
+}
+
+#[cfg(windows)]
+impl Drop for DwmThumbnailPreview {
+    fn drop(&mut self) {
+        self.unregister();
+    }
+}
+
+#[cfg(windows)]
+fn fit_thumbnail_rect(
+    container: windows::Win32::Foundation::RECT,
+    source: windows::Win32::Foundation::SIZE,
+) -> Option<windows::Win32::Foundation::RECT> {
+    use windows::Win32::Foundation::RECT;
+
+    let container_width = container.right - container.left;
+    let container_height = container.bottom - container.top;
+    if container_width <= 0 || container_height <= 0 || source.cx <= 0 || source.cy <= 0 {
+        return None;
+    }
+    let scale =
+        (container_width as f64 / source.cx as f64).min(container_height as f64 / source.cy as f64);
+    let width = (source.cx as f64 * scale).round().max(1.0) as i32;
+    let height = (source.cy as f64 * scale).round().max(1.0) as i32;
+    let left = container.left + (container_width - width) / 2;
+    let top = container.top + (container_height - height) / 2;
+    Some(RECT {
+        left,
+        top,
+        right: left + width,
+        bottom: top + height,
+    })
+}
+
 struct PickerApp {
     view_model: Arc<ViewModel>,
     renderer: WindowState,
@@ -883,6 +1020,9 @@ struct PickerApp {
     input_ready_at: Instant,
     visible: bool,
     exit_code: i32,
+    pending_native_preview: Option<NativeWindowId>,
+    #[cfg(windows)]
+    native_thumbnail: Option<DwmThumbnailPreview>,
 }
 
 impl PickerApp {
@@ -903,6 +1043,9 @@ impl PickerApp {
             input_ready_at: Instant::now(),
             visible: false,
             exit_code: 0,
+            pending_native_preview: None,
+            #[cfg(windows)]
+            native_thumbnail: None,
         })
     }
 
@@ -937,6 +1080,13 @@ impl PickerApp {
         self.soft_surface = Some(surface);
         self.soft_context = Some(context);
         self.window = Some(window);
+        #[cfg(windows)]
+        {
+            self.native_thumbnail = Some(DwmThumbnailPreview::new(
+                self.window.as_ref().expect("window was just assigned"),
+            )?);
+            self.sync_native_thumbnail();
+        }
         if self.visible {
             self.show();
         }
@@ -962,6 +1112,8 @@ impl PickerApp {
             }
             window.request_redraw();
         }
+        #[cfg(windows)]
+        self.sync_native_thumbnail();
         self.next_blink = Instant::now() + Duration::from_millis(530);
         self.input_ready_at = Instant::now() + Duration::from_millis(150);
     }
@@ -975,6 +1127,10 @@ impl PickerApp {
             }
             #[cfg(not(windows))]
             window.set_visible(false);
+        }
+        #[cfg(windows)]
+        if let Some(thumbnail) = &mut self.native_thumbnail {
+            thumbnail.unregister();
         }
     }
 
@@ -1059,6 +1215,31 @@ impl PickerApp {
             window.request_redraw();
         }
     }
+
+    #[cfg(windows)]
+    fn sync_native_thumbnail(&mut self) {
+        let Some(thumbnail) = &mut self.native_thumbnail else {
+            return;
+        };
+        let source = self.pending_native_preview.map(|window| window.0);
+        if thumbnail.source() != source {
+            if let Err(error) = thumbnail.set_source(source) {
+                self.renderer
+                    .set_native_preview_error(format!("Window preview unavailable: {error}"));
+                return;
+            }
+            self.renderer.clear_native_preview_error();
+        }
+        if !self.visible {
+            return;
+        }
+        if let Some(preview_box) = self.renderer.layout.preview_box {
+            if let Err(error) = thumbnail.update_layout(preview_box, self.renderer.scale_factor) {
+                self.renderer
+                    .set_native_preview_error(format!("Window preview unavailable: {error}"));
+            }
+        }
+    }
 }
 
 impl ApplicationHandler<AppEvent> for PickerApp {
@@ -1079,33 +1260,29 @@ impl ApplicationHandler<AppEvent> for PickerApp {
                     window.request_redraw();
                 }
             }
-            AppEvent::Ui(UiEvent::Preview(PreviewUpdate::Clear { generation })) => {
-                self.renderer.begin_preview(generation);
-                if let Some(window) = &self.window {
-                    window.request_redraw();
+            AppEvent::Ui(UiEvent::Preview(PreviewView::Text { update, top_line })) => {
+                match update {
+                    PreviewUpdate::Clear { generation } => self.renderer.begin_preview(generation),
+                    PreviewUpdate::Ready {
+                        generation,
+                        lines,
+                        truncated,
+                        ..
+                    } => self.renderer.finish_preview(generation, lines, truncated),
+                    PreviewUpdate::Error {
+                        generation,
+                        message,
+                    } => self.renderer.fail_preview(generation, message),
                 }
-            }
-            AppEvent::Ui(UiEvent::Preview(PreviewUpdate::Ready {
-                generation,
-                lines,
-                truncated,
-            })) => {
-                self.renderer.finish_preview(generation, lines, truncated);
-                if let Some(window) = &self.window {
-                    window.request_redraw();
-                }
-            }
-            AppEvent::Ui(UiEvent::Preview(PreviewUpdate::Error {
-                generation,
-                message,
-            })) => {
-                self.renderer.fail_preview(generation, message);
-                if let Some(window) = &self.window {
-                    window.request_redraw();
-                }
-            }
-            AppEvent::Ui(UiEvent::PreviewViewport { top_line }) => {
                 self.renderer.preview_top_line = top_line;
+                if let Some(window) = &self.window {
+                    window.request_redraw();
+                }
+            }
+            AppEvent::Ui(UiEvent::Preview(PreviewView::NativeWindow(source))) => {
+                self.pending_native_preview = source;
+                #[cfg(windows)]
+                self.sync_native_thumbnail();
                 if let Some(window) = &self.window {
                     window.request_redraw();
                 }
@@ -1139,6 +1316,8 @@ impl ApplicationHandler<AppEvent> for PickerApp {
                     {
                         eprintln!("picker render failed: {error:#}");
                     }
+                    #[cfg(windows)]
+                    self.sync_native_thumbnail();
                 }
             }
             WindowEvent::KeyboardInput { event, .. } => self.handle_keyboard(event),
@@ -1447,6 +1626,8 @@ fn skia_color(value: u32) -> Color {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(windows)]
+    use super::fit_thumbnail_rect;
     use super::{calculate_layout, copy_bgra_to_softbuffer, Rect};
 
     #[test]
@@ -1478,5 +1659,66 @@ mod tests {
         assert!(preview.y + preview.height < layout.list_border.y);
         assert!(layout.list_border.y + layout.list_border.height < layout.search_border.y);
         assert!(layout.search_border.y + layout.search_border.height <= layout.window.height);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn thumbnail_fit_preserves_aspect_ratio_and_centers() {
+        use windows::Win32::Foundation::{RECT, SIZE};
+
+        let wide = fit_thumbnail_rect(
+            RECT {
+                left: 10,
+                top: 20,
+                right: 410,
+                bottom: 320,
+            },
+            SIZE { cx: 1600, cy: 900 },
+        )
+        .unwrap();
+        assert_eq!(wide.right - wide.left, 400);
+        assert_eq!(wide.bottom - wide.top, 225);
+        assert_eq!(wide.top, 57);
+
+        let tall = fit_thumbnail_rect(
+            RECT {
+                left: 0,
+                top: 0,
+                right: 400,
+                bottom: 300,
+            },
+            SIZE { cx: 600, cy: 1200 },
+        )
+        .unwrap();
+        assert_eq!(tall.right - tall.left, 150);
+        assert_eq!(tall.bottom - tall.top, 300);
+        assert_eq!(tall.left, 125);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn thumbnail_fit_rejects_empty_source_or_destination() {
+        use windows::Win32::Foundation::{RECT, SIZE};
+
+        assert!(fit_thumbnail_rect(
+            RECT {
+                left: 0,
+                top: 0,
+                right: 0,
+                bottom: 100,
+            },
+            SIZE { cx: 100, cy: 100 },
+        )
+        .is_none());
+        assert!(fit_thumbnail_rect(
+            RECT {
+                left: 0,
+                top: 0,
+                right: 100,
+                bottom: 100,
+            },
+            SIZE { cx: 0, cy: 100 },
+        )
+        .is_none());
     }
 }

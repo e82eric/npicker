@@ -3,12 +3,13 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use crossbeam_channel::bounded;
+use rust_nfm::preview::{PreviewConfig, PreviewService};
 use rust_nfm::request::{
     DelimitedInputOptions, DelimitedStdinRequest, DelimitedTextSelector, DelimitedValueSelector,
     PickerResponse, StdinRequest,
 };
 #[cfg(windows)]
-use rust_nfm::request::{FileSystemPickerRequest, FlatItemsPickerRequest};
+use rust_nfm::request::{FileSystemPickerRequest, WindowListPickerRequest};
 use rust_nfm::skia_ui;
 use rust_nfm::view_model::ViewModel;
 
@@ -34,9 +35,21 @@ fn main() -> Result<()> {
     }
 
     nfm_search_core::timing::set_sink(output_timing);
-    let preview_enabled = options.preview_command.is_some();
-    let view_model =
-        ViewModel::new_with_preview_options(options.preview_command, options.preview_cwd);
+    let is_window_list = matches!(&options.input, InputMode::ListWindows);
+    let command_preview = options.preview_program.is_some();
+    let native_window_preview =
+        resolve_native_window_preview(is_window_list, options.window_preview, command_preview)?;
+    let preview_enabled = command_preview || native_window_preview;
+    let preview_config = match options.preview_program {
+        Some(program) => PreviewConfig::Command {
+            program: program.into(),
+            arguments: options.preview_arguments,
+            working_directory: options.preview_cwd,
+        },
+        None if native_window_preview => PreviewConfig::NativeWindow,
+        None => PreviewConfig::None,
+    };
+    let view_model = ViewModel::new(PreviewService::new(preview_config));
     let (completion_tx, completion_rx) = bounded(1);
     match options.input {
         InputMode::Stdin(None) => run_stdin_request(Arc::clone(&view_model), completion_tx),
@@ -53,6 +66,17 @@ fn main() -> Result<()> {
         std::process::exit(code);
     }
     Ok(())
+}
+
+fn resolve_native_window_preview(
+    is_window_list: bool,
+    requested: bool,
+    has_command_preview: bool,
+) -> Result<bool> {
+    if requested && !is_window_list {
+        anyhow::bail!("--window-preview is only valid with listwindows");
+    }
+    Ok(requested && !has_command_preview)
 }
 
 fn run_delimited_request(
@@ -88,10 +112,7 @@ fn run_list_windows_request(
 ) -> Result<()> {
     let items = rust_nfm::list_windows::list_windows()?;
     std::thread::spawn(move || {
-        let request = FlatItemsPickerRequest {
-            items,
-            search_string: None,
-        };
+        let request = WindowListPickerRequest { items };
         let code = response_exit_code(view_model.run_request(&request));
         let _ = completion.send(code);
     });
@@ -191,16 +212,20 @@ enum InputMode {
 struct AppOptions {
     debug_wait: bool,
     input: InputMode,
-    preview_command: Option<String>,
+    preview_program: Option<String>,
+    preview_arguments: Vec<String>,
     preview_cwd: Option<std::path::PathBuf>,
+    window_preview: bool,
 }
 
 fn app_options() -> AppOptions {
     let mut options = AppOptions {
         debug_wait: false,
         input: InputMode::Stdin(None),
-        preview_command: None,
+        preview_program: None,
+        preview_arguments: Vec::new(),
         preview_cwd: None,
+        window_preview: false,
     };
     let mut filewalker = false;
     let mut list_windows = false;
@@ -218,10 +243,17 @@ fn app_options() -> AppOptions {
             "--stdin" if !filewalker => {}
             "--debug-wait" => options.debug_wait = true,
             "--preview" => {
-                if let Some(command) = args.next() {
-                    options.preview_command = Some(command);
+                if let Some(program) = args.next() {
+                    options.preview_program = Some(program);
                 } else {
-                    eprintln!("--preview requires a command");
+                    eprintln!("--preview requires an executable");
+                }
+            }
+            "--preview-arg" => {
+                if let Some(argument) = args.next() {
+                    options.preview_arguments.push(argument);
+                } else {
+                    eprintln!("--preview-arg requires a value");
                 }
             }
             "--preview-cwd" => {
@@ -231,6 +263,7 @@ fn app_options() -> AppOptions {
                     eprintln!("--preview-cwd requires a directory");
                 }
             }
+            "--window-preview" => options.window_preview = true,
             "--delimiter" if !filewalker => {
                 if let Some(value) = args.next() {
                     delimiter = parse_delimiter(&value);
@@ -331,5 +364,21 @@ fn parse_field(value: Option<String>, option: &str) -> Option<usize> {
             eprintln!("{option} requires a positive field number");
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_native_window_preview;
+
+    #[test]
+    fn command_preview_overrides_native_window_preview() {
+        assert!(!resolve_native_window_preview(true, true, true).unwrap());
+        assert!(resolve_native_window_preview(true, true, false).unwrap());
+    }
+
+    #[test]
+    fn native_window_preview_is_rejected_for_other_inputs() {
+        assert!(resolve_native_window_preview(false, true, false).is_err());
     }
 }

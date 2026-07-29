@@ -43,7 +43,10 @@ rg --vimgrep TODO |
         --preview-file-field 1 `
         --preview-center-line-field 2 `
         --preview-cwd $PWD `
-        --preview 'bat --color=always --paging=never --highlight-line $env:NFM_PREVIEW_LINE $env:NFM_PREVIEW_ITEM'
+        --preview pwsh `
+        --preview-arg -NoProfile `
+        --preview-arg -Command `
+        --preview-arg 'bat --color=always --paging=never --highlight-line $env:NFM_PREVIEW_LINE $env:NFM_PREVIEW_ITEM'
 ```
 
 `--text-field all` searches and displays the original input record; it is the
@@ -72,21 +75,40 @@ nfm-rust-win32host listwindows
 ```
 
 Rows contain the window handle, process ID, executable name, and title. The
-selected row is written to stdout.
+selected row is written to stdout. Add a live, client-area DWM thumbnail of the
+selected window with:
 
-Add a non-blocking preview pane above the results with `--preview`. The selected
-item is passed only to the preview child process in `NFM_PREVIEW_ITEM`.
+```text
+nfm-rust-win32host listwindows --window-preview
+```
 
-On Windows, preview commands run in a non-interactive PowerShell process:
+An explicitly supplied `--preview` command takes precedence over the native
+window thumbnail.
+
+Add a non-blocking preview pane above the results with `--preview`. Its value is
+an executable, and each repeatable `--preview-arg` supplies one argument. The
+selected item is passed only to the preview child process in
+`NFM_PREVIEW_ITEM`.
+
+NFM does not implicitly invoke a shell. Invoke one explicitly when the preview
+uses shell expressions or pipelines:
 
 ```powershell
-nfm-rust-win32host filewalker --preview 'Get-ChildItem -Force -LiteralPath $env:NFM_PREVIEW_ITEM | Out-String -Width 240'
+nfm-rust-win32host filewalker `
+    --preview pwsh `
+    --preview-arg -NoProfile `
+    --preview-arg -Command `
+    --preview-arg 'Get-ChildItem -Force -LiteralPath $env:NFM_PREVIEW_ITEM | Out-String -Width 240'
 ```
 
 To preview file contents:
 
 ```powershell
-nfm-rust-win32host filewalker --preview 'Get-Content -LiteralPath $env:NFM_PREVIEW_ITEM'
+nfm-rust-win32host filewalker `
+    --preview pwsh `
+    --preview-arg -NoProfile `
+    --preview-arg -Command `
+    --preview-arg 'Get-Content -LiteralPath $env:NFM_PREVIEW_ITEM'
 ```
 
 ANSI SGR colors and styling are rendered in the preview. Because preview output
@@ -94,7 +116,11 @@ is captured through a pipe rather than a terminal, commands must be told to
 emit colors. For example, use `bat` with color forced and paging disabled:
 
 ```powershell
-nfm-rust-win32host filewalker --preview 'Get-Content -LiteralPath $env:NFM_PREVIEW_ITEM | bat --color=always --paging=never'
+nfm-rust-win32host filewalker `
+    --preview pwsh `
+    --preview-arg -NoProfile `
+    --preview-arg -Command `
+    --preview-arg 'Get-Content -LiteralPath $env:NFM_PREVIEW_ITEM | bat --color=always --paging=never'
 ```
 
 The preview supports standard and bright ANSI colors, 256-color and truecolor
@@ -102,10 +128,12 @@ sequences, backgrounds, bold, dim, italic, underline, strikethrough, hidden,
 and inverse styling. It does not emulate an interactive terminal or implement
 cursor-positioning and alternate-screen controls.
 
-On other platforms, preview commands run through `/bin/sh`:
-
 ```sh
-some-command-producing-lines | nfm-rust-win32host --preview 'cat "$NFM_PREVIEW_ITEM"'
+some-command-producing-lines |
+    nfm-rust-win32host \
+        --preview sh \
+        --preview-arg -c \
+        --preview-arg 'cat "$NFM_PREVIEW_ITEM"'
 ```
 
 Preview commands are debounced as the selection moves. Older processes are

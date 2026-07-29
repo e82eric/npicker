@@ -9,6 +9,8 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 #[cfg(windows)]
+use crate::list_windows::{WindowListItem, WindowPayload};
+#[cfg(windows)]
 use nfm_file_system::walker::{start_scan, PublishedSnapshot, ScanOptions};
 #[cfg(windows)]
 use std::path::PathBuf;
@@ -74,6 +76,30 @@ impl PickerRequest for FlatItemsPickerRequest {
             self.items.iter().map(|item| (item, ())),
         ));
         Arc::new(SharedStore::completed(Arc::new(AnyItemSource::Flat(
+            snapshot,
+        ))))
+    }
+}
+
+#[cfg(windows)]
+pub struct WindowListPickerRequest {
+    pub items: Vec<WindowListItem>,
+}
+
+#[cfg(windows)]
+impl PickerRequest for WindowListPickerRequest {
+    type Source = FlatSnapshot<WindowPayload>;
+
+    fn search_string(&self) -> Option<&str> {
+        None
+    }
+
+    fn run(&self) -> Arc<SharedStore> {
+        let snapshot =
+            Arc::new(FlatSnapshot::from_items(self.items.iter().map(|item| {
+                (item.text.as_str(), WindowPayload { hwnd: item.hwnd })
+            })));
+        Arc::new(SharedStore::completed(Arc::new(AnyItemSource::Windows(
             snapshot,
         ))))
     }
@@ -444,6 +470,26 @@ mod tests {
         assert_eq!(
             snapshot.delimited_metadata(0).expect("metadata").value,
             "text"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn window_list_request_retains_native_window_payload() {
+        let request = WindowListPickerRequest {
+            items: vec![WindowListItem {
+                text: "00001234      100 app.exe Window title".into(),
+                hwnd: 0x1234,
+            }],
+        };
+        let store = request.run();
+        let snapshot = store.snapshot().expect("snapshot");
+        assert_eq!(snapshot.native_window(0), Some(0x1234));
+        let mut stack = [0; 64];
+        let mut heap = Vec::new();
+        assert_eq!(
+            snapshot.get_string(0, &mut stack, &mut heap),
+            b"00001234      100 app.exe Window title"
         );
     }
 }

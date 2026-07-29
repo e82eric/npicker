@@ -6,10 +6,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 
 use crate::delimited_store::{DelimitedItemMetadata, DelimitedStreamingSnapshot};
+#[cfg(windows)]
+use crate::list_windows::WindowPayload;
 
 pub enum AnyItemSource {
     #[cfg(windows)]
     FileSystem(Arc<PublishedSnapshot>),
+    #[cfg(windows)]
+    Windows(Arc<FlatSnapshot<WindowPayload>>),
     Flat(Arc<FlatSnapshot<()>>),
     Streaming(Arc<StreamingItemSnapshot>),
     Delimited(Arc<DelimitedStreamingSnapshot>),
@@ -20,6 +24,8 @@ impl ItemsSource for AnyItemSource {
         match self {
             #[cfg(windows)]
             AnyItemSource::FileSystem(source) => source.version(),
+            #[cfg(windows)]
+            AnyItemSource::Windows(source) => source.version(),
             AnyItemSource::Flat(source) => source.version(),
             AnyItemSource::Streaming(source) => source.version(),
             AnyItemSource::Delimited(source) => source.version(),
@@ -30,6 +36,8 @@ impl ItemsSource for AnyItemSource {
         match self {
             #[cfg(windows)]
             AnyItemSource::FileSystem(source) => source.len(),
+            #[cfg(windows)]
+            AnyItemSource::Windows(source) => source.len(),
             AnyItemSource::Flat(source) => source.len(),
             AnyItemSource::Streaming(source) => source.len(),
             AnyItemSource::Delimited(source) => source.len(),
@@ -40,6 +48,8 @@ impl ItemsSource for AnyItemSource {
         match self {
             #[cfg(windows)]
             AnyItemSource::FileSystem(source) => source.is_empty(),
+            #[cfg(windows)]
+            AnyItemSource::Windows(source) => source.is_empty(),
             AnyItemSource::Flat(source) => source.is_empty(),
             AnyItemSource::Streaming(source) => source.is_empty(),
             AnyItemSource::Delimited(source) => source.is_empty(),
@@ -57,6 +67,8 @@ impl ItemsSource for AnyItemSource {
             AnyItemSource::FileSystem(source) => {
                 source.get_string(index, stack_buffer, heap_buffer)
             }
+            #[cfg(windows)]
+            AnyItemSource::Windows(source) => source.get_string(index, stack_buffer, heap_buffer),
             AnyItemSource::Flat(source) => source.get_string(index, stack_buffer, heap_buffer),
             AnyItemSource::Streaming(source) => source.get_string(index, stack_buffer, heap_buffer),
             AnyItemSource::Delimited(source) => source.get_string(index, stack_buffer, heap_buffer),
@@ -67,6 +79,8 @@ impl ItemsSource for AnyItemSource {
         match self {
             #[cfg(windows)]
             AnyItemSource::FileSystem(source) => source.get_string_lossy(node_index, out),
+            #[cfg(windows)]
+            AnyItemSource::Windows(source) => source.get_string_lossy(node_index, out),
             AnyItemSource::Flat(source) => source.get_string_lossy(node_index, out),
             AnyItemSource::Streaming(source) => source.get_string_lossy(node_index, out),
             AnyItemSource::Delimited(source) => source.get_string_lossy(node_index, out),
@@ -75,6 +89,19 @@ impl ItemsSource for AnyItemSource {
 }
 
 impl AnyItemSource {
+    #[cfg(windows)]
+    pub fn native_window(&self, node_index: usize) -> Option<isize> {
+        let Self::Windows(source) = self else {
+            return None;
+        };
+        Some(source.payload(node_index).hwnd)
+    }
+
+    #[cfg(not(windows))]
+    pub fn native_window(&self, _node_index: usize) -> Option<isize> {
+        None
+    }
+
     pub fn delimited_metadata(&self, node_index: usize) -> Option<DelimitedItemMetadata> {
         let Self::Delimited(source) = self else {
             return None;

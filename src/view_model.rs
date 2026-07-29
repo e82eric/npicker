@@ -1,10 +1,11 @@
 use std::ops::Range;
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-use crate::preview::{PreviewController, PreviewTarget, PreviewUpdate};
+use crate::preview::{
+    NativeWindowId, PreviewCoordinator, PreviewEvent, PreviewService, PreviewUpdate,
+};
 use crate::request::{PickerRequest, PickerResponse};
 use crate::source_store::{AnyItemSource, SharedStore};
 use anyhow::{bail, Result};
@@ -19,9 +20,17 @@ const PICKER_DISPLAY_LIMIT: usize = 7;
 pub enum UiEvent {
     Show,
     Results(UiUpdate),
-    Preview(PreviewUpdate),
-    PreviewViewport { top_line: usize },
+    Preview(PreviewView),
     Close,
+}
+
+#[derive(Clone, Debug)]
+pub enum PreviewView {
+    Text {
+        update: PreviewUpdate,
+        top_line: usize,
+    },
+    NativeWindow(Option<NativeWindowId>),
 }
 
 #[derive(Clone, Debug, Default)]
@@ -46,7 +55,7 @@ pub struct ViewModel {
     search_update_rx: Receiver<FuzzySearchUpdate>,
     events_tx: Sender<UiEvent>,
     events_rx: Receiver<UiEvent>,
-    preview: Option<PreviewController>,
+    preview: PreviewCoordinator,
 }
 
 struct State {
@@ -58,13 +67,12 @@ struct State {
     counters: UiCounters,
     selected: usize,
     viewport_start: usize,
-    preview_item: Option<PreviewTarget>,
     preview_generation: u64,
     preview_line_count: usize,
     preview_top_line: usize,
     preview_visible_rows: usize,
     preview_truncated: bool,
-    preview_center_line: Option<usize>,
+    preview_update: Option<PreviewUpdate>,
 }
 
 #[derive(Clone)]
@@ -105,33 +113,10 @@ struct ActiveRequest {
 }
 
 impl ViewModel {
-    pub fn new() -> Arc<Self> {
-        Self::new_with_preview(None)
-    }
-
-    pub fn new_with_preview(preview_command: Option<String>) -> Arc<Self> {
-        Self::new_with_preview_options(preview_command, None)
-    }
-
-    pub fn new_with_preview_options(
-        preview_command: Option<String>,
-        preview_working_directory: Option<PathBuf>,
-    ) -> Arc<Self> {
+    pub fn new(preview_service: PreviewService) -> Arc<Self> {
         let (events_tx, events_rx) = unbounded();
         let (search_update_tx, search_update_rx) = unbounded();
-        let (preview, preview_rx) = if let Some(command) = preview_command {
-            let (preview_tx, preview_rx) = unbounded();
-            (
-                Some(PreviewController::new(
-                    command,
-                    preview_working_directory,
-                    preview_tx,
-                )),
-                Some(preview_rx),
-            )
-        } else {
-            (None, None)
-        };
+        let (preview, preview_events) = preview_service.into_parts();
 
         let this = Arc::new(Self {
             state: Mutex::new(State {
@@ -143,13 +128,12 @@ impl ViewModel {
                 viewport_start: 0,
                 cursor_position: 0,
                 cursor_selection_anchor: None,
-                preview_item: None,
                 preview_generation: 0,
                 preview_line_count: 0,
                 preview_top_line: 0,
                 preview_visible_rows: 0,
                 preview_truncated: false,
-                preview_center_line: None,
+                preview_update: None,
             }),
             request_generation: AtomicU64::new(0),
             search_update_tx,
@@ -159,30 +143,33 @@ impl ViewModel {
             preview,
         });
 
-        if let Some(preview_rx) = preview_rx {
-            let weak = Arc::downgrade(&this);
-            thread::spawn(move || {
-                while let Ok(update) = preview_rx.recv() {
-                    let Some(view_model) = weak.upgrade() else {
-                        break;
-                    };
-                    view_model.apply_preview_update(&update);
-                    if view_model.events_tx.send(UiEvent::Preview(update)).is_err() {
-                        break;
-                    }
-                    let top_line = view_model
-                        .state
-                        .lock()
-                        .expect("view model poisoned")
-                        .preview_top_line;
-                    let _ = view_model
-                        .events_tx
-                        .send(UiEvent::PreviewViewport { top_line });
-                }
-            });
-        }
+        this.spawn_preview_event_thread(preview_events);
         this.spawn_search_update_thread();
         this
+    }
+
+    fn spawn_preview_event_thread(self: &Arc<Self>, preview_events: Receiver<PreviewEvent>) {
+        let weak = Arc::downgrade(self);
+        thread::spawn(move || {
+            while let Ok(event) = preview_events.recv() {
+                let Some(view_model) = weak.upgrade() else {
+                    break;
+                };
+                view_model.handle_preview_event(event);
+            }
+        });
+    }
+
+    fn handle_preview_event(&self, event: PreviewEvent) {
+        let view = match event {
+            PreviewEvent::Command(update) => self
+                .apply_preview_update(&update)
+                .map(|top_line| PreviewView::Text { update, top_line }),
+            PreviewEvent::NativeWindow(window) => Some(PreviewView::NativeWindow(window)),
+        };
+        if let Some(view) = view {
+            let _ = self.events_tx.send(UiEvent::Preview(view));
+        }
     }
 
     fn spawn_search_update_thread(self: &Arc<Self>) {
@@ -243,7 +230,7 @@ impl ViewModel {
                 store: Arc::clone(&store),
             });
         }
-        self.update_preview_selection(None);
+        self.clear_preview_selection();
 
         let _ = self.events_tx.send(UiEvent::Show);
         session.start();
@@ -275,7 +262,7 @@ impl ViewModel {
         };
 
         if let Some((search_session, search_text)) = search_update {
-            self.update_preview_selection(None);
+            self.clear_preview_selection();
             search_session.set_query(search_text);
         }
     }
@@ -335,20 +322,22 @@ impl ViewModel {
     }
 
     pub fn set_preview_visible_rows(&self, visible_rows: usize) {
-        let top_line = {
+        let view = {
             let mut state = self.state.lock().expect("view model poisoned");
             if state.preview_visible_rows == visible_rows {
                 return;
             }
             state.preview_visible_rows = visible_rows;
             state.clamp_preview_viewport();
-            state.preview_top_line
+            state.preview_view()
         };
-        let _ = self.events_tx.send(UiEvent::PreviewViewport { top_line });
+        if let Some(view) = view {
+            let _ = self.events_tx.send(UiEvent::Preview(view));
+        }
     }
 
     fn page_preview(&self, direction: isize) {
-        let top_line = {
+        let view = {
             let mut state = self.state.lock().expect("view model poisoned");
             let page = state.preview_content_rows().saturating_sub(1).max(1);
             let maximum = state
@@ -359,20 +348,26 @@ impl ViewModel {
             } else {
                 state.preview_top_line.saturating_add(page).min(maximum)
             };
-            state.preview_top_line
+            state.preview_view()
         };
-        let _ = self.events_tx.send(UiEvent::PreviewViewport { top_line });
+        if let Some(view) = view {
+            let _ = self.events_tx.send(UiEvent::Preview(view));
+        }
     }
 
-    fn apply_preview_update(&self, update: &PreviewUpdate) {
+    fn apply_preview_update(&self, update: &PreviewUpdate) -> Option<usize> {
         let mut state = self.state.lock().expect("view model poisoned");
-        let generation = match update {
-            PreviewUpdate::Clear { generation }
-            | PreviewUpdate::Ready { generation, .. }
-            | PreviewUpdate::Error { generation, .. } => *generation,
-        };
-        if generation != state.preview_generation {
-            return;
+        if let PreviewUpdate::Clear { generation } = update {
+            state.preview_generation = *generation;
+        } else {
+            let generation = match update {
+                PreviewUpdate::Ready { generation, .. }
+                | PreviewUpdate::Error { generation, .. } => *generation,
+                PreviewUpdate::Clear { .. } => unreachable!(),
+            };
+            if generation != state.preview_generation {
+                return None;
+            }
         }
         match update {
             PreviewUpdate::Clear { .. } | PreviewUpdate::Error { .. } => {
@@ -381,12 +376,14 @@ impl ViewModel {
                 state.preview_truncated = false;
             }
             PreviewUpdate::Ready {
-                lines, truncated, ..
+                lines,
+                truncated,
+                center_line,
+                ..
             } => {
                 state.preview_line_count = lines.len();
                 state.preview_truncated = *truncated;
-                state.preview_top_line = state
-                    .preview_center_line
+                state.preview_top_line = center_line
                     .map(|line| {
                         line.saturating_sub(1)
                             .saturating_sub(state.preview_content_rows() / 2)
@@ -395,6 +392,8 @@ impl ViewModel {
                 state.clamp_preview_viewport();
             }
         }
+        state.preview_update = Some(update.clone());
+        Some(state.preview_top_line)
     }
 
     fn handle_backspace(self: &Arc<Self>, modifiers: KeyModifiers) {
@@ -662,7 +661,7 @@ impl ViewModel {
             session_to_stop.stop();
         }
 
-        self.update_preview_selection(None);
+        self.clear_preview_selection();
         let _ = self.events_tx.send(UiEvent::Close);
     }
 
@@ -681,7 +680,7 @@ impl ViewModel {
             session_to_stop.stop();
         }
 
-        self.update_preview_selection(None);
+        self.clear_preview_selection();
         let _ = self.events_tx.send(UiEvent::Close);
     }
 
@@ -741,70 +740,31 @@ impl ViewModel {
     }
 
     fn publish_results(&self, update: UiUpdate) {
-        let selected_item = {
+        let source = {
             let state = self.state.lock().expect("view model poisoned");
-            update.results.get(update.selected_row).map(|result| {
-                state
-                    .active
-                    .as_ref()
-                    .and_then(|active| active.store.snapshot())
-                    .and_then(|source| source.delimited_metadata(result.node_index))
-                    .map_or_else(
-                        || PreviewTarget {
-                            item: result.path.clone(),
-                            center_line: None,
-                        },
-                        |metadata| PreviewTarget {
-                            item: metadata
-                                .preview_item
-                                .unwrap_or_else(|| metadata.value.clone()),
-                            center_line: metadata.preview_center_line,
-                        },
-                    )
-            })
+            state
+                .active
+                .as_ref()
+                .and_then(|active| active.store.snapshot())
         };
-        self.update_preview_selection(selected_item);
+        self.preview
+            .selected_result_changed(update.results.get(update.selected_row), source.as_deref());
         let _ = self.events_tx.send(UiEvent::Results(update));
     }
 
-    fn update_preview_selection(&self, selected_item: Option<PreviewTarget>) {
-        let changed = {
-            let mut state = self.state.lock().expect("view model poisoned");
-            if state.preview_item == selected_item {
-                false
-            } else {
-                state.preview_item = selected_item.clone();
-                true
-            }
-        };
-        if !changed {
-            return;
-        }
-        if let Some(preview) = &self.preview {
-            let generation = if let Some(selected_item) = selected_item {
-                preview.request(selected_item)
-            } else {
-                preview.cancel()
-            };
-            {
-                let mut state = self.state.lock().expect("view model poisoned");
-                state.preview_generation = generation;
-                state.preview_line_count = 0;
-                state.preview_top_line = 0;
-                state.preview_truncated = false;
-                state.preview_center_line = state
-                    .preview_item
-                    .as_ref()
-                    .and_then(|target| target.center_line);
-            }
-            let _ = self
-                .events_tx
-                .send(UiEvent::Preview(PreviewUpdate::Clear { generation }));
-        }
+    fn clear_preview_selection(&self) {
+        self.preview.clear();
     }
 }
 
 impl State {
+    fn preview_view(&self) -> Option<PreviewView> {
+        self.preview_update.clone().map(|update| PreviewView::Text {
+            update,
+            top_line: self.preview_top_line,
+        })
+    }
+
     fn preview_content_rows(&self) -> usize {
         if self.preview_truncated {
             self.preview_visible_rows.saturating_sub(1)
@@ -865,7 +825,7 @@ impl State {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::preview::PreviewLine;
+    use crate::preview::{NativeWindowId, PreviewLine};
 
     fn modifiers(ctrl: bool, shift: bool) -> KeyModifiers {
         KeyModifiers {
@@ -877,7 +837,7 @@ mod tests {
 
     #[test]
     fn semantic_input_inserts_unicode_and_replaces_selection() {
-        let view_model = ViewModel::new();
+        let view_model = ViewModel::new(PreviewService::default());
         view_model.insert_text("ab");
         view_model.handle_command(InputCommand::MoveLeft, modifiers(false, true));
         view_model.insert_text("é");
@@ -890,7 +850,7 @@ mod tests {
 
     #[test]
     fn semantic_input_moves_and_deletes_by_word() {
-        let view_model = ViewModel::new();
+        let view_model = ViewModel::new(PreviewService::default());
         view_model.insert_text("one two");
         view_model.handle_command(InputCommand::Backspace, modifiers(true, false));
         assert_eq!(view_model.current_search_text().text, "one ");
@@ -901,50 +861,91 @@ mod tests {
 
     #[test]
     fn preview_paging_overlaps_one_row_and_clamps_to_document() {
-        let view_model = ViewModel::new();
+        let view_model = ViewModel::new(PreviewService::default());
         view_model.set_preview_visible_rows(20);
         while view_model.events_rx.try_recv().is_ok() {}
         {
             let mut state = view_model.state.lock().unwrap();
             state.preview_line_count = 50;
+            state.preview_update = Some(PreviewUpdate::Ready {
+                generation: 1,
+                lines: (0..50).map(|_| PreviewLine::default()).collect(),
+                truncated: false,
+                center_line: None,
+            });
         }
 
         view_model.handle_command(InputCommand::PreviewPageDown, KeyModifiers::default());
         assert!(matches!(
             view_model.events_rx.try_recv(),
-            Ok(UiEvent::PreviewViewport { top_line: 19 })
+            Ok(UiEvent::Preview(PreviewView::Text { top_line: 19, .. }))
         ));
 
         view_model.handle_command(InputCommand::PreviewPageDown, KeyModifiers::default());
         assert!(matches!(
             view_model.events_rx.try_recv(),
-            Ok(UiEvent::PreviewViewport { top_line: 30 })
+            Ok(UiEvent::Preview(PreviewView::Text { top_line: 30, .. }))
         ));
 
         view_model.handle_command(InputCommand::PreviewPageUp, KeyModifiers::default());
         assert!(matches!(
             view_model.events_rx.try_recv(),
-            Ok(UiEvent::PreviewViewport { top_line: 11 })
+            Ok(UiEvent::Preview(PreviewView::Text { top_line: 11, .. }))
         ));
     }
 
     #[test]
     fn completed_preview_centers_the_requested_line() {
-        let view_model = ViewModel::new();
+        let view_model = ViewModel::new(PreviewService::default());
         {
             let mut state = view_model.state.lock().unwrap();
             state.preview_generation = 7;
             state.preview_visible_rows = 20;
-            state.preview_center_line = Some(42);
         }
         let lines: Arc<[PreviewLine]> = (0..100).map(|_| PreviewLine::default()).collect();
 
-        view_model.apply_preview_update(&PreviewUpdate::Ready {
+        let _ = view_model.apply_preview_update(&PreviewUpdate::Ready {
             generation: 7,
             lines,
             truncated: false,
+            center_line: Some(42),
         });
 
         assert_eq!(view_model.state.lock().unwrap().preview_top_line, 31);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn window_list_selection_emits_native_preview_target() {
+        use crate::list_windows::WindowListItem;
+        use crate::request::WindowListPickerRequest;
+        use std::time::Duration;
+
+        let view_model = ViewModel::new(PreviewService::new(
+            crate::preview::PreviewConfig::NativeWindow,
+        ));
+        let events = view_model.subscribe();
+        let runner = Arc::clone(&view_model);
+        let request_thread = thread::spawn(move || {
+            runner.run_request(&WindowListPickerRequest {
+                items: vec![WindowListItem {
+                    text: "00001234      100 app.exe Window title".into(),
+                    hwnd: 0x1234,
+                }],
+            })
+        });
+
+        let mut selected = None;
+        for _ in 0..20 {
+            if let Ok(UiEvent::Preview(PreviewView::NativeWindow(window))) =
+                events.recv_timeout(Duration::from_millis(100))
+            {
+                selected = window;
+                break;
+            }
+        }
+        assert_eq!(selected, Some(NativeWindowId(0x1234)));
+        view_model.cancel();
+        request_thread.join().unwrap().unwrap();
     }
 }

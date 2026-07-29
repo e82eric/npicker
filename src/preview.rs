@@ -1,13 +1,15 @@
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use crossbeam_channel::{bounded, RecvTimeoutError, Sender};
+use crossbeam_channel::{bounded, unbounded, Receiver, RecvTimeoutError, Sender};
+use nfm_search_core::search::SearchResult;
 
 use crate::preview_document::PreviewDocument;
 pub use crate::preview_document::PreviewLine;
+use crate::source_store::AnyItemSource;
 
 const OUTPUT_LIMIT: usize = 1024 * 1024;
 const OUTPUT_CHANNEL_CAPACITY: usize = 32;
@@ -22,11 +24,21 @@ pub enum PreviewUpdate {
         generation: u64,
         lines: Arc<[PreviewLine]>,
         truncated: bool,
+        center_line: Option<usize>,
     },
     Error {
         generation: u64,
         message: String,
     },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NativeWindowId(pub isize);
+
+#[derive(Clone, Debug)]
+pub enum PreviewEvent {
+    Command(PreviewUpdate),
+    NativeWindow(Option<NativeWindowId>),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -40,45 +52,50 @@ struct OutputChunk {
     bytes: Vec<u8>,
 }
 
-pub struct PreviewController {
-    command: Arc<str>,
+pub struct CommandPreviewController {
+    program: Arc<PathBuf>,
+    arguments: Arc<[String]>,
     working_directory: Option<Arc<PathBuf>>,
     generation: Arc<AtomicU64>,
-    updates: Sender<PreviewUpdate>,
+    events: Sender<PreviewEvent>,
 }
 
-impl PreviewController {
+impl CommandPreviewController {
     pub fn new(
-        command: String,
+        program: PathBuf,
+        arguments: Vec<String>,
         working_directory: Option<PathBuf>,
-        updates: Sender<PreviewUpdate>,
+        events: Sender<PreviewEvent>,
     ) -> Self {
         Self {
-            command: Arc::from(command),
+            program: Arc::new(program),
+            arguments: arguments.into(),
             working_directory: working_directory.map(Arc::new),
             generation: Arc::new(AtomicU64::new(0)),
-            updates,
+            events,
         }
     }
 
-    pub fn request(&self, target: PreviewTarget) -> u64 {
+    pub fn request(&self, target: CommandPreviewTarget) -> u64 {
         let generation = self.next_generation();
         let current_generation = Arc::clone(&self.generation);
-        let command = Arc::clone(&self.command);
+        let program = Arc::clone(&self.program);
+        let arguments = Arc::clone(&self.arguments);
         let working_directory = self.working_directory.clone();
-        let updates = self.updates.clone();
+        let events = self.events.clone();
         std::thread::spawn(move || {
             std::thread::sleep(DEBOUNCE);
             if current_generation.load(Ordering::Acquire) != generation {
                 return;
             }
             run_process(
-                &command,
+                &program,
+                &arguments,
                 working_directory.as_deref(),
                 &target,
                 generation,
                 current_generation,
-                updates,
+                events,
             );
         });
         generation
@@ -91,23 +108,223 @@ impl PreviewController {
     fn next_generation(&self) -> u64 {
         self.generation.fetch_add(1, Ordering::AcqRel) + 1
     }
+
+    fn publish_clear(&self, generation: u64) {
+        let _ = self
+            .events
+            .send(PreviewEvent::Command(PreviewUpdate::Clear { generation }));
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PreviewTarget {
+pub struct CommandPreviewTarget {
     pub item: String,
     pub center_line: Option<usize>,
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub enum PreviewConfig {
+    #[default]
+    None,
+    Command {
+        program: PathBuf,
+        arguments: Vec<String>,
+        working_directory: Option<PathBuf>,
+    },
+    NativeWindow,
+}
+
+pub struct PreviewService {
+    coordinator: PreviewCoordinator,
+    events: Receiver<PreviewEvent>,
+}
+
+impl PreviewService {
+    pub fn new(config: PreviewConfig) -> Self {
+        let (events_tx, events) = unbounded();
+        let backend = build_preview_backend(config, events_tx);
+        Self {
+            coordinator: PreviewCoordinator::new(backend),
+            events,
+        }
+    }
+
+    pub fn into_parts(self) -> (PreviewCoordinator, Receiver<PreviewEvent>) {
+        (self.coordinator, self.events)
+    }
+}
+
+impl Default for PreviewService {
+    fn default() -> Self {
+        Self::new(PreviewConfig::None)
+    }
+}
+
+trait PreviewBackend: Send + Sync {
+    fn selected_result_changed(
+        &self,
+        result: Option<&SearchResult>,
+        source: Option<&AnyItemSource>,
+    );
+    fn clear(&self);
+}
+
+pub struct PreviewCoordinator {
+    backend: Box<dyn PreviewBackend>,
+}
+
+impl PreviewCoordinator {
+    fn new(backend: Box<dyn PreviewBackend>) -> Self {
+        Self { backend }
+    }
+
+    pub fn selected_result_changed(
+        &self,
+        result: Option<&SearchResult>,
+        source: Option<&AnyItemSource>,
+    ) {
+        self.backend.selected_result_changed(result, source);
+    }
+
+    pub fn clear(&self) {
+        self.backend.clear();
+    }
+}
+
+fn build_preview_backend(
+    config: PreviewConfig,
+    events: Sender<PreviewEvent>,
+) -> Box<dyn PreviewBackend> {
+    match config {
+        PreviewConfig::None => Box::new(NoPreviewBackend),
+        PreviewConfig::Command {
+            program,
+            arguments,
+            working_directory,
+        } => Box::new(CommandPreviewBackend {
+            controller: CommandPreviewController::new(
+                program,
+                arguments,
+                working_directory,
+                events,
+            ),
+            selected: Mutex::new(None),
+        }),
+        PreviewConfig::NativeWindow => Box::new(NativeWindowPreviewBackend {
+            events,
+            selected: Mutex::new(None),
+        }),
+    }
+}
+
+struct NoPreviewBackend;
+
+impl PreviewBackend for NoPreviewBackend {
+    fn selected_result_changed(
+        &self,
+        _result: Option<&SearchResult>,
+        _source: Option<&AnyItemSource>,
+    ) {
+    }
+
+    fn clear(&self) {}
+}
+
+struct CommandPreviewBackend {
+    controller: CommandPreviewController,
+    selected: Mutex<Option<CommandPreviewTarget>>,
+}
+
+impl PreviewBackend for CommandPreviewBackend {
+    fn selected_result_changed(
+        &self,
+        result: Option<&SearchResult>,
+        source: Option<&AnyItemSource>,
+    ) {
+        let target = result.map(|result| {
+            source
+                .and_then(|source| source.delimited_metadata(result.node_index))
+                .map_or_else(
+                    || CommandPreviewTarget {
+                        item: result.path.clone(),
+                        center_line: None,
+                    },
+                    |metadata| CommandPreviewTarget {
+                        item: metadata.preview_item.unwrap_or(metadata.value),
+                        center_line: metadata.preview_center_line,
+                    },
+                )
+        });
+        self.set_target(target);
+    }
+
+    fn clear(&self) {
+        self.set_target(None);
+    }
+}
+
+impl CommandPreviewBackend {
+    fn set_target(&self, target: Option<CommandPreviewTarget>) {
+        let mut selected = self.selected.lock().expect("preview backend poisoned");
+        if *selected == target {
+            return;
+        }
+        *selected = target.clone();
+        drop(selected);
+
+        let generation = match target {
+            Some(target) => self.controller.request(target),
+            None => self.controller.cancel(),
+        };
+        self.controller.publish_clear(generation);
+    }
+}
+
+struct NativeWindowPreviewBackend {
+    events: Sender<PreviewEvent>,
+    selected: Mutex<Option<NativeWindowId>>,
+}
+
+impl PreviewBackend for NativeWindowPreviewBackend {
+    fn selected_result_changed(
+        &self,
+        result: Option<&SearchResult>,
+        source: Option<&AnyItemSource>,
+    ) {
+        let window = result
+            .and_then(|result| source?.native_window(result.node_index))
+            .map(NativeWindowId);
+        self.set_window(window);
+    }
+
+    fn clear(&self) {
+        self.set_window(None);
+    }
+}
+
+impl NativeWindowPreviewBackend {
+    fn set_window(&self, window: Option<NativeWindowId>) {
+        let mut selected = self.selected.lock().expect("preview backend poisoned");
+        if *selected == window {
+            return;
+        }
+        *selected = window;
+        drop(selected);
+        let _ = self.events.send(PreviewEvent::NativeWindow(window));
+    }
+}
+
 fn run_process(
-    preview_command: &str,
+    program: &PathBuf,
+    arguments: &[String],
     working_directory: Option<&PathBuf>,
-    target: &PreviewTarget,
+    target: &CommandPreviewTarget,
     generation: u64,
     current_generation: Arc<AtomicU64>,
-    updates: Sender<PreviewUpdate>,
+    events: Sender<PreviewEvent>,
 ) {
-    let mut command = shell_command(preview_command);
+    let mut command = Command::new(program);
+    command.args(arguments);
     if let Some(working_directory) = working_directory {
         command.current_dir(working_directory);
     }
@@ -133,10 +350,10 @@ fn run_process(
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(error) => {
-            let _ = updates.send(PreviewUpdate::Error {
+            let _ = events.send(PreviewEvent::Command(PreviewUpdate::Error {
                 generation,
                 message: format!("preview failed to start: {error}"),
-            });
+            }));
             return;
         }
     };
@@ -188,10 +405,10 @@ fn run_process(
                 Ok(Some(_)) => child_finished = true,
                 Ok(None) => {}
                 Err(error) => {
-                    let _ = updates.send(PreviewUpdate::Error {
+                    let _ = events.send(PreviewEvent::Command(PreviewUpdate::Error {
                         generation,
                         message: format!("preview process error: {error}"),
-                    });
+                    }));
                     return;
                 }
             }
@@ -202,11 +419,12 @@ fn run_process(
         }
     }
 
-    let _ = updates.send(PreviewUpdate::Ready {
+    let _ = events.send(PreviewEvent::Command(PreviewUpdate::Ready {
         generation,
         lines: document.into_lines().into(),
         truncated,
-    });
+        center_line: target.center_line,
+    }));
 }
 
 fn forward_output(
@@ -236,67 +454,91 @@ fn forward_output(
     });
 }
 
-#[cfg(windows)]
-fn shell_command(preview_command: &str) -> Command {
-    let mut command = Command::new("powershell.exe");
-    let script = format!(
-        "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); \
-         $OutputEncoding = [Console]::OutputEncoding; {preview_command}"
-    );
-    command.args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command"]);
-    command.arg(script);
-    command
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn process_publishes_one_completed_document() {
-        let (updates, receiver) = bounded(4);
+        let (events, receiver) = bounded(4);
         let generation = 7;
         let current_generation = Arc::new(AtomicU64::new(generation));
         #[cfg(windows)]
-        let command =
-            "Write-Output 'first'; Write-Output 'second'; Write-Output $env:NFM_PREVIEW_LINE";
+        let (program, arguments) = (
+            PathBuf::from("powershell.exe"),
+            vec![
+                "-NoLogo".into(),
+                "-NoProfile".into(),
+                "-NonInteractive".into(),
+                "-Command".into(),
+                "Write-Output 'first'; Write-Output 'second'; Write-Output $env:NFM_PREVIEW_LINE"
+                    .into(),
+            ],
+        );
         #[cfg(not(windows))]
-        let command = "printf 'first\\nsecond\\n%s\\n' \"$NFM_PREVIEW_LINE\"";
+        let (program, arguments) = (
+            PathBuf::from("/bin/sh"),
+            vec![
+                "-c".into(),
+                "printf 'first\\nsecond\\n%s\\n' \"$NFM_PREVIEW_LINE\"".into(),
+            ],
+        );
 
         run_process(
-            command,
+            &program,
+            &arguments,
             None,
-            &PreviewTarget {
+            &CommandPreviewTarget {
                 item: String::new(),
                 center_line: Some(42),
             },
             generation,
             current_generation,
-            updates,
+            events,
         );
 
-        let update = receiver.recv().expect("preview update");
+        let PreviewEvent::Command(update) = receiver.recv().expect("preview update") else {
+            panic!("expected command preview event");
+        };
         let PreviewUpdate::Ready {
             generation: result_generation,
             lines,
             truncated,
+            center_line,
         } = update
         else {
             panic!("expected completed preview");
         };
         assert_eq!(result_generation, generation);
         assert!(!truncated);
+        assert_eq!(center_line, Some(42));
         let text: Vec<String> = lines
             .iter()
             .map(|line| line.spans.iter().map(|span| span.text.as_str()).collect())
             .collect();
         assert_eq!(&text[..3], ["first", "second", "42"]);
     }
-}
 
-#[cfg(not(windows))]
-fn shell_command(preview_command: &str) -> Command {
-    let mut command = Command::new("/bin/sh");
-    command.args(["-c", preview_command]);
-    command
+    #[test]
+    fn native_window_backend_deduplicates_and_clears_selection() {
+        let (events, receiver) = bounded(4);
+        let backend = NativeWindowPreviewBackend {
+            events,
+            selected: Mutex::new(None),
+        };
+
+        backend.set_window(Some(NativeWindowId(42)));
+        backend.set_window(Some(NativeWindowId(42)));
+        backend.clear();
+
+        assert!(matches!(
+            receiver.recv().unwrap(),
+            PreviewEvent::NativeWindow(Some(NativeWindowId(42)))
+        ));
+        assert!(matches!(
+            receiver.recv().unwrap(),
+            PreviewEvent::NativeWindow(None)
+        ));
+        assert!(receiver.try_recv().is_err());
+    }
 }

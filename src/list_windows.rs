@@ -16,6 +16,16 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WS_EX_TOOLWINDOW, WS_VISIBLE,
 };
 
+pub struct WindowListItem {
+    pub text: String,
+    pub hwnd: isize,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct WindowPayload {
+    pub hwnd: isize,
+}
+
 struct WindowInfo {
     hwnd: HWND,
     process_id: u32,
@@ -23,7 +33,7 @@ struct WindowInfo {
     title: String,
 }
 
-pub fn list_windows() -> Result<Vec<String>> {
+pub fn list_windows() -> Result<Vec<WindowListItem>> {
     let mut windows = Vec::<WindowInfo>::new();
     unsafe {
         EnumWindows(
@@ -39,11 +49,12 @@ pub fn list_windows() -> Result<Vec<String>> {
         .unwrap_or(0);
     Ok(windows
         .into_iter()
-        .map(|window| {
-            format!(
+        .map(|window| WindowListItem {
+            text: format!(
                 "{:08X} {:8} {:process_width$} {}",
                 window.hwnd.0 as usize, window.process_id, window.process_name, window.title,
-            )
+            ),
+            hwnd: window.hwnd.0 as isize,
         })
         .collect())
 }
