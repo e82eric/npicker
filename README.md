@@ -128,6 +128,31 @@ sequences, backgrounds, bold, dim, italic, underline, strikethrough, hidden,
 and inverse styling. It does not emulate an interactive terminal or implement
 cursor-positioning and alternate-screen controls.
 
+Preview arguments may contain `{item}` and `{line}`. NFM replaces them with the
+selected preview item and center line as individual process arguments, so a
+shell is not required. To render the first video frame as an image:
+
+```powershell
+nfm-rust-win32host filewalker `
+    --preview ffmpeg `
+    --preview-type image `
+    --preview-arg '-loglevel' `
+    --preview-arg 'error' `
+    --preview-arg '-i' `
+    --preview-arg '{item}' `
+    --preview-arg '-frames:v' `
+    --preview-arg '1' `
+    --preview-arg '-f' `
+    --preview-arg 'image2pipe' `
+    --preview-arg '-vcodec' `
+    --preview-arg 'png' `
+    --preview-arg 'pipe:1'
+```
+
+Image previews expect an encoded image such as PNG or JPEG on stdout. Process
+diagnostics remain on stderr. Images are limited to 32 MiB and are scaled to
+fit the preview pane while preserving their aspect ratio.
+
 ```sh
 some-command-producing-lines |
     nfm-rust-win32host \

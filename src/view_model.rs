@@ -362,6 +362,7 @@ impl ViewModel {
         } else {
             let generation = match update {
                 PreviewUpdate::Ready { generation, .. }
+                | PreviewUpdate::ImageReady { generation, .. }
                 | PreviewUpdate::Error { generation, .. } => *generation,
                 PreviewUpdate::Clear { .. } => unreachable!(),
             };
@@ -371,6 +372,11 @@ impl ViewModel {
         }
         match update {
             PreviewUpdate::Clear { .. } | PreviewUpdate::Error { .. } => {
+                state.preview_line_count = 0;
+                state.preview_top_line = 0;
+                state.preview_truncated = false;
+            }
+            PreviewUpdate::ImageReady { .. } => {
                 state.preview_line_count = 0;
                 state.preview_top_line = 0;
                 state.preview_truncated = false;

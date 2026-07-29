@@ -6,8 +6,8 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, Context, Result};
 use crossbeam_channel::Receiver;
 use skia_safe::{
-    surfaces, Canvas, Color, Font, FontMgr, FontStyle, Paint, PaintStyle, RRect, Rect as SkRect,
-    Surface,
+    surfaces, Canvas, Color, Data, Font, FontMgr, FontStyle, Image, Paint, PaintStyle, RRect,
+    Rect as SkRect, Surface,
 };
 use softbuffer::{Context as SoftContext, Surface as SoftSurface};
 use winit::application::ApplicationHandler;
@@ -128,6 +128,7 @@ struct WindowState {
     preview_enabled: bool,
     preview_generation: u64,
     preview_lines: Arc<[PreviewLine]>,
+    preview_image: Option<Image>,
     preview_top_line: usize,
     preview_loading: bool,
     preview_truncated: bool,
@@ -347,6 +348,7 @@ impl WindowState {
             preview_enabled,
             preview_generation: 0,
             preview_lines: Arc::from([]),
+            preview_image: None,
             preview_top_line: 0,
             preview_loading: false,
             preview_truncated: false,
@@ -365,6 +367,7 @@ impl WindowState {
     fn begin_preview(&mut self, generation: u64) {
         self.preview_generation = generation;
         self.preview_lines = Arc::from([]);
+        self.preview_image = None;
         self.preview_top_line = 0;
         self.preview_loading = true;
         self.preview_truncated = false;
@@ -374,6 +377,7 @@ impl WindowState {
     fn finish_preview(&mut self, generation: u64, lines: Arc<[PreviewLine]>, truncated: bool) {
         if generation == self.preview_generation {
             self.preview_lines = lines;
+            self.preview_image = None;
             self.preview_top_line = 0;
             self.preview_loading = false;
             self.preview_truncated = truncated;
@@ -381,9 +385,25 @@ impl WindowState {
         }
     }
 
+    fn finish_image_preview(&mut self, generation: u64, encoded: Arc<[u8]>) {
+        if generation != self.preview_generation {
+            return;
+        }
+        self.preview_lines = Arc::from([]);
+        self.preview_top_line = 0;
+        self.preview_loading = false;
+        self.preview_truncated = false;
+        self.preview_image = Image::from_encoded(Data::new_copy(&encoded));
+        self.preview_error = self
+            .preview_image
+            .is_none()
+            .then(|| "preview produced an unsupported or invalid image".into());
+    }
+
     fn fail_preview(&mut self, generation: u64, message: String) {
         if generation == self.preview_generation {
             self.preview_lines = Arc::from([]);
+            self.preview_image = None;
             self.preview_top_line = 0;
             self.preview_loading = false;
             self.preview_truncated = false;
@@ -395,6 +415,7 @@ impl WindowState {
     fn set_native_preview_error(&mut self, message: String) {
         self.preview_loading = false;
         self.preview_lines = Arc::from([]);
+        self.preview_image = None;
         self.preview_error = Some(message);
     }
 
@@ -502,6 +523,19 @@ impl WindowState {
             (self.layout.preview_border, self.layout.preview_box)
         {
             draw_rounded_rectangle(canvas, &self.stroke_paint, preview_border, radius);
+            if let Some(image) = &self.preview_image {
+                let scale = (preview_box.width / image.width() as f32)
+                    .min(preview_box.height / image.height() as f32);
+                let width = image.width() as f32 * scale;
+                let height = image.height() as f32 * scale;
+                let destination = SkRect::from_xywh(
+                    preview_box.x + (preview_box.width - width) / 2.0,
+                    preview_box.y + (preview_box.height - height) / 2.0,
+                    width,
+                    height,
+                );
+                canvas.draw_image_rect(image, None, destination, &self.text_paint);
+            }
             let visible_rows = (preview_box.height / self.layout.text_height).floor() as usize;
             let content_rows = if self.preview_truncated {
                 visible_rows.saturating_sub(1)
@@ -1269,6 +1303,10 @@ impl ApplicationHandler<AppEvent> for PickerApp {
                         truncated,
                         ..
                     } => self.renderer.finish_preview(generation, lines, truncated),
+                    PreviewUpdate::ImageReady {
+                        generation,
+                        encoded,
+                    } => self.renderer.finish_image_preview(generation, encoded),
                     PreviewUpdate::Error {
                         generation,
                         message,

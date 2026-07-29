@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use crossbeam_channel::bounded;
-use rust_nfm::preview::{PreviewConfig, PreviewService};
+use rust_nfm::preview::{PreviewConfig, PreviewOutputType, PreviewService};
 use rust_nfm::request::{
     DelimitedInputOptions, DelimitedStdinRequest, DelimitedTextSelector, DelimitedValueSelector,
     PickerResponse, StdinRequest,
@@ -45,6 +45,7 @@ fn main() -> Result<()> {
             program: program.into(),
             arguments: options.preview_arguments,
             working_directory: options.preview_cwd,
+            output_type: options.preview_output_type,
         },
         None if native_window_preview => PreviewConfig::NativeWindow,
         None => PreviewConfig::None,
@@ -215,6 +216,7 @@ struct AppOptions {
     preview_program: Option<String>,
     preview_arguments: Vec<String>,
     preview_cwd: Option<std::path::PathBuf>,
+    preview_output_type: PreviewOutputType,
     window_preview: bool,
 }
 
@@ -225,6 +227,7 @@ fn app_options() -> AppOptions {
         preview_program: None,
         preview_arguments: Vec::new(),
         preview_cwd: None,
+        preview_output_type: PreviewOutputType::Text,
         window_preview: false,
     };
     let mut filewalker = false;
@@ -256,6 +259,12 @@ fn app_options() -> AppOptions {
                     eprintln!("--preview-arg requires a value");
                 }
             }
+            "--preview-type" => match args.next().as_deref() {
+                Some("text") => options.preview_output_type = PreviewOutputType::Text,
+                Some("image") => options.preview_output_type = PreviewOutputType::Image,
+                Some(value) => eprintln!("unsupported preview type: {value}"),
+                None => eprintln!("--preview-type requires 'text' or 'image'"),
+            },
             "--preview-cwd" => {
                 if let Some(directory) = args.next() {
                     options.preview_cwd = Some(directory.into());

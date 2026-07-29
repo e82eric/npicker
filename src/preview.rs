@@ -12,6 +12,7 @@ pub use crate::preview_document::PreviewLine;
 use crate::source_store::AnyItemSource;
 
 const OUTPUT_LIMIT: usize = 1024 * 1024;
+const IMAGE_OUTPUT_LIMIT: usize = 32 * 1024 * 1024;
 const OUTPUT_CHANNEL_CAPACITY: usize = 32;
 const DEBOUNCE: Duration = Duration::from_millis(75);
 
@@ -25,6 +26,10 @@ pub enum PreviewUpdate {
         lines: Arc<[PreviewLine]>,
         truncated: bool,
         center_line: Option<usize>,
+    },
+    ImageReady {
+        generation: u64,
+        encoded: Arc<[u8]>,
     },
     Error {
         generation: u64,
@@ -56,6 +61,7 @@ pub struct CommandPreviewController {
     program: Arc<PathBuf>,
     arguments: Arc<[String]>,
     working_directory: Option<Arc<PathBuf>>,
+    output_type: PreviewOutputType,
     generation: Arc<AtomicU64>,
     events: Sender<PreviewEvent>,
 }
@@ -65,12 +71,14 @@ impl CommandPreviewController {
         program: PathBuf,
         arguments: Vec<String>,
         working_directory: Option<PathBuf>,
+        output_type: PreviewOutputType,
         events: Sender<PreviewEvent>,
     ) -> Self {
         Self {
             program: Arc::new(program),
             arguments: arguments.into(),
             working_directory: working_directory.map(Arc::new),
+            output_type,
             generation: Arc::new(AtomicU64::new(0)),
             events,
         }
@@ -82,6 +90,7 @@ impl CommandPreviewController {
         let program = Arc::clone(&self.program);
         let arguments = Arc::clone(&self.arguments);
         let working_directory = self.working_directory.clone();
+        let output_type = self.output_type;
         let events = self.events.clone();
         std::thread::spawn(move || {
             std::thread::sleep(DEBOUNCE);
@@ -92,6 +101,7 @@ impl CommandPreviewController {
                 &program,
                 &arguments,
                 working_directory.as_deref(),
+                output_type,
                 &target,
                 generation,
                 current_generation,
@@ -122,6 +132,13 @@ pub struct CommandPreviewTarget {
     pub center_line: Option<usize>,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum PreviewOutputType {
+    #[default]
+    Text,
+    Image,
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub enum PreviewConfig {
     #[default]
@@ -130,6 +147,7 @@ pub enum PreviewConfig {
         program: PathBuf,
         arguments: Vec<String>,
         working_directory: Option<PathBuf>,
+        output_type: PreviewOutputType,
     },
     NativeWindow,
 }
@@ -201,11 +219,13 @@ fn build_preview_backend(
             program,
             arguments,
             working_directory,
+            output_type,
         } => Box::new(CommandPreviewBackend {
             controller: CommandPreviewController::new(
                 program,
                 arguments,
                 working_directory,
+                output_type,
                 events,
             ),
             selected: Mutex::new(None),
@@ -318,13 +338,18 @@ fn run_process(
     program: &PathBuf,
     arguments: &[String],
     working_directory: Option<&PathBuf>,
+    output_type: PreviewOutputType,
     target: &CommandPreviewTarget,
     generation: u64,
     current_generation: Arc<AtomicU64>,
     events: Sender<PreviewEvent>,
 ) {
     let mut command = Command::new(program);
-    command.args(arguments);
+    command.args(
+        arguments
+            .iter()
+            .map(|argument| expand_preview_argument(argument, target)),
+    );
     if let Some(working_directory) = working_directory {
         command.current_dir(working_directory);
     }
@@ -368,9 +393,12 @@ fn run_process(
     drop(output_tx);
 
     let mut document = PreviewDocument::default();
+    let mut image_bytes = Vec::new();
+    let mut image_error = PreviewDocument::default();
     let mut bytes_received = 0;
     let mut truncated = false;
     let mut child_finished = false;
+    let mut child_succeeded = true;
     let mut readers_finished = false;
     loop {
         if current_generation.load(Ordering::Acquire) != generation {
@@ -382,13 +410,31 @@ fn run_process(
         if !readers_finished {
             match output_rx.recv_timeout(Duration::from_millis(20)) {
                 Ok(chunk) => {
-                    let remaining = OUTPUT_LIMIT.saturating_sub(bytes_received);
+                    let output_limit = match output_type {
+                        PreviewOutputType::Text => OUTPUT_LIMIT,
+                        PreviewOutputType::Image => IMAGE_OUTPUT_LIMIT,
+                    };
+                    let remaining = output_limit.saturating_sub(bytes_received);
                     let allowed = remaining.min(chunk.bytes.len());
                     if allowed > 0 {
-                        document.push(chunk.stream, &chunk.bytes[..allowed]);
+                        match output_type {
+                            PreviewOutputType::Text => {
+                                document.push(chunk.stream, &chunk.bytes[..allowed]);
+                            }
+                            PreviewOutputType::Image => match chunk.stream {
+                                PreviewStream::Stdout => {
+                                    image_bytes.extend_from_slice(&chunk.bytes[..allowed]);
+                                }
+                                PreviewStream::Stderr => {
+                                    image_error.push(chunk.stream, &chunk.bytes[..allowed]);
+                                }
+                            },
+                        }
                         bytes_received += allowed;
                     }
-                    if allowed < chunk.bytes.len() || document.line_limit_reached() {
+                    if allowed < chunk.bytes.len()
+                        || (output_type == PreviewOutputType::Text && document.line_limit_reached())
+                    {
                         truncated = true;
                         let _ = child.kill();
                         let _ = child.wait();
@@ -402,7 +448,10 @@ fn run_process(
 
         if !child_finished {
             match child.try_wait() {
-                Ok(Some(_)) => child_finished = true,
+                Ok(Some(status)) => {
+                    child_succeeded = status.success();
+                    child_finished = true;
+                }
                 Ok(None) => {}
                 Err(error) => {
                     let _ = events.send(PreviewEvent::Command(PreviewUpdate::Error {
@@ -419,12 +468,63 @@ fn run_process(
         }
     }
 
-    let _ = events.send(PreviewEvent::Command(PreviewUpdate::Ready {
-        generation,
-        lines: document.into_lines().into(),
-        truncated,
-        center_line: target.center_line,
-    }));
+    let update = match output_type {
+        PreviewOutputType::Text => PreviewUpdate::Ready {
+            generation,
+            lines: document.into_lines().into(),
+            truncated,
+            center_line: target.center_line,
+        },
+        PreviewOutputType::Image if truncated => PreviewUpdate::Error {
+            generation,
+            message: "image preview exceeded 32 MiB".into(),
+        },
+        PreviewOutputType::Image if image_bytes.is_empty() || !child_succeeded => {
+            let message = preview_document_text(image_error)
+                .filter(|message| !message.is_empty())
+                .unwrap_or_else(|| {
+                    if image_bytes.is_empty() {
+                        "image preview produced no output".into()
+                    } else {
+                        "image preview process failed".into()
+                    }
+                });
+            PreviewUpdate::Error {
+                generation,
+                message,
+            }
+        }
+        PreviewOutputType::Image => PreviewUpdate::ImageReady {
+            generation,
+            encoded: image_bytes.into(),
+        },
+    };
+    let _ = events.send(PreviewEvent::Command(update));
+}
+
+fn expand_preview_argument(argument: &str, target: &CommandPreviewTarget) -> String {
+    argument.replace("{item}", &target.item).replace(
+        "{line}",
+        &target
+            .center_line
+            .map(|line| line.to_string())
+            .unwrap_or_default(),
+    )
+}
+
+fn preview_document_text(document: PreviewDocument) -> Option<String> {
+    let text = document
+        .into_lines()
+        .into_iter()
+        .map(|line| {
+            line.spans
+                .into_iter()
+                .map(|span| span.text)
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    (!text.is_empty()).then_some(text)
 }
 
 fn forward_output(
@@ -488,6 +588,7 @@ mod tests {
             &program,
             &arguments,
             None,
+            PreviewOutputType::Text,
             &CommandPreviewTarget {
                 item: String::new(),
                 center_line: Some(42),
@@ -517,6 +618,64 @@ mod tests {
             .map(|line| line.spans.iter().map(|span| span.text.as_str()).collect())
             .collect();
         assert_eq!(&text[..3], ["first", "second", "42"]);
+    }
+
+    #[test]
+    fn preview_arguments_expand_item_and_line_placeholders() {
+        let target = CommandPreviewTarget {
+            item: r"C:\files\a b.png".into(),
+            center_line: Some(17),
+        };
+        assert_eq!(
+            expand_preview_argument("--input={item}", &target),
+            r"--input=C:\files\a b.png"
+        );
+        assert_eq!(expand_preview_argument("{line}", &target), "17");
+    }
+
+    #[test]
+    fn image_process_publishes_binary_stdout() {
+        let (events, receiver) = bounded(4);
+        let generation = 9;
+        let current_generation = Arc::new(AtomicU64::new(generation));
+        #[cfg(windows)]
+        let (program, arguments) = (
+            PathBuf::from("powershell.exe"),
+            vec![
+                "-NoLogo".into(),
+                "-NoProfile".into(),
+                "-NonInteractive".into(),
+                "-Command".into(),
+                "[Console]::OpenStandardOutput().Write([byte[]](1,2,3), 0, 3)".into(),
+            ],
+        );
+        #[cfg(not(windows))]
+        let (program, arguments) = (
+            PathBuf::from("/bin/sh"),
+            vec!["-c".into(), "printf '\\001\\002\\003'".into()],
+        );
+
+        run_process(
+            &program,
+            &arguments,
+            None,
+            PreviewOutputType::Image,
+            &CommandPreviewTarget {
+                item: String::new(),
+                center_line: None,
+            },
+            generation,
+            current_generation,
+            events,
+        );
+
+        assert!(matches!(
+            receiver.recv().unwrap(),
+            PreviewEvent::Command(PreviewUpdate::ImageReady {
+                generation: 9,
+                encoded
+            }) if encoded.as_ref() == [1, 2, 3]
+        ));
     }
 
     #[test]
