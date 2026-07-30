@@ -68,7 +68,8 @@ enum AppEvent {
 pub fn run(
     view_model: Arc<ViewModel>,
     completion: Option<Receiver<i32>>,
-    preview_enabled: bool,
+    preview_available: bool,
+    preview_visible: bool,
 ) -> Result<i32> {
     let mut builder = EventLoop::<AppEvent>::with_user_event();
     #[cfg(windows)]
@@ -84,7 +85,7 @@ pub fn run(
         forward_completion(completion, proxy.clone());
     }
 
-    let mut app = PickerApp::new(view_model, preview_enabled)?;
+    let mut app = PickerApp::new(view_model, preview_available, preview_visible)?;
     event_loop.run_app(&mut app)?;
     Ok(app.exit_code)
 }
@@ -1053,6 +1054,7 @@ struct PickerApp {
     next_blink: Instant,
     input_ready_at: Instant,
     visible: bool,
+    preview_available: bool,
     exit_code: i32,
     pending_native_preview: Option<NativeWindowId>,
     #[cfg(windows)]
@@ -1060,13 +1062,17 @@ struct PickerApp {
 }
 
 impl PickerApp {
-    fn new(view_model: Arc<ViewModel>, preview_enabled: bool) -> Result<Self> {
+    fn new(
+        view_model: Arc<ViewModel>,
+        preview_available: bool,
+        preview_visible: bool,
+    ) -> Result<Self> {
         Ok(Self {
             renderer: WindowState::new(
                 Arc::clone(&view_model),
                 DEFAULT_WIDTH as f32,
                 1.0,
-                preview_enabled,
+                preview_visible,
             )?,
             view_model,
             window: None,
@@ -1076,6 +1082,7 @@ impl PickerApp {
             next_blink: Instant::now() + Duration::from_millis(530),
             input_ready_at: Instant::now(),
             visible: false,
+            preview_available,
             exit_code: 0,
             pending_native_preview: None,
             #[cfg(windows)]
@@ -1214,6 +1221,27 @@ impl PickerApp {
         window.set_outer_position(PhysicalPosition::new(x, y));
     }
 
+    fn set_preview_visibility(&mut self, visible: bool) {
+        if !self.preview_available || self.renderer.preview_enabled == visible {
+            return;
+        }
+        self.renderer.preview_enabled = visible;
+        let desired_height = desired_window_height(
+            self.renderer.layout.text_height,
+            PADDING,
+            DISPLAY_ROWS,
+            visible,
+        );
+        DESIRED_WINDOW_HEIGHT.store(desired_height, Ordering::Relaxed);
+        self.renderer.surface = None;
+        self.center_window();
+        #[cfg(windows)]
+        self.sync_native_thumbnail();
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
+    }
+
     fn handle_keyboard(&mut self, event: winit::event::KeyEvent) {
         if event.state != ElementState::Pressed {
             return;
@@ -1235,10 +1263,20 @@ impl PickerApp {
             Key::Named(NamedKey::Delete) => Some(InputCommand::Delete),
             Key::Named(NamedKey::PageUp) if modifiers.ctrl => Some(InputCommand::PreviewPageUp),
             Key::Named(NamedKey::PageDown) if modifiers.ctrl => Some(InputCommand::PreviewPageDown),
+            Key::Character(value)
+                if modifiers.ctrl && self.preview_available && value.eq_ignore_ascii_case("p") =>
+            {
+                Some(InputCommand::TogglePreview)
+            }
             _ => None,
         };
         if let Some(command) = command {
-            if event.repeat && matches!(command, InputCommand::Accept | InputCommand::Cancel) {
+            if event.repeat
+                && matches!(
+                    command,
+                    InputCommand::Accept | InputCommand::Cancel | InputCommand::TogglePreview
+                )
+            {
                 return;
             }
             self.view_model.handle_command(command, modifiers);
@@ -1255,6 +1293,10 @@ impl PickerApp {
         let Some(thumbnail) = &mut self.native_thumbnail else {
             return;
         };
+        if !self.visible || !self.renderer.preview_enabled {
+            thumbnail.unregister();
+            return;
+        }
         let source = self.pending_native_preview.map(|window| window.0);
         if thumbnail.source() != source {
             if let Err(error) = thumbnail.set_source(source) {
@@ -1263,9 +1305,6 @@ impl PickerApp {
                 return;
             }
             self.renderer.clear_native_preview_error();
-        }
-        if !self.visible {
-            return;
         }
         if let Some(preview_box) = self.renderer.layout.preview_box {
             if let Err(error) = thumbnail.update_layout(preview_box, self.renderer.scale_factor) {
@@ -1324,6 +1363,9 @@ impl ApplicationHandler<AppEvent> for PickerApp {
                 if let Some(window) = &self.window {
                     window.request_redraw();
                 }
+            }
+            AppEvent::Ui(UiEvent::PreviewVisibilityChanged { visible }) => {
+                self.set_preview_visibility(visible);
             }
             AppEvent::Ui(UiEvent::Close) => self.hide(),
             AppEvent::Exit(code) => {

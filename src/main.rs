@@ -76,7 +76,11 @@ fn main() -> Result<()> {
             None => PreviewConfig::None,
         },
     };
-    let view_model = ViewModel::new(PreviewService::new(preview_config));
+    let preview_visible = preview_enabled && options.preview_visible;
+    let view_model = ViewModel::new_with_preview_visibility(
+        PreviewService::new(preview_config),
+        preview_visible,
+    );
     let (completion_tx, completion_rx) = bounded(1);
     match options.input {
         InputMode::Stdin(None) => run_stdin_request(Arc::clone(&view_model), completion_tx),
@@ -88,7 +92,12 @@ fn main() -> Result<()> {
         }
         InputMode::ListWindows => run_list_windows_request(Arc::clone(&view_model), completion_tx)?,
     }
-    let code = skia_ui::run(view_model, Some(completion_rx), preview_enabled)?;
+    let code = skia_ui::run(
+        view_model,
+        Some(completion_rx),
+        preview_enabled,
+        preview_visible,
+    )?;
     if code != 0 {
         std::process::exit(code);
     }
@@ -247,6 +256,7 @@ struct AppOptions {
     preview_resolver_arguments: Vec<String>,
     preview_profiles: HashMap<String, PreviewProfileOptions>,
     preview_default_profile: Option<String>,
+    preview_visible: bool,
     window_preview: bool,
 }
 
@@ -270,6 +280,7 @@ fn app_options() -> AppOptions {
         preview_resolver_arguments: Vec::new(),
         preview_profiles: HashMap::new(),
         preview_default_profile: None,
+        preview_visible: true,
         window_preview: false,
     };
     let mut filewalker = false;
@@ -376,6 +387,12 @@ fn app_options() -> AppOptions {
                     eprintln!("--preview-default requires a profile");
                 }
             }
+            "--preview-visible" => match args.next().as_deref() {
+                Some("true") => options.preview_visible = true,
+                Some("false") => options.preview_visible = false,
+                Some(value) => eprintln!("--preview-visible requires true or false, got: {value}"),
+                None => eprintln!("--preview-visible requires true or false"),
+            },
             "--preview-cwd" => {
                 if let Some(directory) = args.next() {
                     options.preview_cwd = Some(directory.into());

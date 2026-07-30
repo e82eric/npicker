@@ -21,6 +21,7 @@ pub enum UiEvent {
     Show,
     Results(UiUpdate),
     Preview(PreviewView),
+    PreviewVisibilityChanged { visible: bool },
     Close,
 }
 
@@ -73,6 +74,7 @@ struct State {
     preview_visible_rows: usize,
     preview_truncated: bool,
     preview_update: Option<PreviewUpdate>,
+    preview_visible: bool,
 }
 
 #[derive(Clone)]
@@ -103,6 +105,7 @@ pub enum InputCommand {
     Delete,
     PreviewPageUp,
     PreviewPageDown,
+    TogglePreview,
 }
 
 struct ActiveRequest {
@@ -114,6 +117,13 @@ struct ActiveRequest {
 
 impl ViewModel {
     pub fn new(preview_service: PreviewService) -> Arc<Self> {
+        Self::new_with_preview_visibility(preview_service, true)
+    }
+
+    pub fn new_with_preview_visibility(
+        preview_service: PreviewService,
+        preview_visible: bool,
+    ) -> Arc<Self> {
         let (events_tx, events_rx) = unbounded();
         let (search_update_tx, search_update_rx) = unbounded();
         let (preview, preview_events) = preview_service.into_parts();
@@ -134,6 +144,7 @@ impl ViewModel {
                 preview_visible_rows: 0,
                 preview_truncated: false,
                 preview_update: None,
+                preview_visible,
             }),
             request_generation: AtomicU64::new(0),
             search_update_tx,
@@ -318,7 +329,19 @@ impl ViewModel {
             InputCommand::Delete => self.handle_delete(modifiers),
             InputCommand::PreviewPageUp => self.page_preview(-1),
             InputCommand::PreviewPageDown => self.page_preview(1),
+            InputCommand::TogglePreview => self.toggle_preview(),
         }
+    }
+
+    fn toggle_preview(&self) {
+        let visible = {
+            let mut state = self.state.lock().expect("view model poisoned");
+            state.preview_visible = !state.preview_visible;
+            state.preview_visible
+        };
+        let _ = self
+            .events_tx
+            .send(UiEvent::PreviewVisibilityChanged { visible });
     }
 
     pub fn set_preview_visible_rows(&self, visible_rows: usize) {
@@ -897,6 +920,23 @@ mod tests {
         assert!(matches!(
             view_model.events_rx.try_recv(),
             Ok(UiEvent::Preview(PreviewView::Text { top_line: 11, .. }))
+        ));
+    }
+
+    #[test]
+    fn preview_visibility_toggle_publishes_the_new_state() {
+        let view_model = ViewModel::new_with_preview_visibility(PreviewService::default(), false);
+
+        view_model.handle_command(InputCommand::TogglePreview, KeyModifiers::default());
+        assert!(matches!(
+            view_model.events_rx.try_recv(),
+            Ok(UiEvent::PreviewVisibilityChanged { visible: true })
+        ));
+
+        view_model.handle_command(InputCommand::TogglePreview, KeyModifiers::default());
+        assert!(matches!(
+            view_model.events_rx.try_recv(),
+            Ok(UiEvent::PreviewVisibilityChanged { visible: false })
         ));
     }
 

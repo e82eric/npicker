@@ -90,6 +90,10 @@ an executable, and each repeatable `--preview-arg` supplies one argument. The
 selected item is passed only to the preview child process in
 `NFM_PREVIEW_ITEM`.
 
+Press Ctrl+P to toggle the preview pane. Use `--preview-visible false` to start
+with a configured preview hidden; preview commands continue running while the
+pane is hidden so it can be restored immediately.
+
 NFM does not implicitly invoke a shell. Invoke one explicitly when the preview
 uses shell expressions or pipelines:
 
