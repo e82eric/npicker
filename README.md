@@ -153,6 +153,40 @@ Image previews expect an encoded image such as PNG or JPEG on stdout. Process
 diagnostics remain on stderr. Images are limited to 32 MiB and are scaled to
 fit the preview pane while preserving their aspect ratio.
 
+For selection-dependent previews, `--preview-resolver` can classify the current
+item by returning one configured profile name on stdout. Profiles are trusted
+commands configured with `--preview-command` and related options:
+
+```powershell
+nfm-rust-win32host filewalker `
+    --preview-resolver classify-preview.exe `
+    --preview-resolver-arg '{item}' `
+    --preview-command text bat `
+    --preview-command-type text text `
+    --preview-command-arg text '--color=always' `
+    --preview-command-arg text '--paging=never' `
+    --preview-command-arg text '{item}' `
+    --preview-command image ffmpeg `
+    --preview-command-type image image `
+    --preview-command-arg image '-loglevel' `
+    --preview-command-arg image 'error' `
+    --preview-command-arg image '-i' `
+    --preview-command-arg image '{item}' `
+    --preview-command-arg image '-frames:v' `
+    --preview-command-arg image '1' `
+    --preview-command-arg image '-f' `
+    --preview-command-arg image 'image2pipe' `
+    --preview-command-arg image '-vcodec' `
+    --preview-command-arg image 'png' `
+    --preview-command-arg image 'pipe:1'
+```
+
+The resolver receives `NFM_PREVIEW_ITEM` and `NFM_PREVIEW_LINE`, supports the
+same `{item}` and `{line}` argument placeholders, and must return zero or one
+profile name. Empty output selects `--preview-default`, when supplied. Unknown
+profiles, nonzero exit status, output over 64 KiB, multiple names, and resolver
+runs longer than two seconds are reported as preview errors.
+
 ```sh
 some-command-producing-lines |
     nfm-rust-win32host \

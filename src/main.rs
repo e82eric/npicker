@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::io::Write;
 use std::sync::Arc;
 
@@ -36,19 +37,44 @@ fn main() -> Result<()> {
 
     nfm_search_core::timing::set_sink(output_timing);
     let is_window_list = matches!(&options.input, InputMode::ListWindows);
-    let command_preview = options.preview_program.is_some();
+    let command_preview =
+        options.preview_program.is_some() || options.preview_resolver_program.is_some();
     let native_window_preview =
         resolve_native_window_preview(is_window_list, options.window_preview, command_preview)?;
     let preview_enabled = command_preview || native_window_preview;
-    let preview_config = match options.preview_program {
-        Some(program) => PreviewConfig::Command {
+    let preview_config = match options.preview_resolver_program {
+        Some(program) => PreviewConfig::Resolver {
             program: program.into(),
-            arguments: options.preview_arguments,
-            working_directory: options.preview_cwd,
-            output_type: options.preview_output_type,
+            arguments: options.preview_resolver_arguments,
+            profiles: options
+                .preview_profiles
+                .into_iter()
+                .filter_map(|(name, profile)| {
+                    profile.program.map(|program| {
+                        (
+                            name,
+                            rust_nfm::preview::PreviewProfile {
+                                program: program.into(),
+                                arguments: profile.arguments,
+                                working_directory: profile.working_directory,
+                                output_type: profile.output_type,
+                            },
+                        )
+                    })
+                })
+                .collect(),
+            default_profile: options.preview_default_profile,
         },
-        None if native_window_preview => PreviewConfig::NativeWindow,
-        None => PreviewConfig::None,
+        None => match options.preview_program {
+            Some(program) => PreviewConfig::Command {
+                program: program.into(),
+                arguments: options.preview_arguments,
+                working_directory: options.preview_cwd,
+                output_type: options.preview_output_type,
+            },
+            None if native_window_preview => PreviewConfig::NativeWindow,
+            None => PreviewConfig::None,
+        },
     };
     let view_model = ViewModel::new(PreviewService::new(preview_config));
     let (completion_tx, completion_rx) = bounded(1);
@@ -217,7 +243,19 @@ struct AppOptions {
     preview_arguments: Vec<String>,
     preview_cwd: Option<std::path::PathBuf>,
     preview_output_type: PreviewOutputType,
+    preview_resolver_program: Option<String>,
+    preview_resolver_arguments: Vec<String>,
+    preview_profiles: HashMap<String, PreviewProfileOptions>,
+    preview_default_profile: Option<String>,
     window_preview: bool,
+}
+
+#[derive(Default)]
+struct PreviewProfileOptions {
+    program: Option<String>,
+    arguments: Vec<String>,
+    working_directory: Option<std::path::PathBuf>,
+    output_type: PreviewOutputType,
 }
 
 fn app_options() -> AppOptions {
@@ -228,6 +266,10 @@ fn app_options() -> AppOptions {
         preview_arguments: Vec::new(),
         preview_cwd: None,
         preview_output_type: PreviewOutputType::Text,
+        preview_resolver_program: None,
+        preview_resolver_arguments: Vec::new(),
+        preview_profiles: HashMap::new(),
+        preview_default_profile: None,
         window_preview: false,
     };
     let mut filewalker = false;
@@ -265,6 +307,75 @@ fn app_options() -> AppOptions {
                 Some(value) => eprintln!("unsupported preview type: {value}"),
                 None => eprintln!("--preview-type requires 'text' or 'image'"),
             },
+            "--preview-resolver" => {
+                options.preview_resolver_program = args.next();
+                if options.preview_resolver_program.is_none() {
+                    eprintln!("--preview-resolver requires an executable");
+                }
+            }
+            "--preview-resolver-arg" => {
+                if let Some(argument) = args.next() {
+                    options.preview_resolver_arguments.push(argument);
+                } else {
+                    eprintln!("--preview-resolver-arg requires a value");
+                }
+            }
+            "--preview-command" => {
+                if let (Some(profile), Some(program)) = (args.next(), args.next()) {
+                    options.preview_profiles.entry(profile).or_default().program = Some(program);
+                } else {
+                    eprintln!("--preview-command requires a profile and executable");
+                }
+            }
+            "--preview-command-arg" => {
+                if let (Some(profile), Some(argument)) = (args.next(), args.next()) {
+                    options
+                        .preview_profiles
+                        .entry(profile)
+                        .or_default()
+                        .arguments
+                        .push(argument);
+                } else {
+                    eprintln!("--preview-command-arg requires a profile and argument");
+                }
+            }
+            "--preview-command-type" => {
+                if let (Some(profile), Some(output_type)) = (args.next(), args.next()) {
+                    let output_type = match output_type.as_str() {
+                        "text" => Some(PreviewOutputType::Text),
+                        "image" => Some(PreviewOutputType::Image),
+                        _ => None,
+                    };
+                    if let Some(output_type) = output_type {
+                        options
+                            .preview_profiles
+                            .entry(profile)
+                            .or_default()
+                            .output_type = output_type;
+                    } else {
+                        eprintln!("--preview-command-type requires 'text' or 'image'");
+                    }
+                } else {
+                    eprintln!("--preview-command-type requires a profile and type");
+                }
+            }
+            "--preview-command-cwd" => {
+                if let (Some(profile), Some(directory)) = (args.next(), args.next()) {
+                    options
+                        .preview_profiles
+                        .entry(profile)
+                        .or_default()
+                        .working_directory = Some(directory.into());
+                } else {
+                    eprintln!("--preview-command-cwd requires a profile and directory");
+                }
+            }
+            "--preview-default" => {
+                options.preview_default_profile = args.next();
+                if options.preview_default_profile.is_none() {
+                    eprintln!("--preview-default requires a profile");
+                }
+            }
             "--preview-cwd" => {
                 if let Some(directory) = args.next() {
                     options.preview_cwd = Some(directory.into());

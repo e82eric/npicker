@@ -1,8 +1,9 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossbeam_channel::{bounded, unbounded, Receiver, RecvTimeoutError, Sender};
 use nfm_search_core::search::SearchResult;
@@ -13,6 +14,7 @@ use crate::source_store::AnyItemSource;
 
 const OUTPUT_LIMIT: usize = 1024 * 1024;
 const IMAGE_OUTPUT_LIMIT: usize = 32 * 1024 * 1024;
+const RESOLVER_OUTPUT_LIMIT: usize = 64 * 1024;
 const OUTPUT_CHANNEL_CAPACITY: usize = 32;
 const DEBOUNCE: Duration = Duration::from_millis(75);
 
@@ -58,27 +60,15 @@ struct OutputChunk {
 }
 
 pub struct CommandPreviewController {
-    program: Arc<PathBuf>,
-    arguments: Arc<[String]>,
-    working_directory: Option<Arc<PathBuf>>,
-    output_type: PreviewOutputType,
+    mode: Arc<CommandPreviewMode>,
     generation: Arc<AtomicU64>,
     events: Sender<PreviewEvent>,
 }
 
 impl CommandPreviewController {
-    pub fn new(
-        program: PathBuf,
-        arguments: Vec<String>,
-        working_directory: Option<PathBuf>,
-        output_type: PreviewOutputType,
-        events: Sender<PreviewEvent>,
-    ) -> Self {
+    fn new(mode: CommandPreviewMode, events: Sender<PreviewEvent>) -> Self {
         Self {
-            program: Arc::new(program),
-            arguments: arguments.into(),
-            working_directory: working_directory.map(Arc::new),
-            output_type,
+            mode: Arc::new(mode),
             generation: Arc::new(AtomicU64::new(0)),
             events,
         }
@@ -87,21 +77,69 @@ impl CommandPreviewController {
     pub fn request(&self, target: CommandPreviewTarget) -> u64 {
         let generation = self.next_generation();
         let current_generation = Arc::clone(&self.generation);
-        let program = Arc::clone(&self.program);
-        let arguments = Arc::clone(&self.arguments);
-        let working_directory = self.working_directory.clone();
-        let output_type = self.output_type;
+        let mode = Arc::clone(&self.mode);
         let events = self.events.clone();
         std::thread::spawn(move || {
             std::thread::sleep(DEBOUNCE);
             if current_generation.load(Ordering::Acquire) != generation {
                 return;
             }
+            let job = match mode.as_ref() {
+                CommandPreviewMode::Fixed(profile) => Some(profile.clone()),
+                CommandPreviewMode::Resolver {
+                    program,
+                    arguments,
+                    profiles,
+                    default_profile,
+                } => match run_resolver(
+                    program,
+                    arguments,
+                    &target,
+                    generation,
+                    Arc::clone(&current_generation),
+                ) {
+                    Ok(Some(profile)) => match profiles.get(&profile) {
+                        Some(job) => Some(job.clone()),
+                        None => {
+                            publish_error(
+                                &events,
+                                generation,
+                                format!("preview resolver returned unknown profile: {profile}"),
+                            );
+                            return;
+                        }
+                    },
+                    Ok(None) => match default_profile {
+                        Some(profile) => match profiles.get(profile) {
+                            Some(job) => Some(job.clone()),
+                            None => {
+                                publish_error(
+                                    &events,
+                                    generation,
+                                    format!("unknown default preview profile: {profile}"),
+                                );
+                                return;
+                            }
+                        },
+                        None => None,
+                    },
+                    Err(message) => {
+                        publish_error(&events, generation, message);
+                        return;
+                    }
+                },
+            };
+            let Some(job) = job else {
+                return;
+            };
+            if current_generation.load(Ordering::Acquire) != generation {
+                return;
+            }
             run_process(
-                &program,
-                &arguments,
-                working_directory.as_deref(),
-                output_type,
+                &job.program,
+                &job.arguments,
+                job.working_directory.as_ref(),
+                job.output_type,
                 &target,
                 generation,
                 current_generation,
@@ -127,6 +165,24 @@ impl CommandPreviewController {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PreviewProfile {
+    pub program: PathBuf,
+    pub arguments: Vec<String>,
+    pub working_directory: Option<PathBuf>,
+    pub output_type: PreviewOutputType,
+}
+
+enum CommandPreviewMode {
+    Fixed(PreviewProfile),
+    Resolver {
+        program: PathBuf,
+        arguments: Vec<String>,
+        profiles: HashMap<String, PreviewProfile>,
+        default_profile: Option<String>,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CommandPreviewTarget {
     pub item: String,
     pub center_line: Option<usize>,
@@ -148,6 +204,12 @@ pub enum PreviewConfig {
         arguments: Vec<String>,
         working_directory: Option<PathBuf>,
         output_type: PreviewOutputType,
+    },
+    Resolver {
+        program: PathBuf,
+        arguments: Vec<String>,
+        profiles: HashMap<String, PreviewProfile>,
+        default_profile: Option<String>,
     },
     NativeWindow,
 }
@@ -222,10 +284,29 @@ fn build_preview_backend(
             output_type,
         } => Box::new(CommandPreviewBackend {
             controller: CommandPreviewController::new(
-                program,
-                arguments,
-                working_directory,
-                output_type,
+                CommandPreviewMode::Fixed(PreviewProfile {
+                    program,
+                    arguments,
+                    working_directory,
+                    output_type,
+                }),
+                events,
+            ),
+            selected: Mutex::new(None),
+        }),
+        PreviewConfig::Resolver {
+            program,
+            arguments,
+            profiles,
+            default_profile,
+        } => Box::new(CommandPreviewBackend {
+            controller: CommandPreviewController::new(
+                CommandPreviewMode::Resolver {
+                    program,
+                    arguments,
+                    profiles,
+                    default_profile,
+                },
                 events,
             ),
             selected: Mutex::new(None),
@@ -332,6 +413,124 @@ impl NativeWindowPreviewBackend {
         drop(selected);
         let _ = self.events.send(PreviewEvent::NativeWindow(window));
     }
+}
+
+fn run_resolver(
+    program: &PathBuf,
+    arguments: &[String],
+    target: &CommandPreviewTarget,
+    generation: u64,
+    current_generation: Arc<AtomicU64>,
+) -> Result<Option<String>, String> {
+    let mut command = Command::new(program);
+    command.args(
+        arguments
+            .iter()
+            .map(|argument| expand_preview_argument(argument, target)),
+    );
+    command
+        .env("NFM_PREVIEW_ITEM", &target.item)
+        .env(
+            "NFM_PREVIEW_LINE",
+            target
+                .center_line
+                .map(|line| line.to_string())
+                .unwrap_or_default(),
+        )
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("preview resolver failed to start: {error}"))?;
+    let (output_tx, output_rx) = bounded(OUTPUT_CHANNEL_CAPACITY);
+    if let Some(stdout) = child.stdout.take() {
+        forward_output(stdout, PreviewStream::Stdout, output_tx.clone());
+    }
+    if let Some(stderr) = child.stderr.take() {
+        forward_output(stderr, PreviewStream::Stderr, output_tx.clone());
+    }
+    drop(output_tx);
+
+    let started = Instant::now();
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let status = loop {
+        if current_generation.load(Ordering::Acquire) != generation {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Ok(None);
+        }
+        if started.elapsed() >= Duration::from_secs(2) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err("preview resolver timed out".into());
+        }
+        match output_rx.recv_timeout(Duration::from_millis(20)) {
+            Ok(chunk) => {
+                if stdout.len() + stderr.len() + chunk.bytes.len() > RESOLVER_OUTPUT_LIMIT {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err("preview resolver output exceeded 64 KiB".into());
+                }
+                let destination = match chunk.stream {
+                    PreviewStream::Stdout => &mut stdout,
+                    PreviewStream::Stderr => &mut stderr,
+                };
+                destination.extend_from_slice(&chunk.bytes);
+            }
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => {}
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {}
+            Err(error) => return Err(format!("preview resolver process error: {error}")),
+        }
+    };
+    while let Ok(chunk) = output_rx.recv_timeout(Duration::from_millis(100)) {
+        if stdout.len() + stderr.len() + chunk.bytes.len() > RESOLVER_OUTPUT_LIMIT {
+            return Err("preview resolver output exceeded 64 KiB".into());
+        }
+        match chunk.stream {
+            PreviewStream::Stdout => stdout.extend_from_slice(&chunk.bytes),
+            PreviewStream::Stderr => stderr.extend_from_slice(&chunk.bytes),
+        }
+    }
+
+    if !status.success() {
+        let message = String::from_utf8_lossy(&stderr).trim().to_owned();
+        return Err(if message.is_empty() {
+            format!("preview resolver exited with {status}")
+        } else {
+            message
+        });
+    }
+    let output = String::from_utf8(stdout)
+        .map_err(|_| "preview resolver output was not valid UTF-8".to_string())?;
+    let mut lines = output
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty());
+    let profile = lines.next().map(str::to_owned);
+    if lines.next().is_some() {
+        return Err("preview resolver returned more than one profile".into());
+    }
+    Ok(profile)
+}
+
+fn publish_error(events: &Sender<PreviewEvent>, generation: u64, message: String) {
+    let _ = events.send(PreviewEvent::Command(PreviewUpdate::Error {
+        generation,
+        message,
+    }));
 }
 
 fn run_process(
@@ -631,6 +830,40 @@ mod tests {
             r"--input=C:\files\a b.png"
         );
         assert_eq!(expand_preview_argument("{line}", &target), "17");
+    }
+
+    #[test]
+    fn process_resolver_returns_one_profile_name() {
+        #[cfg(windows)]
+        let (program, arguments) = (
+            PathBuf::from("powershell.exe"),
+            vec![
+                "-NoLogo".into(),
+                "-NoProfile".into(),
+                "-NonInteractive".into(),
+                "-Command".into(),
+                "Write-Output image".into(),
+            ],
+        );
+        #[cfg(not(windows))]
+        let (program, arguments) = (
+            PathBuf::from("/bin/sh"),
+            vec!["-c".into(), "printf 'image\\n'".into()],
+        );
+
+        let profile = run_resolver(
+            &program,
+            &arguments,
+            &CommandPreviewTarget {
+                item: "sample.png".into(),
+                center_line: None,
+            },
+            3,
+            Arc::new(AtomicU64::new(3)),
+        )
+        .unwrap();
+
+        assert_eq!(profile.as_deref(), Some("image"));
     }
 
     #[test]
