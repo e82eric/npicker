@@ -2,6 +2,7 @@ pub mod action;
 mod delimited_store;
 #[cfg(windows)]
 pub mod ffi;
+pub mod key_binding;
 #[cfg(windows)]
 pub mod list_windows;
 pub mod preview;

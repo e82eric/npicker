@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -7,6 +8,8 @@ use crate::action::{
     ActionController, ActionEvent, ActionResolution, ActionSelection, ActionService, ActionState,
     PickerState,
 };
+use crate::key_binding::KeyChord;
+pub use crate::key_binding::KeyModifiers;
 use crate::preview::{
     NativeWindowId, PreviewCoordinator, PreviewEvent, PreviewService, PreviewUpdate,
 };
@@ -64,6 +67,7 @@ pub struct ViewModel {
     events_rx: Receiver<UiEvent>,
     preview: PreviewCoordinator,
     actions: ActionController,
+    bindings: HashMap<KeyChord, String>,
 }
 
 pub(crate) enum ViewModelEvent {
@@ -95,13 +99,6 @@ pub struct SearchInputState {
     pub text: String,
     pub cursor_position: usize,
     pub selection: Option<Range<usize>>,
-}
-
-#[derive(Debug, Clone, Copy, Default)]
-pub struct KeyModifiers {
-    pub ctrl: bool,
-    pub shift: bool,
-    pub alt: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -146,6 +143,20 @@ impl ViewModel {
         action_service: ActionService,
         preview_visible: bool,
     ) -> Arc<Self> {
+        Self::new_with_services_and_bindings(
+            preview_service,
+            action_service,
+            HashMap::new(),
+            preview_visible,
+        )
+    }
+
+    pub fn new_with_services_and_bindings(
+        preview_service: PreviewService,
+        action_service: ActionService,
+        bindings: HashMap<KeyChord, String>,
+        preview_visible: bool,
+    ) -> Arc<Self> {
         let (events_tx, events_rx) = unbounded();
         let (internal_events_tx, internal_events_rx) = unbounded();
         let (search_update_tx, search_update_rx) = unbounded();
@@ -178,6 +189,7 @@ impl ViewModel {
             events_rx,
             preview,
             actions,
+            bindings,
         });
 
         this.spawn_event_thread(internal_events_rx);
@@ -383,6 +395,16 @@ impl ViewModel {
             InputCommand::PreviewPageDown => self.page_preview(1),
             InputCommand::TogglePreview => self.toggle_preview(),
         }
+    }
+
+    pub fn handle_key(&self, chord: KeyChord, repeat: bool) -> bool {
+        let Some(action) = self.bindings.get(&chord) else {
+            return false;
+        };
+        if !repeat {
+            self.invoke_action(action);
+        }
+        true
     }
 
     pub fn invoke_action(&self, name: &str) {

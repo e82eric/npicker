@@ -5,6 +5,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use crossbeam_channel::bounded;
 use rust_nfm::action::{ActionConfig, ActionResolverDefinition, ActionService};
+use rust_nfm::key_binding::{parse_key_chord, KeyChord, KeyModifiers, KeyName};
 use rust_nfm::preview::{PreviewConfig, PreviewOutputType, PreviewService};
 use rust_nfm::request::{
     DelimitedInputOptions, DelimitedStdinRequest, DelimitedTextSelector, DelimitedValueSelector,
@@ -97,9 +98,11 @@ fn main() -> Result<()> {
             })
             .collect(),
     };
-    let view_model = ViewModel::new_with_services(
+    let bindings = options.bindings;
+    let view_model = ViewModel::new_with_services_and_bindings(
         PreviewService::new(preview_config),
         ActionService::new(action_config),
+        bindings,
         preview_visible,
     );
     let (completion_tx, completion_rx) = bounded(1);
@@ -118,7 +121,6 @@ fn main() -> Result<()> {
         Some(completion_rx),
         preview_enabled,
         preview_visible,
-        options.bindings,
     )?;
     if code != 0 {
         std::process::exit(code);
@@ -145,7 +147,10 @@ fn install_accept_action(options: &mut AppOptions) -> Result<()> {
     );
     options
         .bindings
-        .entry("enter".into())
+        .entry(KeyChord {
+            key: KeyName::Enter,
+            modifiers: KeyModifiers::default(),
+        })
         .or_insert_with(|| ACCEPT_ACTION_NAME.into());
     Ok(())
 }
@@ -324,7 +329,7 @@ struct AppOptions {
     accept_resolver_program: Option<String>,
     accept_resolver_arguments: Vec<String>,
     actions: HashMap<String, ActionResolverOptions>,
-    bindings: HashMap<String, String>,
+    bindings: HashMap<KeyChord, String>,
 }
 
 #[derive(Default)]
@@ -524,7 +529,7 @@ fn app_options() -> AppOptions {
             }
             "--bind" => {
                 if let (Some(chord), Some(action)) = (args.next(), args.next()) {
-                    if let Some(chord) = skia_ui::normalize_key_binding(&chord) {
+                    if let Some(chord) = parse_key_chord(&chord) {
                         options.bindings.insert(chord, action);
                     } else {
                         eprintln!("invalid key binding: {chord}");

@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::num::NonZeroU32;
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::Arc;
@@ -18,6 +17,7 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy}
 use winit::keyboard::{Key, NamedKey};
 use winit::window::{Window, WindowAttributes, WindowId, WindowLevel};
 
+use crate::key_binding::{KeyChord, KeyName};
 use crate::preview::{NativeWindowId, PreviewLine, PreviewUpdate};
 use crate::preview_document::PreviewStyle;
 use crate::view_model::{InputCommand, KeyModifiers, PreviewView, UiCounters, UiEvent, ViewModel};
@@ -71,7 +71,6 @@ pub fn run(
     completion: Option<Receiver<i32>>,
     preview_available: bool,
     preview_visible: bool,
-    bindings: HashMap<String, String>,
 ) -> Result<i32> {
     let mut builder = EventLoop::<AppEvent>::with_user_event();
     #[cfg(windows)]
@@ -87,7 +86,7 @@ pub fn run(
         forward_completion(completion, proxy.clone());
     }
 
-    let mut app = PickerApp::new(view_model, preview_available, preview_visible, bindings)?;
+    let mut app = PickerApp::new(view_model, preview_available, preview_visible)?;
     event_loop.run_app(&mut app)?;
     Ok(app.exit_code)
 }
@@ -1057,7 +1056,6 @@ struct PickerApp {
     input_ready_at: Instant,
     visible: bool,
     preview_available: bool,
-    bindings: HashMap<String, String>,
     exit_code: i32,
     pending_native_preview: Option<NativeWindowId>,
     #[cfg(windows)]
@@ -1069,7 +1067,6 @@ impl PickerApp {
         view_model: Arc<ViewModel>,
         preview_available: bool,
         preview_visible: bool,
-        bindings: HashMap<String, String>,
     ) -> Result<Self> {
         Ok(Self {
             renderer: WindowState::new(
@@ -1087,7 +1084,6 @@ impl PickerApp {
             input_ready_at: Instant::now(),
             visible: false,
             preview_available,
-            bindings,
             exit_code: 0,
             pending_native_preview: None,
             #[cfg(windows)]
@@ -1255,15 +1251,12 @@ impl PickerApp {
             return;
         }
         let modifiers = key_modifiers(self.modifiers);
-        if !event.repeat {
-            if let Some(chord) = event_key_chord(&event.logical_key, modifiers) {
-                if let Some(action) = self.bindings.get(&chord) {
-                    self.view_model.invoke_action(action);
-                    if let Some(window) = &self.window {
-                        window.request_redraw();
-                    }
-                    return;
+        if let Some(chord) = event_key_chord(&event.logical_key, modifiers) {
+            if self.view_model.handle_key(chord, event.repeat) {
+                if let Some(window) = &self.window {
+                    window.request_redraw();
                 }
+                return;
             }
         }
         let command = match &event.logical_key {
@@ -1331,82 +1324,31 @@ impl PickerApp {
     }
 }
 
-pub fn normalize_key_binding(value: &str) -> Option<String> {
-    let mut ctrl = false;
-    let mut alt = false;
-    let mut shift = false;
-    let mut key = None;
-    for part in value
-        .split('+')
-        .map(str::trim)
-        .filter(|part| !part.is_empty())
-    {
-        match part.to_ascii_lowercase().as_str() {
-            "ctrl" | "control" => ctrl = true,
-            "alt" => alt = true,
-            "shift" => shift = true,
-            value if key.is_none() => key = normalize_key_name(value),
-            _ => return None,
-        }
-    }
-    format_key_chord(ctrl, alt, shift, key?)
-}
-
-fn event_key_chord(key: &Key, modifiers: KeyModifiers) -> Option<String> {
+fn event_key_chord(key: &Key, modifiers: KeyModifiers) -> Option<KeyChord> {
     let key = match key {
-        Key::Character(value) if value.chars().count() == 1 => value.to_ascii_lowercase(),
-        Key::Named(key) => named_key_name(*key)?.to_string(),
+        Key::Character(value) if value.chars().count() == 1 => {
+            KeyName::Character(value.chars().next()?.to_ascii_lowercase())
+        }
+        Key::Named(key) => named_key_name(*key)?,
         _ => return None,
     };
-    format_key_chord(modifiers.ctrl, modifiers.alt, modifiers.shift, key)
+    Some(KeyChord { key, modifiers })
 }
 
-fn format_key_chord(ctrl: bool, alt: bool, shift: bool, key: String) -> Option<String> {
-    let mut parts = Vec::new();
-    if ctrl {
-        parts.push("ctrl");
-    }
-    if alt {
-        parts.push("alt");
-    }
-    if shift {
-        parts.push("shift");
-    }
-    parts.push(&key);
-    Some(parts.join("+"))
-}
-
-fn normalize_key_name(value: &str) -> Option<String> {
-    let value = match value {
-        "arrowup" | "up" => "up",
-        "arrowdown" | "down" => "down",
-        "arrowleft" | "left" => "left",
-        "arrowright" | "right" => "right",
-        "pgup" | "pageup" => "pageup",
-        "pgdown" | "pagedown" => "pagedown",
-        "esc" | "escape" => "escape",
-        "return" | "enter" => "enter",
-        "backspace" | "delete" | "home" | "end" => value,
-        value if value.chars().count() == 1 => value,
-        _ => return None,
-    };
-    Some(value.to_string())
-}
-
-fn named_key_name(key: NamedKey) -> Option<&'static str> {
+fn named_key_name(key: NamedKey) -> Option<KeyName> {
     match key {
-        NamedKey::Enter => Some("enter"),
-        NamedKey::Escape => Some("escape"),
-        NamedKey::ArrowUp => Some("up"),
-        NamedKey::ArrowDown => Some("down"),
-        NamedKey::ArrowLeft => Some("left"),
-        NamedKey::ArrowRight => Some("right"),
-        NamedKey::Home => Some("home"),
-        NamedKey::End => Some("end"),
-        NamedKey::Backspace => Some("backspace"),
-        NamedKey::Delete => Some("delete"),
-        NamedKey::PageUp => Some("pageup"),
-        NamedKey::PageDown => Some("pagedown"),
+        NamedKey::Enter => Some(KeyName::Enter),
+        NamedKey::Escape => Some(KeyName::Escape),
+        NamedKey::ArrowUp => Some(KeyName::Up),
+        NamedKey::ArrowDown => Some(KeyName::Down),
+        NamedKey::ArrowLeft => Some(KeyName::Left),
+        NamedKey::ArrowRight => Some(KeyName::Right),
+        NamedKey::Home => Some(KeyName::Home),
+        NamedKey::End => Some(KeyName::End),
+        NamedKey::Backspace => Some(KeyName::Backspace),
+        NamedKey::Delete => Some(KeyName::Delete),
+        NamedKey::PageUp => Some(KeyName::PageUp),
+        NamedKey::PageDown => Some(KeyName::PageDown),
         _ => None,
     }
 }
@@ -1804,20 +1746,7 @@ fn skia_color(value: u32) -> Color {
 mod tests {
     #[cfg(windows)]
     use super::fit_thumbnail_rect;
-    use super::{calculate_layout, copy_bgra_to_softbuffer, normalize_key_binding, Rect};
-
-    #[test]
-    fn normalizes_configured_key_chords() {
-        assert_eq!(
-            normalize_key_binding("Alt+ArrowUp").as_deref(),
-            Some("alt+up")
-        );
-        assert_eq!(
-            normalize_key_binding("shift+ctrl+P").as_deref(),
-            Some("ctrl+shift+p")
-        );
-        assert_eq!(normalize_key_binding("ctrl+unknown"), None);
-    }
+    use super::{calculate_layout, copy_bgra_to_softbuffer, Rect};
 
     #[test]
     fn pixel_copy_converts_bgra_and_honors_row_stride() {
