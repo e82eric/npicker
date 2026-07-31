@@ -70,15 +70,16 @@ Pass one or more roots after `filewalker` to scan different directories.
 
 An accept resolver can decide whether Enter completes NFM or transitions the
 same window to a new filewalker picker. The resolver is an executable followed
-by repeatable `--accept-resolver-arg` arguments. It receives
-`NFM_ACCEPT_ITEM`, `NFM_ACCEPT_VALUE`, and `NFM_ACCEPT_LINE`:
+by repeatable `--accept-resolver-arg` arguments. This is compatibility syntax
+for a generated action resolver bound to Enter, and it receives the same
+`NFM_ACTION_STATE` JSON document as other actions:
 
 ```powershell
 nfm-rust-win32host filewalker `
     --accept-resolver pwsh `
     --accept-resolver-arg '-NoProfile' `
     --accept-resolver-arg '-Command' `
-    --accept-resolver-arg 'if (Test-Path -LiteralPath $env:NFM_ACCEPT_ITEM -PathType Container) { @{ action = "picker"; picker = @{ kind = "filewalker"; roots = @("{item}") } } | ConvertTo-Json -Compress } else { @{ action = "complete" } | ConvertTo-Json -Compress }'
+    --accept-resolver-arg '$state = $env:NFM_ACTION_STATE | ConvertFrom-Json; if (Test-Path -LiteralPath $state.selection.item -PathType Container) { @{ action = "picker"; picker = @{ kind = "filewalker"; roots = @("{item}") } } | ConvertTo-Json -Compress } else { @{ action = "complete" } | ConvertTo-Json -Compress }'
 ```
 
 The resolver must write exactly one JSON object to stdout:
@@ -96,6 +97,62 @@ or:
 For now, NFM expands a root only when its entire value is exactly `{item}`.
 Literal roots are also supported. A filewalker transition keeps the original
 output request open, and Escape cancels the whole NFM session.
+
+Named action resolvers can be assigned to key chords. Each invocation receives
+one JSON document in `NFM_ACTION_STATE`, containing the current selection,
+picker context, and query. This example binds Alt+Up to the parent of the
+current filewalker root:
+
+```powershell
+nfm-rust-win32host filewalker G:\src `
+    --action parent action-resolver `
+    --action-program parent pwsh `
+    --action-arg parent '-NoProfile' `
+    --action-arg parent '-Command' `
+    --action-arg parent '$state = $env:NFM_ACTION_STATE | ConvertFrom-Json; $roots = @($state.picker.roots); $parent = if ($roots.Count -eq 1) { Split-Path -Parent $roots[0] }; if ([string]::IsNullOrEmpty($parent)) { @{ action = "none" } | ConvertTo-Json -Compress } else { @{ action = "picker"; picker = @{ kind = "filewalker"; roots = @($parent) } } | ConvertTo-Json -Compress -Depth 4 }' `
+    --bind alt+up parent
+```
+
+The state has this shape:
+
+```json
+{
+  "selection": {
+    "item": "G:\\src\\project",
+    "value": "G:\\src\\project",
+    "line": null
+  },
+  "picker": {
+    "kind": "filewalker",
+    "roots": ["G:\\src"]
+  },
+  "query": "project"
+}
+```
+
+An action resolver currently returns either:
+
+```json
+{"action":"none"}
+```
+
+to make no change,
+
+```json
+{"action":"complete"}
+```
+
+to complete with the selection captured when the resolver started, or:
+
+```json
+{"action":"picker","picker":{"kind":"filewalker","roots":["G:\\src"]}}
+```
+
+`--action`, `--action-program`, and repeatable `--action-arg` options define a
+named resolver. Repeatable `--bind <chord> <action>` options reference those
+names. Supported chord names include characters, arrows, Enter, Escape, Home,
+End, Delete, Backspace, PageUp, and PageDown with Ctrl, Alt, and Shift
+modifiers. User bindings override built-in handling for the same chord.
 
 On Windows, list the visible Alt-Tab application windows:
 

@@ -8,6 +8,7 @@ use std::io::{BufRead, BufReader, Read};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
+use crate::action::PickerState;
 #[cfg(windows)]
 use crate::list_windows::{WindowListItem, WindowPayload};
 #[cfg(windows)]
@@ -20,6 +21,7 @@ pub trait PickerRequest {
 
     fn search_string(&self) -> Option<&str>;
     fn run(&self) -> Arc<SharedStore>;
+    fn picker_state(&self) -> PickerState;
 }
 
 #[cfg(windows)]
@@ -57,6 +59,12 @@ impl PickerRequest for FileSystemPickerRequest {
         );
         shared
     }
+
+    fn picker_state(&self) -> PickerState {
+        PickerState::Filewalker {
+            roots: self.root_directories.clone(),
+        }
+    }
 }
 
 pub struct FlatItemsPickerRequest {
@@ -78,6 +86,10 @@ impl PickerRequest for FlatItemsPickerRequest {
         Arc::new(SharedStore::completed(Arc::new(AnyItemSource::Flat(
             snapshot,
         ))))
+    }
+
+    fn picker_state(&self) -> PickerState {
+        PickerState::Stdin
     }
 }
 
@@ -102,6 +114,10 @@ impl PickerRequest for WindowListPickerRequest {
         Arc::new(SharedStore::completed(Arc::new(AnyItemSource::Windows(
             snapshot,
         ))))
+    }
+
+    fn picker_state(&self) -> PickerState {
+        PickerState::Windows
     }
 }
 
@@ -212,6 +228,10 @@ impl PickerRequest for DelimitedStdinRequest {
         self.spawn_reader();
         Arc::clone(&self.shared_store)
     }
+
+    fn picker_state(&self) -> PickerState {
+        PickerState::DelimitedStdin
+    }
 }
 
 impl StdinRequest {
@@ -272,6 +292,10 @@ impl PickerRequest for StdinRequest {
     fn run(&self) -> Arc<SharedStore> {
         self.spawn_reader();
         Arc::clone(&self.shared_store)
+    }
+
+    fn picker_state(&self) -> PickerState {
+        PickerState::Stdin
     }
 }
 

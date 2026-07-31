@@ -161,7 +161,9 @@ fn ensure_initialized() -> Arc<ViewModel> {
         let view_model = ViewModel::new(crate::preview::PreviewService::default());
         let ui_view_model = Arc::clone(&view_model);
         std::thread::spawn(move || {
-            if let Err(error) = picker_ui::run(ui_view_model, None, false, false) {
+            if let Err(error) =
+                picker_ui::run(ui_view_model, None, false, false, Default::default())
+            {
                 eprintln!("RustNfm UI stopped: {error:?}");
             }
         });

@@ -3,7 +3,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-use crate::accept::{AcceptController, AcceptEvent, AcceptResolution, AcceptService, AcceptTarget};
+use crate::action::{
+    ActionController, ActionEvent, ActionResolution, ActionSelection, ActionService, ActionState,
+    PickerState,
+};
 use crate::preview::{
     NativeWindowId, PreviewCoordinator, PreviewEvent, PreviewService, PreviewUpdate,
 };
@@ -60,12 +63,12 @@ pub struct ViewModel {
     events_tx: Sender<UiEvent>,
     events_rx: Receiver<UiEvent>,
     preview: PreviewCoordinator,
-    accept: AcceptController,
+    actions: ActionController,
 }
 
 pub(crate) enum ViewModelEvent {
     Preview(PreviewEvent),
-    Accept(AcceptEvent),
+    Action(ActionEvent),
 }
 
 struct State {
@@ -84,7 +87,7 @@ struct State {
     preview_truncated: bool,
     preview_update: Option<PreviewUpdate>,
     preview_visible: bool,
-    accept_generation: Option<u64>,
+    action_generation: Option<u64>,
 }
 
 #[derive(Clone)]
@@ -123,30 +126,31 @@ struct ActiveRequest {
     response_tx: Sender<PickerResponse>,
     search_session: FuzzySearchSession<AnyItemSource, SharedStore>,
     store: Arc<SharedStore>,
+    picker_state: PickerState,
 }
 
 impl ViewModel {
     pub fn new(preview_service: PreviewService) -> Arc<Self> {
-        Self::new_with_services(preview_service, AcceptService::default(), true)
+        Self::new_with_services(preview_service, ActionService::default(), true)
     }
 
     pub fn new_with_preview_visibility(
         preview_service: PreviewService,
         preview_visible: bool,
     ) -> Arc<Self> {
-        Self::new_with_services(preview_service, AcceptService::default(), preview_visible)
+        Self::new_with_services(preview_service, ActionService::default(), preview_visible)
     }
 
     pub fn new_with_services(
         preview_service: PreviewService,
-        accept_service: AcceptService,
+        action_service: ActionService,
         preview_visible: bool,
     ) -> Arc<Self> {
         let (events_tx, events_rx) = unbounded();
         let (internal_events_tx, internal_events_rx) = unbounded();
         let (search_update_tx, search_update_rx) = unbounded();
         let preview = preview_service.into_coordinator(internal_events_tx.clone());
-        let accept = accept_service.into_controller(internal_events_tx.clone());
+        let actions = action_service.into_controller(internal_events_tx.clone());
 
         let this = Arc::new(Self {
             state: Mutex::new(State {
@@ -165,7 +169,7 @@ impl ViewModel {
                 preview_truncated: false,
                 preview_update: None,
                 preview_visible,
-                accept_generation: None,
+                action_generation: None,
             }),
             request_generation: AtomicU64::new(0),
             search_update_tx,
@@ -173,7 +177,7 @@ impl ViewModel {
             events_tx,
             events_rx,
             preview,
-            accept,
+            actions,
         });
 
         this.spawn_event_thread(internal_events_rx);
@@ -190,7 +194,7 @@ impl ViewModel {
                 };
                 match event {
                     ViewModelEvent::Preview(event) => view_model.handle_preview_event(event),
-                    ViewModelEvent::Accept(event) => view_model.handle_accept_event(event),
+                    ViewModelEvent::Action(event) => view_model.handle_action_event(event),
                 }
             }
         });
@@ -209,18 +213,22 @@ impl ViewModel {
         });
     }
 
-    fn handle_accept_event(&self, event: AcceptEvent) {
+    fn handle_action_event(&self, event: ActionEvent) {
         {
             let mut state = self.state.lock().expect("view model poisoned");
-            if state.accept_generation != Some(event.generation) {
+            if state.action_generation != Some(event.generation) {
                 return;
             }
-            state.accept_generation = None;
+            state.action_generation = None;
         }
         match event.result {
-            Ok(AcceptResolution::Complete) => self.complete_accept(event.target.value),
-            Ok(AcceptResolution::FileWalker { roots }) => self.transition_to_filewalker(roots),
-            Err(message) => eprintln!("accept resolver error: {message}"),
+            Ok(ActionResolution::None) => {}
+            Ok(ActionResolution::Complete) => match event.state.selection {
+                Some(selection) => self.complete_accept(selection.value),
+                None => eprintln!("action resolver cannot complete without a selection"),
+            },
+            Ok(ActionResolution::FileWalker { roots }) => self.transition_to_filewalker(roots),
+            Err(message) => eprintln!("action resolver error: {message}"),
         }
     }
 
@@ -276,12 +284,13 @@ impl ViewModel {
             state.cursor_selection_anchor = None;
             state.cursor_position = cursor_position;
             state.viewport_start = 0;
-            state.accept_generation = None;
+            state.action_generation = None;
             state.active = Some(ActiveRequest {
                 id: request_id,
                 response_tx,
                 search_session: session.clone(),
                 store: Arc::clone(&store),
+                picker_state: request.picker_state(),
             });
         }
         self.clear_preview_selection();
@@ -374,6 +383,59 @@ impl ViewModel {
             InputCommand::PreviewPageDown => self.page_preview(1),
             InputCommand::TogglePreview => self.toggle_preview(),
         }
+    }
+
+    pub fn invoke_action(&self, name: &str) {
+        if !self.actions.contains(name) {
+            eprintln!("unknown action: {name}");
+            return;
+        }
+        let (generation, action_state) = {
+            let mut state = self.state.lock().expect("view model poisoned");
+            if state.action_generation.is_some() {
+                return;
+            }
+            let Some(active) = state.active.as_ref() else {
+                return;
+            };
+            let selection = state.results.get(state.selected).map(|result| {
+                let metadata = active
+                    .store
+                    .snapshot()
+                    .and_then(|source| source.delimited_metadata(result.node_index));
+                match metadata {
+                    Some(metadata) => ActionSelection {
+                        item: metadata
+                            .preview_item
+                            .clone()
+                            .unwrap_or_else(|| metadata.value.clone()),
+                        value: metadata.value,
+                        line: metadata.preview_center_line,
+                    },
+                    None => ActionSelection {
+                        item: result.path.clone(),
+                        value: result.path.clone(),
+                        line: None,
+                    },
+                }
+            });
+            let picker = active.picker_state.clone();
+            let query = state.search_text.clone();
+            let generation = self
+                .actions
+                .reserve(name)
+                .expect("action was checked before locking state");
+            state.action_generation = Some(generation);
+            (
+                generation,
+                ActionState {
+                    selection,
+                    picker,
+                    query,
+                },
+            )
+        };
+        self.actions.request(name, generation, action_state);
     }
 
     fn toggle_preview(&self) {
@@ -707,51 +769,6 @@ impl ViewModel {
     }
 
     pub fn select_current(&self) {
-        if self.accept.resolves_accept() {
-            let target = {
-                let state = self.state.lock().expect("view model poisoned");
-                if state.accept_generation.is_some() {
-                    return;
-                }
-                let Some(active) = state.active.as_ref() else {
-                    return;
-                };
-                let Some(result) = state.results.get(state.selected) else {
-                    drop(state);
-                    self.complete_cancelled();
-                    return;
-                };
-                let metadata = active
-                    .store
-                    .snapshot()
-                    .and_then(|source| source.delimited_metadata(result.node_index));
-                Some(match metadata {
-                    Some(metadata) => AcceptTarget {
-                        item: metadata
-                            .preview_item
-                            .clone()
-                            .unwrap_or_else(|| metadata.value.clone()),
-                        value: metadata.value,
-                        center_line: metadata.preview_center_line,
-                    },
-                    None => AcceptTarget {
-                        item: result.path.clone(),
-                        value: result.path.clone(),
-                        center_line: None,
-                    },
-                })
-            };
-            if let Some(target) = target {
-                let generation = self.accept.reserve();
-                self.state
-                    .lock()
-                    .expect("view model poisoned")
-                    .accept_generation = Some(generation);
-                self.accept.request(generation, target);
-            }
-            return;
-        }
-
         let value = {
             let state = self.state.lock().expect("view model poisoned");
             let Some(active) = state.active.as_ref() else {
@@ -810,7 +827,7 @@ impl ViewModel {
     }
 
     pub fn cancel(&self) {
-        self.accept.cancel();
+        self.actions.cancel();
         self.complete_cancelled();
     }
 
@@ -849,6 +866,9 @@ impl ViewModel {
                 response_tx: active.response_tx,
                 search_session: session.clone(),
                 store,
+                picker_state: PickerState::Filewalker {
+                    roots: request.root_directories,
+                },
             });
             old_session
         };
@@ -859,7 +879,7 @@ impl ViewModel {
 
     #[cfg(not(windows))]
     fn transition_to_filewalker(&self, _roots: Vec<String>) {
-        eprintln!("accept resolver requested filewalker, which is only available on Windows");
+        eprintln!("action requested filewalker, which is only available on Windows");
     }
 
     #[allow(dead_code)]

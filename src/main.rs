@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use crossbeam_channel::bounded;
-use rust_nfm::accept::{AcceptConfig, AcceptService};
+use rust_nfm::action::{ActionConfig, ActionResolverDefinition, ActionService};
 use rust_nfm::preview::{PreviewConfig, PreviewOutputType, PreviewService};
 use rust_nfm::request::{
     DelimitedInputOptions, DelimitedStdinRequest, DelimitedTextSelector, DelimitedValueSelector,
@@ -31,7 +31,9 @@ fn output_timing(line: &str) {
 }
 
 fn main() -> Result<()> {
-    let options = app_options();
+    let mut options = app_options();
+    install_accept_action(&mut options)?;
+    validate_action_options(&options)?;
     if options.debug_wait {
         debug_wait();
     }
@@ -78,16 +80,26 @@ fn main() -> Result<()> {
         },
     };
     let preview_visible = preview_enabled && options.preview_visible;
-    let accept_config = match options.accept_resolver_program {
-        Some(program) => AcceptConfig::Resolver {
-            program: program.into(),
-            arguments: options.accept_resolver_arguments,
-        },
-        None => AcceptConfig::Complete,
+    let action_config = ActionConfig {
+        resolvers: options
+            .actions
+            .into_iter()
+            .filter_map(|(name, action)| {
+                action.program.map(|program| {
+                    (
+                        name,
+                        ActionResolverDefinition {
+                            program: program.into(),
+                            arguments: action.arguments,
+                        },
+                    )
+                })
+            })
+            .collect(),
     };
     let view_model = ViewModel::new_with_services(
         PreviewService::new(preview_config),
-        AcceptService::new(accept_config),
+        ActionService::new(action_config),
         preview_visible,
     );
     let (completion_tx, completion_rx) = bounded(1);
@@ -106,9 +118,51 @@ fn main() -> Result<()> {
         Some(completion_rx),
         preview_enabled,
         preview_visible,
+        options.bindings,
     )?;
     if code != 0 {
         std::process::exit(code);
+    }
+    Ok(())
+}
+
+const ACCEPT_ACTION_NAME: &str = "__nfm_accept";
+
+fn install_accept_action(options: &mut AppOptions) -> Result<()> {
+    let Some(program) = options.accept_resolver_program.take() else {
+        return Ok(());
+    };
+    if options.actions.contains_key(ACCEPT_ACTION_NAME) {
+        anyhow::bail!("action name '{ACCEPT_ACTION_NAME}' is reserved");
+    }
+    options.actions.insert(
+        ACCEPT_ACTION_NAME.into(),
+        ActionResolverOptions {
+            declared: true,
+            program: Some(program),
+            arguments: std::mem::take(&mut options.accept_resolver_arguments),
+        },
+    );
+    options
+        .bindings
+        .entry("enter".into())
+        .or_insert_with(|| ACCEPT_ACTION_NAME.into());
+    Ok(())
+}
+
+fn validate_action_options(options: &AppOptions) -> Result<()> {
+    for (name, action) in &options.actions {
+        if !action.declared {
+            anyhow::bail!("action '{name}' is missing --action {name} action-resolver");
+        }
+        if action.program.is_none() {
+            anyhow::bail!("action '{name}' is missing --action-program");
+        }
+    }
+    for action in options.bindings.values() {
+        if !options.actions.contains_key(action) {
+            anyhow::bail!("key binding references undefined action: {action}");
+        }
     }
     Ok(())
 }
@@ -269,6 +323,8 @@ struct AppOptions {
     window_preview: bool,
     accept_resolver_program: Option<String>,
     accept_resolver_arguments: Vec<String>,
+    actions: HashMap<String, ActionResolverOptions>,
+    bindings: HashMap<String, String>,
 }
 
 #[derive(Default)]
@@ -277,6 +333,13 @@ struct PreviewProfileOptions {
     arguments: Vec<String>,
     working_directory: Option<std::path::PathBuf>,
     output_type: PreviewOutputType,
+}
+
+#[derive(Default)]
+struct ActionResolverOptions {
+    declared: bool,
+    program: Option<String>,
+    arguments: Vec<String>,
 }
 
 fn app_options() -> AppOptions {
@@ -295,6 +358,8 @@ fn app_options() -> AppOptions {
         window_preview: false,
         accept_resolver_program: None,
         accept_resolver_arguments: Vec::new(),
+        actions: HashMap::new(),
+        bindings: HashMap::new(),
     };
     let mut filewalker = false;
     let mut list_windows = false;
@@ -425,6 +490,47 @@ fn app_options() -> AppOptions {
                     options.accept_resolver_arguments.push(argument);
                 } else {
                     eprintln!("--accept-resolver-arg requires a value");
+                }
+            }
+            "--action" => {
+                if let (Some(name), Some(kind)) = (args.next(), args.next()) {
+                    if kind == "action-resolver" {
+                        options.actions.entry(name).or_default().declared = true;
+                    } else {
+                        eprintln!("unsupported action type: {kind}");
+                    }
+                } else {
+                    eprintln!("--action requires a name and action-resolver");
+                }
+            }
+            "--action-program" => {
+                if let (Some(name), Some(program)) = (args.next(), args.next()) {
+                    options.actions.entry(name).or_default().program = Some(program);
+                } else {
+                    eprintln!("--action-program requires an action name and executable");
+                }
+            }
+            "--action-arg" => {
+                if let (Some(name), Some(argument)) = (args.next(), args.next()) {
+                    options
+                        .actions
+                        .entry(name)
+                        .or_default()
+                        .arguments
+                        .push(argument);
+                } else {
+                    eprintln!("--action-arg requires an action name and argument");
+                }
+            }
+            "--bind" => {
+                if let (Some(chord), Some(action)) = (args.next(), args.next()) {
+                    if let Some(chord) = skia_ui::normalize_key_binding(&chord) {
+                        options.bindings.insert(chord, action);
+                    } else {
+                        eprintln!("invalid key binding: {chord}");
+                    }
+                } else {
+                    eprintln!("--bind requires a key chord and action name");
                 }
             }
             "--delimiter" if !filewalker => {
