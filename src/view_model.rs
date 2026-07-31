@@ -3,9 +3,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
+use crate::accept::{AcceptController, AcceptEvent, AcceptResolution, AcceptService, AcceptTarget};
 use crate::preview::{
     NativeWindowId, PreviewCoordinator, PreviewEvent, PreviewService, PreviewUpdate,
 };
+#[cfg(windows)]
+use crate::request::FileSystemPickerRequest;
 use crate::request::{PickerRequest, PickerResponse};
 use crate::source_store::{AnyItemSource, SharedStore};
 use anyhow::{bail, Result};
@@ -57,6 +60,12 @@ pub struct ViewModel {
     events_tx: Sender<UiEvent>,
     events_rx: Receiver<UiEvent>,
     preview: PreviewCoordinator,
+    accept: AcceptController,
+}
+
+pub(crate) enum ViewModelEvent {
+    Preview(PreviewEvent),
+    Accept(AcceptEvent),
 }
 
 struct State {
@@ -75,6 +84,7 @@ struct State {
     preview_truncated: bool,
     preview_update: Option<PreviewUpdate>,
     preview_visible: bool,
+    accept_generation: Option<u64>,
 }
 
 #[derive(Clone)]
@@ -117,16 +127,26 @@ struct ActiveRequest {
 
 impl ViewModel {
     pub fn new(preview_service: PreviewService) -> Arc<Self> {
-        Self::new_with_preview_visibility(preview_service, true)
+        Self::new_with_services(preview_service, AcceptService::default(), true)
     }
 
     pub fn new_with_preview_visibility(
         preview_service: PreviewService,
         preview_visible: bool,
     ) -> Arc<Self> {
+        Self::new_with_services(preview_service, AcceptService::default(), preview_visible)
+    }
+
+    pub fn new_with_services(
+        preview_service: PreviewService,
+        accept_service: AcceptService,
+        preview_visible: bool,
+    ) -> Arc<Self> {
         let (events_tx, events_rx) = unbounded();
+        let (internal_events_tx, internal_events_rx) = unbounded();
         let (search_update_tx, search_update_rx) = unbounded();
-        let (preview, preview_events) = preview_service.into_parts();
+        let preview = preview_service.into_coordinator(internal_events_tx.clone());
+        let accept = accept_service.into_controller(internal_events_tx.clone());
 
         let this = Arc::new(Self {
             state: Mutex::new(State {
@@ -145,6 +165,7 @@ impl ViewModel {
                 preview_truncated: false,
                 preview_update: None,
                 preview_visible,
+                accept_generation: None,
             }),
             request_generation: AtomicU64::new(0),
             search_update_tx,
@@ -152,23 +173,55 @@ impl ViewModel {
             events_tx,
             events_rx,
             preview,
+            accept,
         });
 
-        this.spawn_preview_event_thread(preview_events);
+        this.spawn_event_thread(internal_events_rx);
         this.spawn_search_update_thread();
         this
     }
 
-    fn spawn_preview_event_thread(self: &Arc<Self>, preview_events: Receiver<PreviewEvent>) {
+    fn spawn_event_thread(self: &Arc<Self>, events: Receiver<ViewModelEvent>) {
         let weak = Arc::downgrade(self);
         thread::spawn(move || {
-            while let Ok(event) = preview_events.recv() {
+            while let Ok(event) = events.recv() {
                 let Some(view_model) = weak.upgrade() else {
                     break;
                 };
-                view_model.handle_preview_event(event);
+                match event {
+                    ViewModelEvent::Preview(event) => view_model.handle_preview_event(event),
+                    ViewModelEvent::Accept(event) => view_model.handle_accept_event(event),
+                }
             }
         });
+    }
+
+    fn spawn_search_update_thread(self: &Arc<Self>) {
+        let weak = Arc::downgrade(self);
+        let updates = self.search_update_rx.clone();
+        thread::spawn(move || {
+            while let Ok(update) = updates.recv() {
+                let Some(view_model) = weak.upgrade() else {
+                    break;
+                };
+                view_model.apply_search_update(update);
+            }
+        });
+    }
+
+    fn handle_accept_event(&self, event: AcceptEvent) {
+        {
+            let mut state = self.state.lock().expect("view model poisoned");
+            if state.accept_generation != Some(event.generation) {
+                return;
+            }
+            state.accept_generation = None;
+        }
+        match event.result {
+            Ok(AcceptResolution::Complete) => self.complete_accept(event.target.value),
+            Ok(AcceptResolution::FileWalker { roots }) => self.transition_to_filewalker(roots),
+            Err(message) => eprintln!("accept resolver error: {message}"),
+        }
     }
 
     fn handle_preview_event(&self, event: PreviewEvent) {
@@ -181,17 +234,6 @@ impl ViewModel {
         if let Some(view) = view {
             let _ = self.events_tx.send(UiEvent::Preview(view));
         }
-    }
-
-    fn spawn_search_update_thread(self: &Arc<Self>) {
-        let this = Arc::clone(self);
-        let rx = this.search_update_rx.clone();
-
-        thread::spawn(move || {
-            while let Ok(event) = rx.recv() {
-                this.apply_search_update(event);
-            }
-        });
     }
 
     pub fn subscribe(&self) -> Receiver<UiEvent> {
@@ -234,6 +276,7 @@ impl ViewModel {
             state.cursor_selection_anchor = None;
             state.cursor_position = cursor_position;
             state.viewport_start = 0;
+            state.accept_generation = None;
             state.active = Some(ActiveRequest {
                 id: request_id,
                 response_tx,
@@ -664,22 +707,75 @@ impl ViewModel {
     }
 
     pub fn select_current(&self) {
+        if self.accept.resolves_accept() {
+            let target = {
+                let state = self.state.lock().expect("view model poisoned");
+                if state.accept_generation.is_some() {
+                    return;
+                }
+                let Some(active) = state.active.as_ref() else {
+                    return;
+                };
+                let Some(result) = state.results.get(state.selected) else {
+                    drop(state);
+                    self.complete_cancelled();
+                    return;
+                };
+                let metadata = active
+                    .store
+                    .snapshot()
+                    .and_then(|source| source.delimited_metadata(result.node_index));
+                Some(match metadata {
+                    Some(metadata) => AcceptTarget {
+                        item: metadata
+                            .preview_item
+                            .clone()
+                            .unwrap_or_else(|| metadata.value.clone()),
+                        value: metadata.value,
+                        center_line: metadata.preview_center_line,
+                    },
+                    None => AcceptTarget {
+                        item: result.path.clone(),
+                        value: result.path.clone(),
+                        center_line: None,
+                    },
+                })
+            };
+            if let Some(target) = target {
+                let generation = self.accept.reserve();
+                self.state
+                    .lock()
+                    .expect("view model poisoned")
+                    .accept_generation = Some(generation);
+                self.accept.request(generation, target);
+            }
+            return;
+        }
+
+        let value = {
+            let state = self.state.lock().expect("view model poisoned");
+            let Some(active) = state.active.as_ref() else {
+                return;
+            };
+            state.results.get(state.selected).map(|result| {
+                active
+                    .store
+                    .snapshot()
+                    .and_then(|source| source.delimited_metadata(result.node_index))
+                    .map_or_else(|| result.path.clone(), |metadata| metadata.value)
+            })
+        };
+        match value {
+            Some(value) => self.complete_accept(value),
+            None => self.complete_cancelled(),
+        }
+    }
+
+    fn complete_accept(&self, value: String) {
         let session_to_stop = {
             let mut state = self.state.lock().expect("view model poisoned");
             if let Some(active) = state.active.take() {
-                let response = state
-                    .results
-                    .get(state.selected)
-                    .map(|result| {
-                        let value = active
-                            .store
-                            .snapshot()
-                            .and_then(|source| source.delimited_metadata(result.node_index))
-                            .map_or_else(|| result.path.clone(), |metadata| metadata.value);
-                        PickerResponse::selected(value)
-                    })
-                    .unwrap_or_else(PickerResponse::cancelled);
-                let _ = active.response_tx.send(response);
+                let _ = active.response_tx.send(PickerResponse::selected(value));
                 Some(active.search_session)
             } else {
                 None
@@ -694,7 +790,7 @@ impl ViewModel {
         let _ = self.events_tx.send(UiEvent::Close);
     }
 
-    pub fn cancel(&self) {
+    fn complete_cancelled(&self) {
         let session_to_stop = {
             let mut state = self.state.lock().expect("view model poisoned");
             if let Some(active) = state.active.take() {
@@ -711,6 +807,59 @@ impl ViewModel {
 
         self.clear_preview_selection();
         let _ = self.events_tx.send(UiEvent::Close);
+    }
+
+    pub fn cancel(&self) {
+        self.accept.cancel();
+        self.complete_cancelled();
+    }
+
+    #[cfg(windows)]
+    fn transition_to_filewalker(&self, roots: Vec<String>) {
+        let request = FileSystemPickerRequest {
+            root_directories: roots,
+            max_depth: i32::MAX,
+            directories_only: false,
+            files_only: false,
+            search_string: None,
+        };
+        let store = request.run();
+        let request_id = self.request_generation.fetch_add(1, Ordering::AcqRel) + 1;
+        let session = FuzzySearchSession::new(
+            request_id,
+            Arc::clone(&store),
+            String::new(),
+            self.search_update_tx.clone(),
+        );
+        let old_session = {
+            let mut state = self.state.lock().expect("view model poisoned");
+            let Some(active) = state.active.take() else {
+                return;
+            };
+            let old_session = active.search_session;
+            state.search_text.clear();
+            state.results.clear();
+            state.counters = UiCounters::default();
+            state.selected = 0;
+            state.viewport_start = 0;
+            state.cursor_position = 0;
+            state.cursor_selection_anchor = None;
+            state.active = Some(ActiveRequest {
+                id: request_id,
+                response_tx: active.response_tx,
+                search_session: session.clone(),
+                store,
+            });
+            old_session
+        };
+        old_session.stop();
+        self.clear_preview_selection();
+        session.start();
+    }
+
+    #[cfg(not(windows))]
+    fn transition_to_filewalker(&self, _roots: Vec<String>) {
+        eprintln!("accept resolver requested filewalker, which is only available on Windows");
     }
 
     #[allow(dead_code)]

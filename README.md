@@ -68,6 +68,35 @@ nfm-rust-win32host filewalker
 
 Pass one or more roots after `filewalker` to scan different directories.
 
+An accept resolver can decide whether Enter completes NFM or transitions the
+same window to a new filewalker picker. The resolver is an executable followed
+by repeatable `--accept-resolver-arg` arguments. It receives
+`NFM_ACCEPT_ITEM`, `NFM_ACCEPT_VALUE`, and `NFM_ACCEPT_LINE`:
+
+```powershell
+nfm-rust-win32host filewalker `
+    --accept-resolver pwsh `
+    --accept-resolver-arg '-NoProfile' `
+    --accept-resolver-arg '-Command' `
+    --accept-resolver-arg 'if (Test-Path -LiteralPath $env:NFM_ACCEPT_ITEM -PathType Container) { @{ action = "picker"; picker = @{ kind = "filewalker"; roots = @("{item}") } } | ConvertTo-Json -Compress } else { @{ action = "complete" } | ConvertTo-Json -Compress }'
+```
+
+The resolver must write exactly one JSON object to stdout:
+
+```json
+{"action":"complete"}
+```
+
+or:
+
+```json
+{"action":"picker","picker":{"kind":"filewalker","roots":["{item}"]}}
+```
+
+For now, NFM expands a root only when its entire value is exactly `{item}`.
+Literal roots are also supported. A filewalker transition keeps the original
+output request open, and Escape cancels the whole NFM session.
+
 On Windows, list the visible Alt-Tab application windows:
 
 ```text

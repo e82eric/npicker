@@ -5,12 +5,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crossbeam_channel::{bounded, unbounded, Receiver, RecvTimeoutError, Sender};
+use crossbeam_channel::{bounded, RecvTimeoutError, Sender};
 use nfm_search_core::search::SearchResult;
 
 use crate::preview_document::PreviewDocument;
 pub use crate::preview_document::PreviewLine;
 use crate::source_store::AnyItemSource;
+use crate::view_model::ViewModelEvent;
 
 const OUTPUT_LIMIT: usize = 1024 * 1024;
 const IMAGE_OUTPUT_LIMIT: usize = 32 * 1024 * 1024;
@@ -62,11 +63,11 @@ struct OutputChunk {
 pub struct CommandPreviewController {
     mode: Arc<CommandPreviewMode>,
     generation: Arc<AtomicU64>,
-    events: Sender<PreviewEvent>,
+    events: Sender<ViewModelEvent>,
 }
 
 impl CommandPreviewController {
-    fn new(mode: CommandPreviewMode, events: Sender<PreviewEvent>) -> Self {
+    fn new(mode: CommandPreviewMode, events: Sender<ViewModelEvent>) -> Self {
         Self {
             mode: Arc::new(mode),
             generation: Arc::new(AtomicU64::new(0)),
@@ -158,9 +159,10 @@ impl CommandPreviewController {
     }
 
     fn publish_clear(&self, generation: u64) {
-        let _ = self
-            .events
-            .send(PreviewEvent::Command(PreviewUpdate::Clear { generation }));
+        send_preview(
+            &self.events,
+            PreviewEvent::Command(PreviewUpdate::Clear { generation }),
+        );
     }
 }
 
@@ -215,22 +217,16 @@ pub enum PreviewConfig {
 }
 
 pub struct PreviewService {
-    coordinator: PreviewCoordinator,
-    events: Receiver<PreviewEvent>,
+    config: PreviewConfig,
 }
 
 impl PreviewService {
     pub fn new(config: PreviewConfig) -> Self {
-        let (events_tx, events) = unbounded();
-        let backend = build_preview_backend(config, events_tx);
-        Self {
-            coordinator: PreviewCoordinator::new(backend),
-            events,
-        }
+        Self { config }
     }
 
-    pub fn into_parts(self) -> (PreviewCoordinator, Receiver<PreviewEvent>) {
-        (self.coordinator, self.events)
+    pub(crate) fn into_coordinator(self, events: Sender<ViewModelEvent>) -> PreviewCoordinator {
+        PreviewCoordinator::new(build_preview_backend(self.config, events))
     }
 }
 
@@ -273,7 +269,7 @@ impl PreviewCoordinator {
 
 fn build_preview_backend(
     config: PreviewConfig,
-    events: Sender<PreviewEvent>,
+    events: Sender<ViewModelEvent>,
 ) -> Box<dyn PreviewBackend> {
     match config {
         PreviewConfig::None => Box::new(NoPreviewBackend),
@@ -382,7 +378,7 @@ impl CommandPreviewBackend {
 }
 
 struct NativeWindowPreviewBackend {
-    events: Sender<PreviewEvent>,
+    events: Sender<ViewModelEvent>,
     selected: Mutex<Option<NativeWindowId>>,
 }
 
@@ -411,7 +407,7 @@ impl NativeWindowPreviewBackend {
         }
         *selected = window;
         drop(selected);
-        let _ = self.events.send(PreviewEvent::NativeWindow(window));
+        send_preview(&self.events, PreviewEvent::NativeWindow(window));
     }
 }
 
@@ -526,11 +522,18 @@ fn run_resolver(
     Ok(profile)
 }
 
-fn publish_error(events: &Sender<PreviewEvent>, generation: u64, message: String) {
-    let _ = events.send(PreviewEvent::Command(PreviewUpdate::Error {
-        generation,
-        message,
-    }));
+fn send_preview(events: &Sender<ViewModelEvent>, event: PreviewEvent) {
+    let _ = events.send(ViewModelEvent::Preview(event));
+}
+
+fn publish_error(events: &Sender<ViewModelEvent>, generation: u64, message: String) {
+    send_preview(
+        events,
+        PreviewEvent::Command(PreviewUpdate::Error {
+            generation,
+            message,
+        }),
+    );
 }
 
 fn run_process(
@@ -541,7 +544,7 @@ fn run_process(
     target: &CommandPreviewTarget,
     generation: u64,
     current_generation: Arc<AtomicU64>,
-    events: Sender<PreviewEvent>,
+    events: Sender<ViewModelEvent>,
 ) {
     let mut command = Command::new(program);
     command.args(
@@ -574,10 +577,13 @@ fn run_process(
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(error) => {
-            let _ = events.send(PreviewEvent::Command(PreviewUpdate::Error {
-                generation,
-                message: format!("preview failed to start: {error}"),
-            }));
+            send_preview(
+                &events,
+                PreviewEvent::Command(PreviewUpdate::Error {
+                    generation,
+                    message: format!("preview failed to start: {error}"),
+                }),
+            );
             return;
         }
     };
@@ -653,10 +659,13 @@ fn run_process(
                 }
                 Ok(None) => {}
                 Err(error) => {
-                    let _ = events.send(PreviewEvent::Command(PreviewUpdate::Error {
-                        generation,
-                        message: format!("preview process error: {error}"),
-                    }));
+                    send_preview(
+                        &events,
+                        PreviewEvent::Command(PreviewUpdate::Error {
+                            generation,
+                            message: format!("preview process error: {error}"),
+                        }),
+                    );
                     return;
                 }
             }
@@ -698,7 +707,7 @@ fn run_process(
             encoded: image_bytes.into(),
         },
     };
-    let _ = events.send(PreviewEvent::Command(update));
+    send_preview(&events, PreviewEvent::Command(update));
 }
 
 fn expand_preview_argument(argument: &str, target: &CommandPreviewTarget) -> String {
@@ -797,7 +806,9 @@ mod tests {
             events,
         );
 
-        let PreviewEvent::Command(update) = receiver.recv().expect("preview update") else {
+        let ViewModelEvent::Preview(PreviewEvent::Command(update)) =
+            receiver.recv().expect("preview update")
+        else {
             panic!("expected command preview event");
         };
         let PreviewUpdate::Ready {
@@ -904,10 +915,10 @@ mod tests {
 
         assert!(matches!(
             receiver.recv().unwrap(),
-            PreviewEvent::Command(PreviewUpdate::ImageReady {
+            ViewModelEvent::Preview(PreviewEvent::Command(PreviewUpdate::ImageReady {
                 generation: 9,
                 encoded
-            }) if encoded.as_ref() == [1, 2, 3]
+            })) if encoded.as_ref() == [1, 2, 3]
         ));
     }
 
@@ -925,11 +936,11 @@ mod tests {
 
         assert!(matches!(
             receiver.recv().unwrap(),
-            PreviewEvent::NativeWindow(Some(NativeWindowId(42)))
+            ViewModelEvent::Preview(PreviewEvent::NativeWindow(Some(NativeWindowId(42))))
         ));
         assert!(matches!(
             receiver.recv().unwrap(),
-            PreviewEvent::NativeWindow(None)
+            ViewModelEvent::Preview(PreviewEvent::NativeWindow(None))
         ));
         assert!(receiver.try_recv().is_err());
     }

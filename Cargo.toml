@@ -21,6 +21,8 @@ nfm_search_core = { path = "nfm-search-core" }
 anstyle-parse = "1.0"
 anyhow = "1"
 crossbeam-channel = "0.5"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 skia-safe = "0.97.2"
 softbuffer = "0.4.8"
 winit = "0.30.13"

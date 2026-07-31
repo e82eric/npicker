@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use crossbeam_channel::bounded;
+use rust_nfm::accept::{AcceptConfig, AcceptService};
 use rust_nfm::preview::{PreviewConfig, PreviewOutputType, PreviewService};
 use rust_nfm::request::{
     DelimitedInputOptions, DelimitedStdinRequest, DelimitedTextSelector, DelimitedValueSelector,
@@ -77,8 +78,16 @@ fn main() -> Result<()> {
         },
     };
     let preview_visible = preview_enabled && options.preview_visible;
-    let view_model = ViewModel::new_with_preview_visibility(
+    let accept_config = match options.accept_resolver_program {
+        Some(program) => AcceptConfig::Resolver {
+            program: program.into(),
+            arguments: options.accept_resolver_arguments,
+        },
+        None => AcceptConfig::Complete,
+    };
+    let view_model = ViewModel::new_with_services(
         PreviewService::new(preview_config),
+        AcceptService::new(accept_config),
         preview_visible,
     );
     let (completion_tx, completion_rx) = bounded(1);
@@ -258,6 +267,8 @@ struct AppOptions {
     preview_default_profile: Option<String>,
     preview_visible: bool,
     window_preview: bool,
+    accept_resolver_program: Option<String>,
+    accept_resolver_arguments: Vec<String>,
 }
 
 #[derive(Default)]
@@ -282,6 +293,8 @@ fn app_options() -> AppOptions {
         preview_default_profile: None,
         preview_visible: true,
         window_preview: false,
+        accept_resolver_program: None,
+        accept_resolver_arguments: Vec::new(),
     };
     let mut filewalker = false;
     let mut list_windows = false;
@@ -401,6 +414,19 @@ fn app_options() -> AppOptions {
                 }
             }
             "--window-preview" => options.window_preview = true,
+            "--accept-resolver" => {
+                options.accept_resolver_program = args.next();
+                if options.accept_resolver_program.is_none() {
+                    eprintln!("--accept-resolver requires an executable");
+                }
+            }
+            "--accept-resolver-arg" => {
+                if let Some(argument) = args.next() {
+                    options.accept_resolver_arguments.push(argument);
+                } else {
+                    eprintln!("--accept-resolver-arg requires a value");
+                }
+            }
             "--delimiter" if !filewalker => {
                 if let Some(value) = args.next() {
                     delimiter = parse_delimiter(&value);
