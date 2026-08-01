@@ -7,13 +7,13 @@ use std::sync::OnceLock;
 use crate::action::{
     ActionConfig, ActionDefinition, ActionResolution, ActionService, ActionState, PickerState,
 };
+use crate::d2d_ui as picker_ui;
 use crate::key_binding::{KeyChord, KeyModifiers, KeyName};
 use crate::preview::{
     CommandPreviewTarget, PreviewCancellation, PreviewConfig, PreviewJob, PreviewOutputType,
     PreviewProfile, PreviewResolver, PreviewService,
 };
 use crate::request::{FileSystemPickerRequest, FlatItemsPickerRequest};
-use crate::skia_ui as picker_ui;
 use crate::view_model::ViewModel;
 use std::sync::Arc;
 use std::thread;

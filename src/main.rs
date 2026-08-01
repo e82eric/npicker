@@ -5,6 +5,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use crossbeam_channel::bounded;
 use rust_nfm::action::{ActionConfig, ActionDefinition, ActionResolverDefinition, ActionService};
+use rust_nfm::d2d_ui as picker_ui;
 use rust_nfm::key_binding::{parse_key_chord, KeyChord, KeyModifiers, KeyName};
 use rust_nfm::preview::{
     PreviewConfig, PreviewOutputType, PreviewProfile, PreviewResolver, PreviewService,
@@ -15,7 +16,6 @@ use rust_nfm::request::{
 };
 #[cfg(windows)]
 use rust_nfm::request::{FileSystemPickerRequest, WindowListPickerRequest};
-use rust_nfm::skia_ui;
 use rust_nfm::view_model::ViewModel;
 
 fn output_timing(line: &str) {
@@ -118,7 +118,7 @@ fn main() -> Result<()> {
         }
         InputMode::ListWindows => run_list_windows_request(Arc::clone(&view_model), completion_tx)?,
     }
-    let code = skia_ui::run(
+    let code = picker_ui::run(
         view_model,
         Some(completion_rx),
         preview_enabled,
