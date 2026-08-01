@@ -1,7 +1,17 @@
+use std::collections::HashMap;
 use std::ffi::{c_char, c_int, c_void, CStr, CString};
 use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::process::{Command, Stdio};
 use std::sync::OnceLock;
 
+use crate::action::{
+    ActionConfig, ActionDefinition, ActionResolution, ActionService, ActionState, PickerState,
+};
+use crate::key_binding::{KeyChord, KeyModifiers, KeyName};
+use crate::preview::{
+    CommandPreviewTarget, PreviewCancellation, PreviewConfig, PreviewJob, PreviewOutputType,
+    PreviewProfile, PreviewResolver, PreviewService,
+};
 use crate::request::{FileSystemPickerRequest, FlatItemsPickerRequest};
 use crate::skia_ui as picker_ui;
 use crate::view_model::ViewModel;
@@ -13,6 +23,13 @@ type OnSelect = unsafe extern "C" fn(*mut c_char, *mut c_void);
 type OnClosed = unsafe extern "C" fn();
 
 static VIEW_MODEL: OnceLock<Arc<ViewModel>> = OnceLock::new();
+
+#[repr(C)]
+pub struct RustNfmFileSystemOptions {
+    pub struct_size: usize,
+    pub max_depth: i32,
+    pub preview_visible: c_int,
+}
 
 fn output_debug_string(line: &str) {
     use windows::core::PCWSTR;
@@ -42,6 +59,7 @@ pub extern "C" fn RustNfmShowProgramsList(
 ) {
     let _ = catch_unwind(AssertUnwindSafe(|| {
         let view_model = ensure_initialized();
+        view_model.set_preview_visible(false);
         let root_directories = unsafe { copy_directories(directories, directory_count) };
         let state = state as usize;
 
@@ -50,12 +68,12 @@ pub extern "C" fn RustNfmShowProgramsList(
                 root_directories,
                 max_depth: 5,
                 directories_only: false,
-                files_only: false,
+                files_only: true,
                 search_string: None,
             };
 
-            if let Ok(response) = view_model.run_request(&request) {
-                if response.status == "selected" {
+            match view_model.run_request(&request) {
+                Ok(response) if response.status == "selected" => {
                     if let (Some(on_select), Some(selected)) = (on_select, response.selected_item) {
                         if let Ok(selected) = CString::new(selected) {
                             unsafe {
@@ -64,15 +82,75 @@ pub extern "C" fn RustNfmShowProgramsList(
                         }
                     }
                 }
-            }
-
-            if let Some(on_closed) = on_closed {
-                unsafe {
-                    on_closed();
+                _ => {
+                    if let Some(on_closed) = on_closed {
+                        unsafe { on_closed() };
+                    }
                 }
             }
         });
     }));
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn RustNfmShowFileSystem(
+    options: *const RustNfmFileSystemOptions,
+    on_select: Option<OnSelect>,
+    on_closed: Option<OnClosed>,
+    state: *mut c_void,
+) -> c_int {
+    catch_unwind(AssertUnwindSafe(|| {
+        let Some(options) = (unsafe { options.as_ref() }) else {
+            return 0;
+        };
+        if options.struct_size < std::mem::size_of::<RustNfmFileSystemOptions>() {
+            return 0;
+        }
+        let roots = logical_drive_roots();
+        if roots.is_empty() {
+            return 0;
+        }
+        let view_model = ensure_initialized();
+        view_model.set_preview_visible(options.preview_visible != 0);
+        let max_depth = options.max_depth;
+        let state = state as usize;
+        thread::spawn(move || {
+            let request = FileSystemPickerRequest {
+                root_directories: roots,
+                max_depth,
+                directories_only: false,
+                files_only: false,
+                search_string: None,
+            };
+            match view_model.run_request(&request) {
+                Ok(response) if response.status == "selected" => {
+                    if let (Some(on_select), Some(selected)) = (on_select, response.selected_item) {
+                        if let Ok(selected) = CString::new(selected) {
+                            unsafe {
+                                on_select(selected.as_ptr() as *mut c_char, state as *mut c_void)
+                            };
+                        }
+                    }
+                }
+                _ => {
+                    if let Some(on_closed) = on_closed {
+                        unsafe { on_closed() };
+                    }
+                }
+            }
+        });
+        1
+    }))
+    .unwrap_or(0)
+}
+
+fn logical_drive_roots() -> Vec<String> {
+    use windows::Win32::Storage::FileSystem::GetLogicalDrives;
+    let mask = unsafe { GetLogicalDrives() };
+    (0..26)
+        .filter(|index| mask & (1 << index) != 0)
+        .map(|index| format!("{}:\\", (b'A' + index as u8) as char))
+        .collect()
 }
 
 unsafe fn copy_directories(
@@ -121,8 +199,8 @@ pub extern "C" fn RustNfmShowItemsList(
                 search_string: None,
             };
 
-            if let Ok(response) = view_model.run_request(&request) {
-                if response.status == "selected" {
+            match view_model.run_request(&request) {
+                Ok(response) if response.status == "selected" => {
                     if let (Some(on_select), Some(selected)) = (on_select, response.selected_item) {
                         if let Ok(selected) = CString::new(selected) {
                             unsafe {
@@ -131,11 +209,10 @@ pub extern "C" fn RustNfmShowItemsList(
                         }
                     }
                 }
-            }
-
-            if let Some(on_closed) = on_closed {
-                unsafe {
-                    on_closed();
+                _ => {
+                    if let Some(on_closed) = on_closed {
+                        unsafe { on_closed() };
+                    }
                 }
             }
         });
@@ -158,15 +235,236 @@ pub extern "C" fn RustNfmSetMenuLocation(x: i32, y: i32) {
 
 fn ensure_initialized() -> Arc<ViewModel> {
     Arc::clone(VIEW_MODEL.get_or_init(|| {
-        let view_model = ViewModel::new(crate::preview::PreviewService::default());
+        let mut resolvers = HashMap::new();
+        resolvers.insert(
+            "ffi-accept".into(),
+            ActionDefinition::Native(resolve_file_system_accept),
+        );
+        resolvers.insert(
+            "ffi-parent".into(),
+            ActionDefinition::Native(resolve_file_system_parent),
+        );
+        let mut bindings = HashMap::new();
+        bindings.insert(
+            KeyChord {
+                key: KeyName::Enter,
+                modifiers: KeyModifiers::default(),
+            },
+            "ffi-accept".into(),
+        );
+        bindings.insert(
+            KeyChord {
+                key: KeyName::Character('u'),
+                modifiers: KeyModifiers {
+                    ctrl: true,
+                    ..KeyModifiers::default()
+                },
+            },
+            "ffi-parent".into(),
+        );
+        let view_model = ViewModel::new_with_services_and_bindings(
+            PreviewService::new(PreviewConfig::Command(PreviewResolver::Function(
+                resolve_native_file_preview,
+            ))),
+            ActionService::new(ActionConfig { resolvers }),
+            bindings,
+            false,
+        );
         let ui_view_model = Arc::clone(&view_model);
         std::thread::spawn(move || {
-            if let Err(error) = picker_ui::run(ui_view_model, None, false, false) {
+            if let Err(error) = picker_ui::run(ui_view_model, None, true, false) {
                 eprintln!("RustNfm UI stopped: {error:?}");
             }
         });
         view_model
     }))
+}
+
+fn resolve_native_file_preview(
+    target: &CommandPreviewTarget,
+) -> Result<Option<PreviewJob>, String> {
+    let path = std::path::Path::new(&target.item);
+    if path.is_dir() {
+        return Ok(Some(PreviewJob::Process(PreviewProfile {
+            program: "cmd.exe".into(),
+            arguments: vec!["/d".into(), "/c".into(), "dir".into(), "{item}".into()],
+            working_directory: None,
+            output_type: PreviewOutputType::Text,
+        })));
+    }
+    let extension = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if matches!(
+        extension.as_str(),
+        "mp4" | "mkv" | "mov" | "avi" | "webm" | "m4v" | "wmv"
+    ) {
+        return Ok(Some(PreviewJob::Function(resolve_video_frame_preview)));
+    }
+    if matches!(
+        extension.as_str(),
+        "png" | "jpg" | "jpeg" | "gif" | "bmp" | "webp" | "tif" | "tiff"
+    ) {
+        return Ok(Some(PreviewJob::Process(PreviewProfile {
+            program: "ffmpeg".into(),
+            arguments: vec![
+                "-loglevel".into(),
+                "error".into(),
+                "-i".into(),
+                "{item}".into(),
+                "-frames:v".into(),
+                "1".into(),
+                "-f".into(),
+                "image2pipe".into(),
+                "-vcodec".into(),
+                "png".into(),
+                "pipe:1".into(),
+            ],
+            working_directory: None,
+            output_type: PreviewOutputType::Image,
+        })));
+    }
+    if matches!(
+        extension.as_str(),
+        "txt"
+            | "md"
+            | "json"
+            | "xml"
+            | "yaml"
+            | "yml"
+            | "toml"
+            | "ini"
+            | "rs"
+            | "c"
+            | "h"
+            | "cpp"
+            | "hpp"
+            | "cs"
+            | "js"
+            | "ts"
+            | "css"
+            | "html"
+            | "ps1"
+            | "cmd"
+            | "bat"
+            | "sh"
+            | "py"
+            | "rb"
+            | "go"
+            | "java"
+            | "log"
+    ) {
+        return Ok(Some(PreviewJob::Process(PreviewProfile {
+            program: "bat".into(),
+            arguments: vec![
+                "--color=always".into(),
+                "--style=plain".into(),
+                "--paging=never".into(),
+                "{item}".into(),
+            ],
+            working_directory: None,
+            output_type: PreviewOutputType::Text,
+        })));
+    }
+    Ok(Some(PreviewJob::Process(PreviewProfile {
+        program: "cmd.exe".into(),
+        arguments: vec!["/d".into(), "/c".into(), "dir".into(), "{item}".into()],
+        working_directory: None,
+        output_type: PreviewOutputType::Text,
+    })))
+}
+
+fn resolve_video_frame_preview(
+    target: &CommandPreviewTarget,
+    cancellation: &PreviewCancellation,
+) -> Result<Option<PreviewProfile>, String> {
+    let mut probe = Command::new("ffprobe");
+    probe.args([
+        "-v",
+        "error",
+        "-show_entries",
+        "format=duration",
+        "-of",
+        "default=noprint_wrappers=1:nokey=1",
+    ]);
+    probe.arg(&target.item).stdin(Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        probe.creation_flags(CREATE_NO_WINDOW);
+    }
+    let output = probe
+        .output()
+        .map_err(|error| format!("ffprobe failed to start: {error}"))?;
+    if cancellation.is_cancelled() {
+        return Ok(None);
+    }
+    if !output.status.success() {
+        let message = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        return Err(if message.is_empty() {
+            format!("ffprobe exited with {}", output.status)
+        } else {
+            message
+        });
+    }
+    let duration = String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse::<f64>()
+        .map_err(|_| "ffprobe returned an invalid duration".to_string())?;
+    if !duration.is_finite() || duration < 0.0 {
+        return Err("ffprobe returned an invalid duration".into());
+    }
+    Ok(Some(PreviewProfile {
+        program: "ffmpeg".into(),
+        arguments: vec![
+            "-loglevel".into(),
+            "error".into(),
+            "-ss".into(),
+            format!("{:.3}", duration * 0.25),
+            "-i".into(),
+            "{item}".into(),
+            "-frames:v".into(),
+            "1".into(),
+            "-f".into(),
+            "image2pipe".into(),
+            "-vcodec".into(),
+            "png".into(),
+            "pipe:1".into(),
+        ],
+        working_directory: None,
+        output_type: PreviewOutputType::Image,
+    }))
+}
+
+fn resolve_file_system_accept(state: &ActionState) -> Result<ActionResolution, String> {
+    let Some(selection) = &state.selection else {
+        return Ok(ActionResolution::None);
+    };
+    if std::path::Path::new(&selection.item).is_dir() {
+        Ok(ActionResolution::FileWalker {
+            roots: vec![selection.item.clone()],
+        })
+    } else {
+        Ok(ActionResolution::Complete)
+    }
+}
+
+fn resolve_file_system_parent(state: &ActionState) -> Result<ActionResolution, String> {
+    let PickerState::Filewalker { roots } = &state.picker else {
+        return Ok(ActionResolution::None);
+    };
+    if roots.len() != 1 {
+        return Ok(ActionResolution::None);
+    }
+    let Some(parent) = std::path::Path::new(&roots[0]).parent() else {
+        return Ok(ActionResolution::None);
+    };
+    Ok(ActionResolution::FileWalker {
+        roots: vec![parent.to_string_lossy().into_owned()],
+    })
 }
 
 fn collect_items(

@@ -31,7 +31,7 @@ pub enum UiEvent {
     Results(UiUpdate),
     Preview(PreviewView),
     PreviewVisibilityChanged { visible: bool },
-    Close,
+    Hide,
 }
 
 #[derive(Clone, Debug)]
@@ -471,6 +471,23 @@ impl ViewModel {
             .send(UiEvent::PreviewVisibilityChanged { visible });
     }
 
+    pub fn set_preview_visible(&self, visible: bool) {
+        let changed = {
+            let mut state = self.state.lock().expect("view model poisoned");
+            if state.preview_visible == visible {
+                false
+            } else {
+                state.preview_visible = visible;
+                true
+            }
+        };
+        if changed {
+            let _ = self
+                .events_tx
+                .send(UiEvent::PreviewVisibilityChanged { visible });
+        }
+    }
+
     pub fn set_preview_visible_rows(&self, visible_rows: usize) {
         let view = {
             let mut state = self.state.lock().expect("view model poisoned");
@@ -811,41 +828,33 @@ impl ViewModel {
     }
 
     fn complete_accept(&self, value: String) {
-        let session_to_stop = {
-            let mut state = self.state.lock().expect("view model poisoned");
-            if let Some(active) = state.active.take() {
-                let _ = active.response_tx.send(PickerResponse::selected(value));
-                Some(active.search_session)
-            } else {
-                None
-            }
-        };
-
-        if let Some(session_to_stop) = session_to_stop {
-            session_to_stop.stop();
-        }
-
-        self.clear_preview_selection();
-        let _ = self.events_tx.send(UiEvent::Close);
+        self.complete(PickerResponse::selected(value));
     }
 
     fn complete_cancelled(&self) {
-        let session_to_stop = {
+        self.complete(PickerResponse::cancelled());
+    }
+
+    fn complete(&self, response: PickerResponse) {
+        let active = {
             let mut state = self.state.lock().expect("view model poisoned");
-            if let Some(active) = state.active.take() {
-                let _ = active.response_tx.send(PickerResponse::cancelled());
-                Some(active.search_session)
-            } else {
-                None
-            }
+            state.active.take()
         };
-
-        if let Some(session_to_stop) = session_to_stop {
-            session_to_stop.stop();
-        }
-
+        let Some(active) = active else {
+            self.hide();
+            return;
+        };
+        active.search_session.stop();
         self.clear_preview_selection();
-        let _ = self.events_tx.send(UiEvent::Close);
+        // Queue the UI hide before releasing the waiting FFI thread. This
+        // preserves lifecycle ordering without making the model manipulate a
+        // native window directly.
+        self.hide();
+        let _ = active.response_tx.send(response);
+    }
+
+    pub fn hide(&self) {
+        let _ = self.events_tx.send(UiEvent::Hide);
     }
 
     pub fn cancel(&self) {

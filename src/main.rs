@@ -4,9 +4,11 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use crossbeam_channel::bounded;
-use rust_nfm::action::{ActionConfig, ActionResolverDefinition, ActionService};
+use rust_nfm::action::{ActionConfig, ActionDefinition, ActionResolverDefinition, ActionService};
 use rust_nfm::key_binding::{parse_key_chord, KeyChord, KeyModifiers, KeyName};
-use rust_nfm::preview::{PreviewConfig, PreviewOutputType, PreviewService};
+use rust_nfm::preview::{
+    PreviewConfig, PreviewOutputType, PreviewProfile, PreviewResolver, PreviewService,
+};
 use rust_nfm::request::{
     DelimitedInputOptions, DelimitedStdinRequest, DelimitedTextSelector, DelimitedValueSelector,
     PickerResponse, StdinRequest,
@@ -47,7 +49,7 @@ fn main() -> Result<()> {
         resolve_native_window_preview(is_window_list, options.window_preview, command_preview)?;
     let preview_enabled = command_preview || native_window_preview;
     let preview_config = match options.preview_resolver_program {
-        Some(program) => PreviewConfig::Resolver {
+        Some(program) => PreviewConfig::Command(PreviewResolver::Process {
             program: program.into(),
             arguments: options.preview_resolver_arguments,
             profiles: options
@@ -68,14 +70,14 @@ fn main() -> Result<()> {
                 })
                 .collect(),
             default_profile: options.preview_default_profile,
-        },
+        }),
         None => match options.preview_program {
-            Some(program) => PreviewConfig::Command {
+            Some(program) => PreviewConfig::Command(PreviewResolver::Fixed(PreviewProfile {
                 program: program.into(),
                 arguments: options.preview_arguments,
                 working_directory: options.preview_cwd,
                 output_type: options.preview_output_type,
-            },
+            })),
             None if native_window_preview => PreviewConfig::NativeWindow,
             None => PreviewConfig::None,
         },
@@ -89,10 +91,10 @@ fn main() -> Result<()> {
                 action.program.map(|program| {
                     (
                         name,
-                        ActionResolverDefinition {
+                        ActionDefinition::Process(ActionResolverDefinition {
                             program: program.into(),
                             arguments: action.arguments,
-                        },
+                        }),
                     )
                 })
             })

@@ -20,9 +20,17 @@ pub struct ActionResolverDefinition {
     pub arguments: Vec<String>,
 }
 
+pub type NativeActionResolver = fn(&ActionState) -> Result<ActionResolution, String>;
+
+#[derive(Clone, Debug)]
+pub enum ActionDefinition {
+    Process(ActionResolverDefinition),
+    Native(NativeActionResolver),
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct ActionConfig {
-    pub resolvers: HashMap<String, ActionResolverDefinition>,
+    pub resolvers: HashMap<String, ActionDefinition>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -87,7 +95,7 @@ impl Default for ActionService {
 }
 
 pub struct ActionController {
-    definitions: Arc<HashMap<String, ActionResolverDefinition>>,
+    definitions: Arc<HashMap<String, ActionDefinition>>,
     generation: Arc<AtomicU64>,
     events: Sender<ViewModelEvent>,
 }
@@ -110,7 +118,12 @@ impl ActionController {
         let current_generation = Arc::clone(&self.generation);
         let events = self.events.clone();
         std::thread::spawn(move || {
-            let result = run_resolver(&definition, &state, generation, &current_generation);
+            let result = match definition {
+                ActionDefinition::Process(definition) => {
+                    run_resolver(&definition, &state, generation, &current_generation)
+                }
+                ActionDefinition::Native(resolve) => resolve(&state),
+            };
             if current_generation.load(Ordering::Acquire) == generation {
                 let _ = events.send(ViewModelEvent::Action(ActionEvent {
                     generation,

@@ -1162,18 +1162,23 @@ impl PickerApp {
 
     fn hide(&mut self) {
         self.visible = false;
-        if let Some(window) = &self.window {
-            #[cfg(windows)]
-            if let Err(error) = configure_windows_popup(window, false) {
-                eprintln!("failed to hide Win32 popup: {error:#}");
-            }
-            #[cfg(not(windows))]
-            window.set_visible(false);
-        }
         #[cfg(windows)]
         if let Some(thumbnail) = &mut self.native_thumbnail {
             thumbnail.unregister();
         }
+        // The FFI event loop is long-lived, but the native presentation
+        // resources do not need to be. Dropping them here destroys the HWND
+        // and its softbuffer DC, preventing a retained GDI surface from
+        // remaining composed after the picker has been dismissed. Show will
+        // recreate a fresh window on the same event loop.
+        #[cfg(windows)]
+        {
+            self.native_thumbnail = None;
+        }
+        self.soft_surface = None;
+        self.soft_context = None;
+        self.window = None;
+        self.renderer.surface = None;
     }
 
     fn center_window(&self) {
@@ -1364,7 +1369,13 @@ impl ApplicationHandler<AppEvent> for PickerApp {
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: AppEvent) {
         match event {
-            AppEvent::Ui(UiEvent::Show) => self.show(),
+            AppEvent::Ui(UiEvent::Show) => {
+                if let Err(error) = self.create_window(event_loop) {
+                    eprintln!("failed to recreate picker window: {error:#}");
+                    return;
+                }
+                self.show();
+            }
             AppEvent::Ui(UiEvent::Results(update)) => {
                 self.renderer.apply_update(update);
                 if let Some(window) = &self.window {
@@ -1405,7 +1416,7 @@ impl ApplicationHandler<AppEvent> for PickerApp {
             AppEvent::Ui(UiEvent::PreviewVisibilityChanged { visible }) => {
                 self.set_preview_visibility(visible);
             }
-            AppEvent::Ui(UiEvent::Close) => self.hide(),
+            AppEvent::Ui(UiEvent::Hide) => self.hide(),
             AppEvent::Exit(code) => {
                 self.exit_code = code;
                 event_loop.exit();

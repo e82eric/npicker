@@ -61,15 +61,15 @@ struct OutputChunk {
 }
 
 pub struct CommandPreviewController {
-    mode: Arc<CommandPreviewMode>,
+    resolver: Arc<PreviewResolver>,
     generation: Arc<AtomicU64>,
     events: Sender<ViewModelEvent>,
 }
 
 impl CommandPreviewController {
-    fn new(mode: CommandPreviewMode, events: Sender<ViewModelEvent>) -> Self {
+    fn new(resolver: PreviewResolver, events: Sender<ViewModelEvent>) -> Self {
         Self {
-            mode: Arc::new(mode),
+            resolver: Arc::new(resolver),
             generation: Arc::new(AtomicU64::new(0)),
             events,
         }
@@ -78,16 +78,16 @@ impl CommandPreviewController {
     pub fn request(&self, target: CommandPreviewTarget) -> u64 {
         let generation = self.next_generation();
         let current_generation = Arc::clone(&self.generation);
-        let mode = Arc::clone(&self.mode);
+        let resolver = Arc::clone(&self.resolver);
         let events = self.events.clone();
         std::thread::spawn(move || {
             std::thread::sleep(DEBOUNCE);
             if current_generation.load(Ordering::Acquire) != generation {
                 return;
             }
-            let job = match mode.as_ref() {
-                CommandPreviewMode::Fixed(profile) => Some(profile.clone()),
-                CommandPreviewMode::Resolver {
+            let job = match resolver.as_ref() {
+                PreviewResolver::Fixed(profile) => Some(PreviewJob::Process(profile.clone())),
+                PreviewResolver::Process {
                     program,
                     arguments,
                     profiles,
@@ -100,7 +100,7 @@ impl CommandPreviewController {
                     Arc::clone(&current_generation),
                 ) {
                     Ok(Some(profile)) => match profiles.get(&profile) {
-                        Some(job) => Some(job.clone()),
+                        Some(job) => Some(PreviewJob::Process(job.clone())),
                         None => {
                             publish_error(
                                 &events,
@@ -112,7 +112,7 @@ impl CommandPreviewController {
                     },
                     Ok(None) => match default_profile {
                         Some(profile) => match profiles.get(profile) {
-                            Some(job) => Some(job.clone()),
+                            Some(job) => Some(PreviewJob::Process(job.clone())),
                             None => {
                                 publish_error(
                                     &events,
@@ -129,23 +129,18 @@ impl CommandPreviewController {
                         return;
                     }
                 },
+                PreviewResolver::Function(resolve) => match resolve(&target) {
+                    Ok(job) => job,
+                    Err(message) => {
+                        publish_error(&events, generation, message);
+                        return;
+                    }
+                },
             };
             let Some(job) = job else {
                 return;
             };
-            if current_generation.load(Ordering::Acquire) != generation {
-                return;
-            }
-            run_process(
-                &job.program,
-                &job.arguments,
-                job.working_directory.as_ref(),
-                job.output_type,
-                &target,
-                generation,
-                current_generation,
-                events,
-            );
+            execute_preview_job(job, &target, generation, current_generation, events);
         });
         generation
     }
@@ -174,14 +169,48 @@ pub struct PreviewProfile {
     pub output_type: PreviewOutputType,
 }
 
-enum CommandPreviewMode {
+#[derive(Clone, Debug)]
+pub enum PreviewResolver {
     Fixed(PreviewProfile),
-    Resolver {
+    Process {
         program: PathBuf,
         arguments: Vec<String>,
         profiles: HashMap<String, PreviewProfile>,
         default_profile: Option<String>,
     },
+    Function(NativePreviewResolver),
+}
+
+pub type NativePreviewResolver = fn(&CommandPreviewTarget) -> Result<Option<PreviewJob>, String>;
+pub type PreviewFunction =
+    fn(&CommandPreviewTarget, &PreviewCancellation) -> Result<Option<PreviewProfile>, String>;
+
+#[derive(Clone)]
+pub struct PreviewCancellation {
+    generation: u64,
+    current_generation: Arc<AtomicU64>,
+}
+
+impl PreviewCancellation {
+    pub fn is_cancelled(&self) -> bool {
+        self.current_generation.load(Ordering::Acquire) != self.generation
+    }
+}
+
+impl std::fmt::Debug for PreviewCancellation {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PreviewCancellation")
+            .field("generation", &self.generation)
+            .field("cancelled", &self.is_cancelled())
+            .finish()
+    }
+}
+
+#[derive(Clone, Debug)]
+pub enum PreviewJob {
+    Process(PreviewProfile),
+    Function(PreviewFunction),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -197,22 +226,11 @@ pub enum PreviewOutputType {
     Image,
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default)]
 pub enum PreviewConfig {
     #[default]
     None,
-    Command {
-        program: PathBuf,
-        arguments: Vec<String>,
-        working_directory: Option<PathBuf>,
-        output_type: PreviewOutputType,
-    },
-    Resolver {
-        program: PathBuf,
-        arguments: Vec<String>,
-        profiles: HashMap<String, PreviewProfile>,
-        default_profile: Option<String>,
-    },
+    Command(PreviewResolver),
     NativeWindow,
 }
 
@@ -273,38 +291,8 @@ fn build_preview_backend(
 ) -> Box<dyn PreviewBackend> {
     match config {
         PreviewConfig::None => Box::new(NoPreviewBackend),
-        PreviewConfig::Command {
-            program,
-            arguments,
-            working_directory,
-            output_type,
-        } => Box::new(CommandPreviewBackend {
-            controller: CommandPreviewController::new(
-                CommandPreviewMode::Fixed(PreviewProfile {
-                    program,
-                    arguments,
-                    working_directory,
-                    output_type,
-                }),
-                events,
-            ),
-            selected: Mutex::new(None),
-        }),
-        PreviewConfig::Resolver {
-            program,
-            arguments,
-            profiles,
-            default_profile,
-        } => Box::new(CommandPreviewBackend {
-            controller: CommandPreviewController::new(
-                CommandPreviewMode::Resolver {
-                    program,
-                    arguments,
-                    profiles,
-                    default_profile,
-                },
-                events,
-            ),
+        PreviewConfig::Command(resolver) => Box::new(CommandPreviewBackend {
+            controller: CommandPreviewController::new(resolver, events),
             selected: Mutex::new(None),
         }),
         PreviewConfig::NativeWindow => Box::new(NativeWindowPreviewBackend {
@@ -409,6 +397,48 @@ impl NativeWindowPreviewBackend {
         drop(selected);
         send_preview(&self.events, PreviewEvent::NativeWindow(window));
     }
+}
+
+fn execute_preview_job(
+    job: PreviewJob,
+    target: &CommandPreviewTarget,
+    generation: u64,
+    current_generation: Arc<AtomicU64>,
+    events: Sender<ViewModelEvent>,
+) {
+    if current_generation.load(Ordering::Acquire) != generation {
+        return;
+    }
+    let profile = match job {
+        PreviewJob::Process(profile) => profile,
+        PreviewJob::Function(function) => {
+            let cancellation = PreviewCancellation {
+                generation,
+                current_generation: Arc::clone(&current_generation),
+            };
+            match function(target, &cancellation) {
+                Ok(Some(profile)) => profile,
+                Ok(None) => return,
+                Err(message) => {
+                    publish_error(&events, generation, message);
+                    return;
+                }
+            }
+        }
+    };
+    if current_generation.load(Ordering::Acquire) != generation {
+        return;
+    }
+    run_process(
+        &profile.program,
+        &profile.arguments,
+        profile.working_directory.as_ref(),
+        profile.output_type,
+        target,
+        generation,
+        current_generation,
+        events,
+    );
 }
 
 fn run_resolver(
