@@ -7,13 +7,13 @@ use std::sync::OnceLock;
 use crate::action::{
     ActionConfig, ActionDefinition, ActionResolution, ActionService, ActionState, PickerState,
 };
-use crate::d2d_ui as picker_ui;
 use crate::key_binding::{KeyChord, KeyModifiers, KeyName};
 use crate::preview::{
     CommandPreviewTarget, PreviewCancellation, PreviewConfig, PreviewJob, PreviewOutputType,
     PreviewProfile, PreviewResolver, PreviewService,
 };
 use crate::request::{FileSystemPickerRequest, FlatItemsPickerRequest};
+use crate::skia_ui as picker_ui;
 use crate::view_model::ViewModel;
 use std::sync::Arc;
 use std::thread;
@@ -456,15 +456,23 @@ fn resolve_file_system_parent(state: &ActionState) -> Result<ActionResolution, S
     let PickerState::Filewalker { roots } = &state.picker else {
         return Ok(ActionResolution::None);
     };
-    if roots.len() != 1 {
+    let roots = file_system_parent_roots(roots, logical_drive_roots());
+    if roots.is_empty() {
         return Ok(ActionResolution::None);
     }
-    let Some(parent) = std::path::Path::new(&roots[0]).parent() else {
-        return Ok(ActionResolution::None);
-    };
-    Ok(ActionResolution::FileWalker {
-        roots: vec![parent.to_string_lossy().into_owned()],
-    })
+    Ok(ActionResolution::FileWalker { roots })
+}
+
+fn file_system_parent_roots(roots: &[String], drive_roots: Vec<String>) -> Vec<String> {
+    if roots.len() == 1 {
+        if let Some(parent) = std::path::Path::new(&roots[0])
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            return vec![parent.to_string_lossy().into_owned()];
+        }
+    }
+    drive_roots
 }
 
 fn collect_items(
@@ -520,5 +528,31 @@ mod tests {
             copy_null_terminated_items(items.as_ptr()),
             vec!["alpha".to_owned(), "beta\\gamma".to_owned()]
         );
+    }
+
+    #[test]
+    fn parent_action_uses_the_single_roots_parent() {
+        assert_eq!(
+            file_system_parent_roots(
+                &[r"C:\work\child".into()],
+                vec![r"C:\".into(), r"D:\".into()],
+            ),
+            vec![r"C:\work".to_owned()]
+        );
+    }
+
+    #[test]
+    fn parent_action_shows_drives_at_a_file_system_root() {
+        let drives = vec![r"C:\".to_owned(), r"D:\".to_owned()];
+        assert_eq!(
+            file_system_parent_roots(&[r"C:\".into()], drives.clone()),
+            drives
+        );
+    }
+
+    #[test]
+    fn parent_action_keeps_the_drive_list_idempotent() {
+        let drives = vec![r"C:\".to_owned(), r"D:\".to_owned()];
+        assert_eq!(file_system_parent_roots(&drives, drives.clone()), drives);
     }
 }

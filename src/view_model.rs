@@ -282,7 +282,7 @@ impl ViewModel {
             query.clone(),
             self.search_update_tx.clone(),
         );
-        {
+        let initial_update = {
             let mut state = self.state.lock().expect("view model poisoned");
             if state.active.is_some() {
                 bail!("A picker request is already active.");
@@ -304,9 +304,13 @@ impl ViewModel {
                 store: Arc::clone(&store),
                 picker_state: request.picker_state(),
             });
-        }
+            state.visible_update()
+        };
         self.clear_preview_selection();
 
+        // A long-lived UI may still contain the previous picker's rows. Publish the cleared
+        // state before showing the next request instead of waiting for its first search update.
+        let _ = self.events_tx.send(UiEvent::Results(initial_update));
         let _ = self.events_tx.send(UiEvent::Show);
         session.start();
 

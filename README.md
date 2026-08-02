@@ -12,7 +12,7 @@ Goals:
   backing storage, and published snapshots for streaming search.
 - Parallel top-K fuzzy search over published snapshots.
 - `nucleo-matcher` fuzzy scoring.
-- A winit window with CPU-rasterized Skia and softbuffer presentation.
+- A native Win32 popup with a persistent CPU-rasterized Skia surface and GDI presentation.
 
 The crate is structured around the same runtime boundaries as the C# path:
 
@@ -22,7 +22,7 @@ The crate is structured around the same runtime boundaries as the C# path:
 - `search`: parallel fuzzy search over a published snapshot.
 - `preview`: cancellable, generation-tagged preview command worker.
 - `view_model`: owns scan/search state and UI events.
-- `skia_ui`: winit/Skia picker window.
+- `skia_ui`: native Win32 message loop, Skia raster renderer, GDI presentation, and DWM thumbnails.
 
 Run the picker by piping candidates to stdin. The selected item is printed to stdout:
 

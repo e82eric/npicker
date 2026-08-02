@@ -6,56 +6,34 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
+use crossbeam_channel::Receiver;
+use skia_safe::{
+    surfaces, Canvas, Color, Data, Font, FontMgr, FontStyle, Image, Paint, PaintStyle, RRect,
+    Rect as SkRect, Surface,
+};
 use windows::core::PCWSTR;
-use windows::Win32::Foundation::{
-    D2DERR_RECREATE_TARGET, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM,
-};
-use windows::Win32::Graphics::Direct2D::Common::{
-    D2D1_ALPHA_MODE_UNKNOWN, D2D1_COLOR_F, D2D1_PIXEL_FORMAT, D2D_RECT_F, D2D_SIZE_U,
-};
-use windows::Win32::Graphics::Direct2D::{
-    D2D1CreateFactory, ID2D1Bitmap, ID2D1Factory, ID2D1HwndRenderTarget, ID2D1SolidColorBrush,
-    D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, D2D1_DRAW_TEXT_OPTIONS_CLIP,
-    D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_FEATURE_LEVEL_DEFAULT,
-    D2D1_HWND_RENDER_TARGET_PROPERTIES, D2D1_PRESENT_OPTIONS_NONE, D2D1_RENDER_TARGET_PROPERTIES,
-    D2D1_RENDER_TARGET_TYPE_DEFAULT, D2D1_ROUNDED_RECT,
-};
-use windows::Win32::Graphics::DirectWrite::{
-    DWriteCreateFactory, IDWriteFactory, IDWriteTextFormat, DWRITE_FACTORY_TYPE_SHARED,
-    DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_ITALIC, DWRITE_FONT_STYLE_NORMAL,
-    DWRITE_FONT_WEIGHT_BOLD, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_MEASURING_MODE_NATURAL,
-    DWRITE_TEXT_ALIGNMENT_TRAILING, DWRITE_TEXT_METRICS, DWRITE_WORD_WRAPPING_NO_WRAP,
-};
-use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_UNKNOWN;
+use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, SIZE, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, EndPaint, GetMonitorInfoW, InvalidateRect, MonitorFromPoint, MonitorFromWindow,
-    UpdateWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST, PAINTSTRUCT,
-};
-use windows::Win32::Graphics::Imaging::{
-    CLSID_WICImagingFactory, GUID_WICPixelFormat32bppPBGRA, IWICImagingFactory,
-    WICBitmapDitherTypeNone, WICBitmapPaletteTypeMedianCut, WICDecodeMetadataCacheOnLoad,
-};
-use windows::Win32::System::Com::{
-    CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER,
-    COINIT_APARTMENTTHREADED,
+    BeginPaint, CreateCompatibleDC, CreateDIBSection, CreateSolidBrush, DeleteDC, DeleteObject,
+    EndPaint, GetMonitorInfoW, InvalidateRect, MonitorFromPoint, MonitorFromWindow, SelectObject,
+    UpdateWindow, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, HBITMAP, HDC, HGDIOBJ,
+    MONITORINFO, MONITOR_DEFAULTTONEAREST, PAINTSTRUCT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     keybd_event, GetKeyState, SendInput, SetFocus, INPUT, INPUT_MOUSE, KEYEVENTF_KEYUP, VK_BACK,
     VK_CONTROL, VK_DELETE, VK_DOWN, VK_END, VK_ESCAPE, VK_HOME, VK_LEFT, VK_MENU, VK_NEXT,
     VK_PRIOR, VK_RETURN, VK_RIGHT, VK_SHIFT, VK_UP,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DispatchMessageW, GetCaretBlinkTime, GetClientRect,
-    GetForegroundWindow, GetMessageW, GetWindowLongPtrW, LoadCursorW, PostMessageW,
-    PostQuitMessage, RegisterClassW, SetForegroundWindow, SetTimer, SetWindowLongPtrW,
-    SetWindowPos, ShowWindow, TranslateMessage, CREATESTRUCTW, GWLP_USERDATA, IDC_ARROW, MSG,
-    SWP_NOACTIVATE, SWP_NOZORDER, SWP_SHOWWINDOW, SW_HIDE, WM_APP, WM_CHAR, WM_DESTROY, WM_KEYDOWN,
-    WM_NCCREATE, WM_PAINT, WM_TIMER, WNDCLASSW, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    CreateWindowExW, DefWindowProcW, DispatchMessageW, GetCaretBlinkTime, GetForegroundWindow,
+    GetMessageW, GetWindowLongPtrW, KillTimer, LoadCursorW, PostMessageW, PostQuitMessage,
+    RegisterClassW, SetForegroundWindow, SetTimer, SetWindowLongPtrW, ShowWindow, TranslateMessage,
+    UpdateLayeredWindow, CREATESTRUCTW, GWLP_USERDATA, IDC_ARROW, MSG, SW_HIDE, SW_SHOW,
+    ULW_OPAQUE, WM_APP, WM_CHAR, WM_DESTROY, WM_DPICHANGED, WM_ERASEBKGND, WM_KEYDOWN, WM_NCCREATE,
+    WM_PAINT, WM_TIMER, WNDCLASSW, WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
-use windows_numerics::Vector2;
-
-use crossbeam_channel::Receiver;
 
 use crate::key_binding::{KeyChord, KeyName};
 use crate::preview::{NativeWindowId, PreviewLine, PreviewUpdate};
@@ -86,6 +64,11 @@ const WM_UI_BRING_TO_FOREGROUND: u32 = WM_APP + 2;
 const WM_CURSOR_BLINK: u32 = WM_APP + 3;
 const WM_SHOW_ROOT: u32 = WM_APP + 4;
 const WM_EXIT: u32 = WM_APP + 5;
+const WM_PREVIEW_LOADING: u32 = WM_APP + 6;
+const WM_INDEXING_SPINNER: u32 = WM_APP + 7;
+const PREVIEW_LOADING_DELAY_MS: u32 = 400;
+const INDEXING_SPINNER_INTERVAL_MS: u32 = 80;
+const INDEXING_SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const DEFAULT_HEIGHT: i32 = 320;
 const COLOR_BACKGROUND: u32 = 0x282828;
 const COLOR_TEXT: u32 = 0xebdbb2;
@@ -112,12 +95,12 @@ pub fn run(
 ) -> Result<i32> {
     let exit_code;
     unsafe {
-        CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok()?;
         let class_name = wide_null("NfmRustD2DPicker");
         let hinstance = GetModuleHandleW(None)?;
         let cursor = LoadCursorW(None, IDC_ARROW)?;
         let wnd_class = WNDCLASSW {
             hCursor: cursor,
+            hbrBackground: CreateSolidBrush(COLORREF(COLOR_BACKGROUND)),
             hInstance: hinstance.into(),
             lpszClassName: PCWSTR(class_name.as_ptr()),
             lpfnWndProc: Some(wnd_proc),
@@ -137,12 +120,13 @@ pub fn run(
             screen_location.y as f32,
             screen_location.width as f32,
             screen_location.height as f32,
+            screen_location.scale(),
             preview_available,
             preview_visible,
         )?);
         let state_ptr = Box::into_raw(state);
         let hwnd = CreateWindowExW(
-            WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
+            WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_LAYERED,
             PCWSTR(class_name.as_ptr()),
             PCWSTR(wide_null("nfm rust picker").as_ptr()),
             WS_POPUP,
@@ -190,47 +174,142 @@ pub fn run(
             DispatchMessageW(&msg);
         }
         exit_code = msg.wParam.0 as i32;
-        CoUninitialize();
     }
 
     Ok(exit_code)
 }
 
+struct GdiBackBuffer {
+    dc: HDC,
+    bitmap: HBITMAP,
+    previous: HGDIOBJ,
+    bits: *mut u8,
+    width: i32,
+    height: i32,
+}
+
+impl GdiBackBuffer {
+    unsafe fn new(width: i32, height: i32) -> Result<Self> {
+        let info = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: width,
+                biHeight: -height,
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: BI_RGB.0,
+                biSizeImage: (width * height * 4) as u32,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let dc = CreateCompatibleDC(None);
+        if dc.0.is_null() {
+            return Err(anyhow!("CreateCompatibleDC failed"));
+        }
+        let mut bits = std::ptr::null_mut();
+        let bitmap = match CreateDIBSection(None, &info, DIB_RGB_COLORS, &mut bits, None, 0) {
+            Ok(bitmap) => bitmap,
+            Err(error) => {
+                let _ = DeleteDC(dc);
+                return Err(error.into());
+            }
+        };
+        let previous = SelectObject(dc, HGDIOBJ(bitmap.0));
+        Ok(Self {
+            dc,
+            bitmap,
+            previous,
+            bits: bits.cast(),
+            width,
+            height,
+        })
+    }
+
+    unsafe fn present(
+        &mut self,
+        hwnd: HWND,
+        surface: &mut Surface,
+        location: ScreenLocation,
+    ) -> Result<()> {
+        let pixmap = surface
+            .peek_pixels()
+            .context("Skia raster pixels are not readable")?;
+        let source = pixmap
+            .bytes()
+            .context("Skia raster pixels are not readable")?;
+        let row_bytes = self.width as usize * 4;
+        for row in 0..self.height as usize {
+            std::ptr::copy_nonoverlapping(
+                source.as_ptr().add(row * pixmap.row_bytes()),
+                self.bits.add(row * row_bytes),
+                row_bytes,
+            );
+        }
+        UpdateLayeredWindow(
+            hwnd,
+            None,
+            Some(&POINT {
+                x: location.x,
+                y: location.y,
+            }),
+            Some(&SIZE {
+                cx: location.width,
+                cy: location.height,
+            }),
+            Some(self.dc),
+            Some(&POINT { x: 0, y: 0 }),
+            COLORREF(0),
+            None,
+            ULW_OPAQUE,
+        )
+        .context("UpdateLayeredWindow failed")
+    }
+}
+
+impl Drop for GdiBackBuffer {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = SelectObject(self.dc, self.previous);
+            let _ = DeleteObject(HGDIOBJ(self.bitmap.0));
+            let _ = DeleteDC(self.dc);
+        }
+    }
+}
+
 struct WindowState {
     view_model: Arc<ViewModel>,
     shared: Arc<Mutex<SharedUiState>>,
-    factory: ID2D1Factory,
-    dwrite_factory: IDWriteFactory,
-    wic_factory: IWICImagingFactory,
-    target: Option<ID2D1HwndRenderTarget>,
-    text_format: IDWriteTextFormat,
-    bold_text_format: IDWriteTextFormat,
-    italic_text_format: IDWriteTextFormat,
-    bold_italic_text_format: IDWriteTextFormat,
-    counter_text_format: IDWriteTextFormat,
-    text_brush: Option<ID2D1SolidColorBrush>,
-    muted_brush: Option<ID2D1SolidColorBrush>,
-    highlight_brush: Option<ID2D1SolidColorBrush>,
-    selected_brush: Option<ID2D1SolidColorBrush>,
-    border_brush: Option<ID2D1SolidColorBrush>,
-    accent_brush: Option<ID2D1SolidColorBrush>,
-    style_brush: Option<ID2D1SolidColorBrush>,
+    surface: Option<Surface>,
+    back_buffer: Option<GdiBackBuffer>,
+    font: Font,
+    bold_font: Font,
+    italic_font: Font,
+    bold_italic_font: Font,
+    counter_font: Font,
+    text_paint: Paint,
+    muted_paint: Paint,
+    highlight_paint: Paint,
+    selected_paint: Paint,
+    selected_accent_paint: Paint,
+    stroke_paint: Paint,
     results: Vec<SearchResult>,
     counters: UiCounters,
     selected_row: usize,
+    indexing_spinner_frame: usize,
     visible: bool,
+    window_shown: bool,
     last_window_location: Option<ScreenLocation>,
-    queued_foreground_after_first_paint: bool,
     logged_first_items_paint: bool,
     cursor_visible: bool,
     preview_available: bool,
     preview_enabled: bool,
     preview_generation: u64,
     preview_lines: Arc<[PreviewLine]>,
-    preview_image_encoded: Option<Arc<[u8]>>,
-    preview_bitmap: Option<ID2D1Bitmap>,
+    preview_image: Option<Image>,
     preview_top_line: usize,
     preview_loading: bool,
+    preview_loading_visible: bool,
     preview_truncated: bool,
     preview_error: Option<String>,
     pending_native_preview: Option<NativeWindowId>,
@@ -311,7 +390,7 @@ impl DwmThumbnailPreview {
         Ok(())
     }
 
-    fn update_layout(&self, container: Rect) -> Result<()> {
+    fn update_layout(&self, container: Rect, scale: f32) -> Result<()> {
         use windows::Win32::Foundation::RECT;
         use windows::Win32::Graphics::Dwm::{
             DwmQueryThumbnailSourceSize, DwmUpdateThumbnailProperties, DWM_THUMBNAIL_PROPERTIES,
@@ -324,10 +403,10 @@ impl DwmThumbnailPreview {
             .context("DwmQueryThumbnailSourceSize failed")?;
         let destination = fit_thumbnail_rect(
             RECT {
-                left: (container.x + 8.0).round() as i32,
-                top: (container.y + 8.0).round() as i32,
-                right: (container.x + container.width - 8.0).round() as i32,
-                bottom: (container.y + container.height - 8.0).round() as i32,
+                left: ((container.x + 8.0) * scale).round() as i32,
+                top: ((container.y + 8.0) * scale).round() as i32,
+                right: ((container.x + container.width - 8.0) * scale).round() as i32,
+                bottom: ((container.y + container.height - 8.0) * scale).round() as i32,
             },
             source,
         )
@@ -485,139 +564,88 @@ impl WindowState {
     fn new(
         view_model: Arc<ViewModel>,
         shared: Arc<Mutex<SharedUiState>>,
-        left: f32,
-        top: f32,
+        _left: f32,
+        _top: f32,
         width: f32,
         _height: f32,
+        scale_factor: f32,
         preview_available: bool,
         preview_visible: bool,
     ) -> Result<Self> {
-        unsafe {
-            let factory: ID2D1Factory = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None)
-                .context("D2D1CreateFactory failed")?;
-            let dwrite_factory: IDWriteFactory = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED)
-                .context("DWriteCreateFactory failed")?;
-            let wic_factory: IWICImagingFactory =
-                CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER)
-                    .context("creating WIC imaging factory failed")?;
-            let text_format = dwrite_factory.CreateTextFormat(
-                PCWSTR(wide_null("Cascadia Mono").as_ptr()),
-                None,
-                DWRITE_FONT_WEIGHT_NORMAL,
-                DWRITE_FONT_STYLE_NORMAL,
-                DWRITE_FONT_STRETCH_NORMAL,
-                15.0,
-                PCWSTR(wide_null("en-us").as_ptr()),
-            )?;
-            text_format.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP)?;
-            let bold_text_format = dwrite_factory.CreateTextFormat(
-                PCWSTR(wide_null("Cascadia Mono").as_ptr()),
-                None,
-                DWRITE_FONT_WEIGHT_BOLD,
-                DWRITE_FONT_STYLE_NORMAL,
-                DWRITE_FONT_STRETCH_NORMAL,
-                15.0,
-                PCWSTR(wide_null("en-us").as_ptr()),
-            )?;
-            bold_text_format.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP)?;
-            let italic_text_format = dwrite_factory.CreateTextFormat(
-                PCWSTR(wide_null("Cascadia Mono").as_ptr()),
-                None,
-                DWRITE_FONT_WEIGHT_NORMAL,
-                DWRITE_FONT_STYLE_ITALIC,
-                DWRITE_FONT_STRETCH_NORMAL,
-                15.0,
-                PCWSTR(wide_null("en-us").as_ptr()),
-            )?;
-            italic_text_format.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP)?;
-            let bold_italic_text_format = dwrite_factory.CreateTextFormat(
-                PCWSTR(wide_null("Cascadia Mono").as_ptr()),
-                None,
-                DWRITE_FONT_WEIGHT_BOLD,
-                DWRITE_FONT_STYLE_ITALIC,
-                DWRITE_FONT_STRETCH_NORMAL,
-                15.0,
-                PCWSTR(wide_null("en-us").as_ptr()),
-            )?;
-            bold_italic_text_format.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP)?;
-            let counter_text_format = dwrite_factory.CreateTextFormat(
-                PCWSTR(wide_null("Cascadia Mono").as_ptr()),
-                None,
-                DWRITE_FONT_WEIGHT_NORMAL,
-                DWRITE_FONT_STYLE_NORMAL,
-                DWRITE_FONT_STRETCH_NORMAL,
-                15.0,
-                PCWSTR(wide_null("en-us").as_ptr()),
-            )?;
-            counter_text_format.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP)?;
-            counter_text_format.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_TRAILING)?;
+        let font_manager = FontMgr::default();
+        let typeface = font_manager
+            .legacy_make_typeface("Cascadia Mono", FontStyle::normal())
+            .or_else(|| font_manager.legacy_make_typeface(None, FontStyle::normal()))
+            .context("failed to create Skia typeface")?;
+        let make_font = |style| {
+            let face = font_manager
+                .legacy_make_typeface("Cascadia Mono", style)
+                .unwrap_or_else(|| typeface.clone());
+            let mut font = Font::new(face, 15.0);
+            font.set_subpixel(true);
+            font
+        };
+        let font = make_font(FontStyle::normal());
+        let bold_font = make_font(FontStyle::bold());
+        let italic_font = make_font(FontStyle::italic());
+        let bold_italic_font = make_font(FontStyle::bold_italic());
+        let counter_font = Font::new(typeface, 15.0);
+        let text_height = font.metrics().0;
+        let desired_height =
+            desired_window_height(text_height, PADDING, DISPLAY_ROWS, preview_visible);
+        DESIRED_WINDOW_HEIGHT.store(desired_height, Ordering::Relaxed);
 
-            let sample = wide_null("Hg");
-            let layout = dwrite_factory.CreateTextLayout(&sample, &text_format, 1000.0, 1000.0)?;
+        let window = Rect {
+            x: 0.0,
+            y: 0.0,
+            width: width / scale_factor,
+            height: desired_height as f32,
+        };
 
-            let mut metrics = DWRITE_TEXT_METRICS::default();
-            let _ = layout.GetMetrics(&mut metrics)?;
+        let app_layout =
+            calculate_layout(window, PADDING, DISPLAY_ROWS, text_height, preview_visible);
 
-            let text_height = metrics.height;
-
-            let desired_height =
-                desired_window_height(text_height, PADDING, DISPLAY_ROWS, preview_visible);
-            DESIRED_WINDOW_HEIGHT.store(desired_height, Ordering::Relaxed);
-
-            let window = Rect {
-                x: left,
-                y: top,
-                width,
-                height: desired_height as f32,
-            };
-
-            let app_layout =
-                calculate_layout(window, PADDING, DISPLAY_ROWS, text_height, preview_visible);
-
-            Ok(Self {
-                view_model,
-                shared,
-                factory,
-                dwrite_factory,
-                wic_factory,
-                target: None,
-                text_format,
-                bold_text_format,
-                italic_text_format,
-                bold_italic_text_format,
-                counter_text_format,
-                text_brush: None,
-                muted_brush: None,
-                highlight_brush: None,
-                selected_brush: None,
-                border_brush: None,
-                accent_brush: None,
-                style_brush: None,
-                results: Vec::new(),
-                counters: UiCounters::default(),
-                selected_row: 0,
-                visible: false,
-                last_window_location: None,
-                queued_foreground_after_first_paint: false,
-                logged_first_items_paint: false,
-                cursor_visible: false,
-                preview_available,
-                preview_enabled: preview_visible,
-                preview_generation: 0,
-                preview_lines: Arc::from([]),
-                preview_image_encoded: None,
-                preview_bitmap: None,
-                preview_top_line: 0,
-                preview_loading: false,
-                preview_truncated: false,
-                preview_error: None,
-                pending_native_preview: None,
-                native_thumbnail: None,
-                pending_high_surrogate: None,
-                input_ready_at: Instant::now(),
-                layout: app_layout,
-            })
-        }
+        Ok(Self {
+            view_model,
+            shared,
+            surface: None,
+            back_buffer: None,
+            font,
+            bold_font,
+            italic_font,
+            bold_italic_font,
+            counter_font,
+            text_paint: fill_paint(COLOR_TEXT),
+            muted_paint: fill_paint(COLOR_TEXT),
+            highlight_paint: fill_paint(COLOR_MATCH),
+            selected_paint: fill_paint(COLOR_SELECTED),
+            selected_accent_paint: fill_paint(COLOR_SELECTED_ACCENT),
+            stroke_paint: stroke_paint(COLOR_BORDER, PANEL_BORDER),
+            results: Vec::new(),
+            counters: UiCounters::default(),
+            selected_row: 0,
+            indexing_spinner_frame: 0,
+            visible: false,
+            window_shown: false,
+            last_window_location: None,
+            logged_first_items_paint: false,
+            cursor_visible: false,
+            preview_available,
+            preview_enabled: preview_visible,
+            preview_generation: 0,
+            preview_lines: Arc::from([]),
+            preview_image: None,
+            preview_top_line: 0,
+            preview_loading: false,
+            preview_loading_visible: false,
+            preview_truncated: false,
+            preview_error: None,
+            pending_native_preview: None,
+            native_thumbnail: None,
+            pending_high_surrogate: None,
+            input_ready_at: Instant::now(),
+            layout: app_layout,
+        })
     }
 
     fn apply_pending(&mut self, hwnd: HWND) {
@@ -632,20 +660,41 @@ impl WindowState {
                     self.show_root(hwnd);
                 },
                 UiEvent::Results(update) => {
+                    let was_scanning = self.counters.scanning;
                     self.results = update.results;
                     self.counters = update.counters;
                     self.selected_row = update.selected_row;
+                    unsafe {
+                        if self.counters.scanning && !was_scanning {
+                            self.indexing_spinner_frame = 0;
+                            let _ = SetTimer(
+                                Some(hwnd),
+                                WM_INDEXING_SPINNER as usize,
+                                INDEXING_SPINNER_INTERVAL_MS,
+                                None,
+                            );
+                        } else if !self.counters.scanning && was_scanning {
+                            self.indexing_spinner_frame = 0;
+                            let _ = KillTimer(Some(hwnd), WM_INDEXING_SPINNER as usize);
+                        }
+                    }
                 }
                 UiEvent::Preview(PreviewView::Text { update, top_line }) => {
+                    let preserve_previous_view = matches!(&update, PreviewUpdate::Clear { .. });
                     match update {
                         PreviewUpdate::Clear { generation } => {
                             self.preview_generation = generation;
-                            self.preview_lines = Arc::from([]);
-                            self.preview_image_encoded = None;
-                            self.preview_bitmap = None;
                             self.preview_loading = true;
-                            self.preview_truncated = false;
+                            self.preview_loading_visible = false;
                             self.preview_error = None;
+                            unsafe {
+                                let _ = SetTimer(
+                                    Some(hwnd),
+                                    WM_PREVIEW_LOADING as usize,
+                                    PREVIEW_LOADING_DELAY_MS,
+                                    None,
+                                );
+                            }
                         }
                         PreviewUpdate::Ready {
                             generation,
@@ -654,31 +703,51 @@ impl WindowState {
                             ..
                         } if generation == self.preview_generation => {
                             self.preview_lines = lines;
-                            self.preview_image_encoded = None;
-                            self.preview_bitmap = None;
+                            self.preview_image = None;
                             self.preview_loading = false;
+                            self.preview_loading_visible = false;
                             self.preview_truncated = truncated;
+                            unsafe {
+                                let _ = KillTimer(Some(hwnd), WM_PREVIEW_LOADING as usize);
+                            }
                         }
                         PreviewUpdate::ImageReady {
                             generation,
                             encoded,
                         } if generation == self.preview_generation => {
                             self.preview_loading = false;
+                            self.preview_loading_visible = false;
                             self.preview_error = None;
                             self.preview_lines = Arc::from([]);
-                            self.preview_image_encoded = Some(encoded);
-                            self.preview_bitmap = None;
+                            self.preview_truncated = false;
+                            self.preview_image = Image::from_encoded(Data::new_copy(&encoded));
+                            if self.preview_image.is_none() {
+                                self.preview_error =
+                                    Some("preview produced an unsupported or invalid image".into());
+                            }
+                            unsafe {
+                                let _ = KillTimer(Some(hwnd), WM_PREVIEW_LOADING as usize);
+                            }
                         }
                         PreviewUpdate::Error {
                             generation,
                             message,
                         } if generation == self.preview_generation => {
                             self.preview_loading = false;
+                            self.preview_loading_visible = false;
+                            self.preview_lines = Arc::from([]);
+                            self.preview_image = None;
+                            self.preview_truncated = false;
                             self.preview_error = Some(message);
+                            unsafe {
+                                let _ = KillTimer(Some(hwnd), WM_PREVIEW_LOADING as usize);
+                            }
                         }
                         _ => {}
                     }
-                    self.preview_top_line = top_line;
+                    if !preserve_previous_view {
+                        self.preview_top_line = top_line;
+                    }
                 }
                 UiEvent::Preview(PreviewView::NativeWindow(source)) => {
                     self.pending_native_preview = source;
@@ -698,11 +767,13 @@ impl WindowState {
                 },
                 UiEvent::Hide => unsafe {
                     self.visible = false;
+                    self.window_shown = false;
                     if let Some(thumbnail) = &mut self.native_thumbnail {
                         thumbnail.unregister();
                     }
                     let _ = ShowWindow(hwnd, SW_HIDE);
-                    self.queued_foreground_after_first_paint = false;
+                    let _ = KillTimer(Some(hwnd), WM_PREVIEW_LOADING as usize);
+                    let _ = KillTimer(Some(hwnd), WM_INDEXING_SPINNER as usize);
                     self.logged_first_items_paint = false;
                 },
             }
@@ -713,21 +784,18 @@ impl WindowState {
     }
 
     unsafe fn show_root(&mut self, hwnd: HWND) {
+        let first_show = !self.window_shown;
         let location = calculate_window_location();
         if self.last_window_location != Some(location) {
-            if let Some(target) = self.target.as_ref() {
-                let _ = target.Resize(&D2D_SIZE_U {
-                    width: location.width.max(1) as u32,
-                    height: location.height.max(1) as u32,
-                });
-            }
+            self.surface = None;
+            self.back_buffer = None;
             self.last_window_location = Some(location);
             self.layout = calculate_layout(
                 Rect {
-                    x: location.x as f32,
-                    y: location.y as f32,
-                    width: location.width as f32,
-                    height: location.height as f32,
+                    x: 0.0,
+                    y: 0.0,
+                    width: location.width as f32 / location.scale(),
+                    height: location.height as f32 / location.scale(),
                 },
                 PADDING,
                 DISPLAY_ROWS,
@@ -742,251 +810,47 @@ impl WindowState {
             self.view_model.set_preview_visible_rows(preview_rows);
         }
 
-        let _ = SetWindowPos(
-            hwnd,
-            None,
-            location.x,
-            location.y,
-            location.width,
-            location.height,
-            SWP_SHOWWINDOW | SWP_NOZORDER | SWP_NOACTIVATE,
-        );
-        let _ = InvalidateRect(Some(hwnd), None, false);
-        let _ = UpdateWindow(hwnd);
+        // UpdateLayeredWindow submits the complete buffer and new window geometry as one
+        // compositor update, avoiding an independently visible resize operation.
+        if let Err(error) = self.paint(hwnd) {
+            eprintln!("failed to paint picker: {error:#}");
+            let _ = InvalidateRect(Some(hwnd), None, false);
+            let _ = UpdateWindow(hwnd);
+        }
 
-        bring_to_foreground(hwnd);
-        let _ = SetFocus(Some(hwnd));
+        if first_show && self.visible {
+            self.window_shown = true;
+            let _ = ShowWindow(hwnd, SW_SHOW);
+            bring_to_foreground(hwnd);
+            let _ = SetFocus(Some(hwnd));
+        }
+        self.start_input(hwnd);
+    }
 
+    unsafe fn start_input(&mut self, hwnd: HWND) {
         let blink_ms = GetCaretBlinkTime();
         if SetTimer(Some(hwnd), WM_CURSOR_BLINK as usize, blink_ms, None) != 0 {}
         self.input_ready_at = Instant::now() + Duration::from_millis(150);
     }
 
-    unsafe fn ensure_target(&mut self, hwnd: HWND) -> Result<()> {
-        if self.target.is_some() {
-            return Ok(());
-        }
-
-        let mut rect = RECT::default();
-        GetClientRect(hwnd, &mut rect)?;
-        let width = (rect.right - rect.left).max(1) as u32;
-        let height = (rect.bottom - rect.top).max(1) as u32;
-
-        let render_props = D2D1_RENDER_TARGET_PROPERTIES {
-            r#type: D2D1_RENDER_TARGET_TYPE_DEFAULT,
-            pixelFormat: D2D1_PIXEL_FORMAT {
-                format: DXGI_FORMAT_UNKNOWN,
-                alphaMode: D2D1_ALPHA_MODE_UNKNOWN,
-            },
-            dpiX: 0.0,
-            dpiY: 0.0,
-            usage: Default::default(),
-            minLevel: D2D1_FEATURE_LEVEL_DEFAULT,
-        };
-        let hwnd_props = D2D1_HWND_RENDER_TARGET_PROPERTIES {
-            hwnd,
-            pixelSize: D2D_SIZE_U { width, height },
-            presentOptions: D2D1_PRESENT_OPTIONS_NONE,
-        };
-        let target = self
-            .factory
-            .CreateHwndRenderTarget(&render_props, &hwnd_props)?;
-
-        self.text_brush = Some(target.CreateSolidColorBrush(&rgb(COLOR_TEXT), None)?);
-        self.muted_brush = Some(target.CreateSolidColorBrush(&rgb(COLOR_TEXT), None)?);
-        self.highlight_brush = Some(target.CreateSolidColorBrush(&rgb(COLOR_MATCH), None)?);
-        self.selected_brush = Some(target.CreateSolidColorBrush(&rgb(COLOR_SELECTED), None)?);
-        self.border_brush = Some(target.CreateSolidColorBrush(&rgb(COLOR_BORDER), None)?);
-        self.accent_brush = Some(target.CreateSolidColorBrush(&rgb(COLOR_SELECTED_ACCENT), None)?);
-        self.style_brush = Some(target.CreateSolidColorBrush(&rgb(COLOR_TEXT), None)?);
-        self.target = Some(target);
-        Ok(())
-    }
-
-    fn discard_device_resources(&mut self) {
-        self.preview_bitmap = None;
-        self.style_brush = None;
-        self.accent_brush = None;
-        self.border_brush = None;
-        self.selected_brush = None;
-        self.highlight_brush = None;
-        self.muted_brush = None;
-        self.text_brush = None;
-        self.target = None;
-    }
-
-    unsafe fn draw_preview(&self, target: &ID2D1HwndRenderTarget) {
-        let (Some(border), Some(preview)) = (self.layout.preview_border, self.layout.preview_box)
-        else {
-            return;
-        };
-        draw_rounded_rectangle(
-            target,
-            self.border_brush.as_ref().expect("border brush"),
-            border,
-            8.0,
-        );
-        if let Some(bitmap) = &self.preview_bitmap {
-            let size = bitmap.GetSize();
-            if size.width > 0.0 && size.height > 0.0 {
-                let scale = (preview.width / size.width).min(preview.height / size.height);
-                let width = size.width * scale;
-                let height = size.height * scale;
-                let destination = D2D_RECT_F {
-                    left: preview.x + (preview.width - width) / 2.0,
-                    top: preview.y + (preview.height - height) / 2.0,
-                    right: preview.x + (preview.width + width) / 2.0,
-                    bottom: preview.y + (preview.height + height) / 2.0,
-                };
-                target.DrawBitmap(
-                    bitmap,
-                    Some(&destination),
-                    1.0,
-                    D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
-                    None,
-                );
-            }
-            return;
-        }
-        if let Some(message) = self.preview_error.as_deref() {
-            draw_text(
-                target,
-                self.highlight_brush.as_ref().expect("highlight brush"),
-                &self.text_format,
-                message,
-                preview,
-            );
-            return;
-        }
-        if self.preview_loading && self.preview_lines.is_empty() {
-            draw_text(
-                target,
-                self.muted_brush.as_ref().expect("muted brush"),
-                &self.text_format,
-                "Loading preview...",
-                preview,
-            );
-            return;
-        }
-
-        let max_rows = (preview.height / self.layout.text_height).floor() as usize;
-        let content_rows = if self.preview_truncated {
-            max_rows.saturating_sub(1)
-        } else {
-            max_rows
-        };
-        for (row, line) in self
-            .preview_lines
-            .iter()
-            .skip(self.preview_top_line)
-            .take(content_rows)
-            .enumerate()
-        {
-            let top = preview.y + row as f32 * self.layout.text_height;
-            let mut x = preview.x;
-            for span in &line.spans {
-                let format = match (span.style.bold, span.style.italic) {
-                    (true, true) => &self.bold_italic_text_format,
-                    (true, false) => &self.bold_text_format,
-                    (false, true) => &self.italic_text_format,
-                    (false, false) => &self.text_format,
-                };
-                let width = measure_text_width(&self.dwrite_factory, format, &span.text);
-                if x >= preview.x + preview.width {
-                    break;
-                }
-                let (foreground, background) = resolved_preview_colors(&span.style);
-                let brush = self.style_brush.as_ref().expect("style brush");
-                if let Some(background) = background {
-                    brush.SetColor(&rgb(background));
-                    target.FillRectangle(
-                        &D2D_RECT_F {
-                            left: x,
-                            top,
-                            right: (x + width).min(preview.x + preview.width),
-                            bottom: top + self.layout.text_height,
-                        },
-                        brush,
-                    );
-                }
-                if !span.style.hidden {
-                    brush.SetColor(&rgb(foreground));
-                    draw_text(
-                        target,
-                        brush,
-                        format,
-                        &span.text,
-                        Rect {
-                            x,
-                            y: top,
-                            width: (preview.x + preview.width - x).max(0.0),
-                            height: self.layout.text_height,
-                        },
-                    );
-                    if span.style.underline || span.style.strikethrough {
-                        let y = if span.style.strikethrough {
-                            top + self.layout.text_height * 0.55
-                        } else {
-                            top + self.layout.text_height - 1.5
-                        };
-                        target.DrawLine(
-                            Vector2 { X: x, Y: y },
-                            Vector2 {
-                                X: (x + width).min(preview.x + preview.width),
-                                Y: y,
-                            },
-                            brush,
-                            1.0,
-                            None,
-                        );
-                    }
-                }
-                x += width;
-            }
-        }
-        if self.preview_truncated {
-            draw_text(
-                target,
-                self.muted_brush.as_ref().expect("muted brush"),
-                &self.text_format,
-                "… preview truncated at 4,000 lines or 1 MiB",
-                Rect {
-                    x: preview.x,
-                    y: preview.y + content_rows as f32 * self.layout.text_height,
-                    width: preview.width,
-                    height: self.layout.text_height,
-                },
-            );
-        }
-    }
-
-    unsafe fn ensure_preview_bitmap(&mut self) -> Result<()> {
-        if self.preview_bitmap.is_some() || self.preview_image_encoded.is_none() {
-            return Ok(());
-        }
-        let encoded = self.preview_image_encoded.as_ref().expect("image checked");
-        let stream = self.wic_factory.CreateStream()?;
-        stream.InitializeFromMemory(encoded)?;
-        let decoder = self.wic_factory.CreateDecoderFromStream(
-            &stream,
-            std::ptr::null(),
-            WICDecodeMetadataCacheOnLoad,
-        )?;
-        let frame = decoder.GetFrame(0)?;
-        let converter = self.wic_factory.CreateFormatConverter()?;
-        converter.Initialize(
-            &frame,
-            &GUID_WICPixelFormat32bppPBGRA,
-            WICBitmapDitherTypeNone,
-            None,
-            0.0,
-            WICBitmapPaletteTypeMedianCut,
-        )?;
-        let target = self
-            .target
+    fn ensure_surface(&mut self) -> Result<()> {
+        let location = self
+            .last_window_location
+            .context("window location not initialized")?;
+        let width = location.width.max(1);
+        let height = location.height.max(1);
+        let needs_surface = self
+            .surface
             .as_ref()
-            .context("render target not initialized")?;
-        self.preview_bitmap = Some(target.CreateBitmapFromWicBitmap(&converter, None)?);
+            .map(|surface| surface.width() != width || surface.height() != height)
+            .unwrap_or(true);
+        if needs_surface {
+            self.surface = surfaces::raster_n32_premul((width, height));
+            if self.surface.is_none() {
+                return Err(anyhow!("failed to create Skia raster surface"));
+            }
+            self.back_buffer = Some(unsafe { GdiBackBuffer::new(width, height)? });
+        }
         Ok(())
     }
 
@@ -1006,7 +870,11 @@ impl WindowState {
         }
         if source.is_some() {
             if let Some(preview) = self.layout.preview_box {
-                if let Err(error) = thumbnail.update_layout(preview) {
+                let scale = self
+                    .last_window_location
+                    .map(ScreenLocation::scale)
+                    .unwrap_or(1.0);
+                if let Err(error) = thumbnail.update_layout(preview, scale) {
                     self.preview_error = Some(format!("Window preview unavailable: {error}"));
                 }
             }
@@ -1014,182 +882,207 @@ impl WindowState {
     }
 
     unsafe fn paint(&mut self, hwnd: HWND) -> Result<()> {
-        self.ensure_target(hwnd)?;
-        if let Err(error) = self.ensure_preview_bitmap() {
-            self.preview_image_encoded = None;
-            self.preview_error = Some(format!("image preview failed: {error}"));
-        }
-        let Some(target) = self.target.as_ref() else {
+        self.ensure_surface()?;
+        let scale = self
+            .last_window_location
+            .context("window location not initialized")?
+            .scale();
+        let Some(surface) = self.surface.as_mut() else {
             return Ok(());
         };
+        let canvas = surface.canvas();
+        canvas.clear(skia_color(COLOR_BACKGROUND));
+        let frame_save_count = canvas.save();
+        canvas.reset_matrix();
+        canvas.scale((scale, scale));
 
-        target.BeginDraw();
-        target.Clear(Some(&rgb(COLOR_BACKGROUND)));
-        self.draw_preview(target);
-
-        let search_state = self.view_model.current_search_text();
-        let search_string = search_state.text;
-        let prompt = "> ";
-        let prompt_width = measure_text_width(&self.dwrite_factory, &self.text_format, prompt);
-
-        let radius = 8.0;
-
-        draw_rounded_rectangle(
-            target,
-            self.border_brush.as_ref().expect("border brush"),
-            self.layout.search_border,
-            radius,
-        );
-
-        if let Some(selection) = search_state.selection {
-            let prefix = &search_string[..selection.start];
-            let prefix_utf16: Vec<u16> = prefix.encode_utf16().collect();
-            let selected_text = &search_string[selection.start..selection.end];
-            let selected_text_utf16: Vec<u16> = selected_text.encode_utf16().collect();
-
-            let prefix_layout = self
-                .dwrite_factory
-                .CreateTextLayout(
-                    &prefix_utf16,
-                    &self.text_format,
-                    1.0,
-                    self.layout.row_size.height,
-                )
-                .expect("dwrite_factory.layout");
-
-            let selected_text_layout = self
-                .dwrite_factory
-                .CreateTextLayout(
-                    &selected_text_utf16,
-                    &self.text_format,
-                    1.0,
-                    self.layout.text_height,
-                )
-                .expect("dwrite_factory.layout");
-
-            let mut prefix_metrics = DWRITE_TEXT_METRICS::default();
-            let mut selected_text_metrics = DWRITE_TEXT_METRICS::default();
-
-            let _ = prefix_layout
-                .GetMetrics(&mut prefix_metrics)
-                .expect("dwrite_factory.layout.GetMetrics");
-            let _ = selected_text_layout
-                .GetMetrics(&mut selected_text_metrics)
-                .expect("dwrite_factory.layout.GetMetrics");
-
-            let rect = D2D_RECT_F {
-                left: self.layout.search_box.x
-                    + prompt_width
-                    + prefix_metrics.widthIncludingTrailingWhitespace,
-                top: self.layout.search_box.y,
-                right: self.layout.search_box.x
-                    + prompt_width
-                    + prefix_metrics.widthIncludingTrailingWhitespace
-                    + selected_text_metrics.widthIncludingTrailingWhitespace,
-                bottom: self.layout.search_box.y + self.layout.search_box.height,
-            };
-            target.FillRectangle(&rect, self.selected_brush.as_ref().expect("brush created"));
+        if let (Some(border), Some(area)) = (self.layout.preview_border, self.layout.preview_box) {
+            draw_skia_round_rect(canvas, &self.stroke_paint, border, 8.0);
+            if let Some(image) = &self.preview_image {
+                let scale =
+                    (area.width / image.width() as f32).min(area.height / image.height() as f32);
+                let width = image.width() as f32 * scale;
+                let height = image.height() as f32 * scale;
+                canvas.draw_image_rect(
+                    image,
+                    None,
+                    SkRect::from_xywh(
+                        area.x + (area.width - width) / 2.0,
+                        area.y + (area.height - height) / 2.0,
+                        width,
+                        height,
+                    ),
+                    &self.text_paint,
+                );
+            } else {
+                let visible_rows = (area.height / self.layout.text_height).floor() as usize;
+                let content_rows = if self.preview_truncated {
+                    visible_rows.saturating_sub(1)
+                } else {
+                    visible_rows
+                };
+                for (row, line) in self
+                    .preview_lines
+                    .iter()
+                    .skip(self.preview_top_line)
+                    .take(content_rows)
+                    .enumerate()
+                {
+                    draw_skia_preview_line(
+                        canvas,
+                        &self.font,
+                        &self.bold_font,
+                        &self.italic_font,
+                        &self.bold_italic_font,
+                        line,
+                        Rect {
+                            x: area.x,
+                            y: area.y + row as f32 * self.layout.text_height,
+                            width: area.width,
+                            height: self.layout.text_height,
+                        },
+                    );
+                }
+                let status = if self.preview_loading_visible {
+                    Some(("Loading preview…", &self.muted_paint))
+                } else if let Some(error) = self.preview_error.as_deref() {
+                    Some((error, &self.highlight_paint))
+                } else if self.preview_truncated {
+                    Some((
+                        "… preview truncated at 4,000 lines or 1 MiB",
+                        &self.muted_paint,
+                    ))
+                } else {
+                    None
+                };
+                if let Some((text, paint)) = status {
+                    let row = if self.preview_truncated {
+                        content_rows
+                    } else {
+                        0
+                    };
+                    draw_skia_text(
+                        canvas,
+                        &self.font,
+                        paint,
+                        text,
+                        Rect {
+                            x: area.x,
+                            y: area.y + row as f32 * self.layout.text_height,
+                            width: area.width,
+                            height: self.layout.text_height,
+                        },
+                        TextAlign::Left,
+                    );
+                }
+            }
         }
 
-        draw_text(
-            target,
-            self.text_brush.as_ref().expect("brush created"),
-            &self.text_format,
-            prompt,
-            self.layout.search_box,
-        );
-        draw_text(
-            target,
-            self.text_brush.as_ref().expect("brush created"),
-            &self.text_format,
-            &search_string,
-            Rect {
-                x: self.layout.search_box.x + prompt_width,
-                y: self.layout.search_box.y,
-                width: self.layout.search_box.width - prompt_width - COUNTER_WIDTH,
-                height: self.layout.search_box.height,
-            },
-        );
-
-        if self.cursor_visible {
-            let search_up_to_cursor = &search_string[..search_state.cursor_position];
-            let wide: Vec<u16> = search_up_to_cursor.encode_utf16().collect();
-            let layout = self
-                .dwrite_factory
-                .CreateTextLayout(&wide, &self.text_format, 1.0, self.layout.text_height)
-                .expect("dwrite_factory.layout");
-            let mut metrics = DWRITE_TEXT_METRICS::default();
-            let _ = layout
-                .GetMetrics(&mut metrics)
-                .expect("dwrite_factory.layout.GetMetrics");
-            let cursor_prefix_width = metrics.widthIncludingTrailingWhitespace;
-
-            target.DrawLine(
-                Vector2 {
-                    X: self.layout.search_box.x + prompt_width + cursor_prefix_width + 1.5,
-                    Y: self.layout.search_box.y,
+        let search = self.view_model.current_search_text();
+        let prompt = if self.counters.scanning {
+            format!(
+                "{} ",
+                INDEXING_SPINNER_FRAMES
+                    [self.indexing_spinner_frame % INDEXING_SPINNER_FRAMES.len()]
+            )
+        } else {
+            "> ".to_owned()
+        };
+        let prompt_width = skia_text_width(&self.font, &self.text_paint, &prompt);
+        draw_skia_round_rect(canvas, &self.stroke_paint, self.layout.search_border, 8.0);
+        if let Some(selection) = search.selection {
+            let prefix_width = skia_text_width(
+                &self.font,
+                &self.text_paint,
+                &search.text[..selection.start],
+            );
+            let selection_width = skia_text_width(
+                &self.font,
+                &self.text_paint,
+                &search.text[selection.start..selection.end],
+            );
+            draw_skia_rect(
+                canvas,
+                &self.selected_paint,
+                Rect {
+                    x: self.layout.search_box.x + prompt_width + prefix_width,
+                    y: self.layout.search_box.y,
+                    width: selection_width,
+                    height: self.layout.search_box.height,
                 },
-                Vector2 {
-                    X: self.layout.search_box.x + prompt_width + cursor_prefix_width + 1.5,
-                    Y: self.layout.search_box.y + self.layout.search_box.height,
-                },
-                self.text_brush.as_ref().expect("brush created"),
-                1.0,
-                None,
             );
         }
-
-        let counter_text = if self.counters.scanning {
-            format!(
-                "{}/{} indexing…",
-                self.counters.displayed, self.counters.published
-            )
+        draw_skia_text(
+            canvas,
+            &self.font,
+            &self.text_paint,
+            &prompt,
+            self.layout.search_box,
+            TextAlign::Left,
+        );
+        let query = Rect {
+            x: self.layout.search_box.x + prompt_width,
+            y: self.layout.search_box.y,
+            width: (self.layout.search_box.width - prompt_width - COUNTER_WIDTH).max(0.0),
+            height: self.layout.search_box.height,
+        };
+        draw_skia_text(
+            canvas,
+            &self.font,
+            &self.text_paint,
+            &search.text,
+            query,
+            TextAlign::Left,
+        );
+        if self.cursor_visible {
+            let cursor_x = query.x
+                + skia_text_width(
+                    &self.font,
+                    &self.text_paint,
+                    &search.text[..search.cursor_position],
+                );
+            canvas.draw_line(
+                (cursor_x + 1.0, query.y),
+                (cursor_x + 1.0, query.y + query.height),
+                &self.text_paint,
+            );
+        }
+        let counter = if self.counters.scanning {
+            format!("{}/{}", self.counters.displayed, self.counters.published)
         } else {
             format!("{}/{}", self.counters.matched, self.counters.published)
         };
-        let counter_rect = Rect {
-            x: self.layout.search_box.x + self.layout.search_box.width - COUNTER_WIDTH,
-            y: self.layout.search_box.y,
-            width: COUNTER_WIDTH,
-            height: self.layout.text_height,
-        };
-        draw_text(
-            target,
-            self.muted_brush.as_ref().expect("brush created"),
-            &self.counter_text_format,
-            &counter_text,
-            counter_rect,
+        draw_skia_text(
+            canvas,
+            &self.counter_font,
+            &self.muted_paint,
+            &counter,
+            Rect {
+                x: self.layout.search_box.x + self.layout.search_box.width - COUNTER_WIDTH,
+                y: self.layout.search_box.y,
+                width: COUNTER_WIDTH,
+                height: self.layout.text_height,
+            },
+            TextAlign::Right,
         );
 
-        draw_rounded_rectangle(
-            target,
-            self.border_brush.as_ref().expect("border brush"),
-            self.layout.list_border,
-            radius,
-        );
-
+        draw_skia_round_rect(canvas, &self.stroke_paint, self.layout.list_border, 8.0);
         for visual_row in 0..DISPLAY_ROWS as usize {
-            let result_index = DISPLAY_ROWS as usize - visual_row - 1;
-            let result = self.results.get(result_index);
+            let index = DISPLAY_ROWS as usize - visual_row - 1;
+            let result = self.results.get(index);
             let top = self.layout.list_box.y + visual_row as f32 * self.layout.row_size.height;
-            let row_height = self.layout.row_size.height - RESULT_GAP;
             let text_top = top + RESULT_VERTICAL_PADDING;
-            if result.is_some() && result_index == self.selected_row {
+            if result.is_some() && index == self.selected_row {
                 let selected = Rect {
                     x: self.layout.list_box.x,
                     y: top,
                     width: self.layout.row_size.width,
-                    height: row_height,
+                    height: self.layout.row_size.height - RESULT_GAP,
                 };
-                fill_rounded_rectangle(
-                    target,
-                    self.selected_brush.as_ref().expect("brush created"),
-                    selected,
-                    6.0,
-                );
-                fill_rounded_rectangle(
-                    target,
-                    self.accent_brush.as_ref().expect("accent brush"),
+                draw_skia_round_rect(canvas, &self.selected_paint, selected, 6.0);
+                draw_skia_round_rect(
+                    canvas,
+                    &self.selected_accent_paint,
                     Rect {
                         x: selected.x,
                         y: selected.y + RESULT_VERTICAL_PADDING,
@@ -1199,49 +1092,43 @@ impl WindowState {
                     SELECTED_ACCENT_WIDTH / 2.0,
                 );
             }
-
             let Some(result) = result else {
                 continue;
             };
-            let item_text_rect = Rect {
+            let text_rect = Rect {
                 x: self.layout.list_box.x + RESULT_HORIZONTAL_PADDING,
                 y: text_top,
                 width: (self.layout.list_box.width - RESULT_HORIZONTAL_PADDING * 2.0).max(0.0),
                 height: self.layout.text_height,
             };
-
-            draw_text(
-                target,
-                self.text_brush.as_ref().expect("brush created"),
-                &self.text_format,
+            draw_skia_text(
+                canvas,
+                &self.font,
+                &self.text_paint,
                 &result.path,
-                item_text_rect,
+                text_rect,
+                TextAlign::Left,
             );
-
-            draw_position_highlights(
-                target,
-                &self.dwrite_factory,
-                self.highlight_brush.as_ref().expect("brush created"),
-                &self.text_format,
+            draw_skia_highlights(
+                canvas,
+                &self.font,
+                &self.highlight_paint,
                 &result.path,
                 &result.positions,
-                self.layout.list_box.x + RESULT_HORIZONTAL_PADDING,
-                text_top,
-                self.layout.list_box.width,
-                self.layout.text_height,
+                text_rect,
             );
         }
-
-        if let Err(error) = target.EndDraw(None, None) {
-            if error.code() == D2DERR_RECREATE_TARGET {
-                self.discard_device_resources();
-                let _ = InvalidateRect(Some(hwnd), None, false);
-                return Ok(());
-            }
-            return Err(error.into());
-        }
+        canvas.restore_to_count(frame_save_count);
+        self.back_buffer
+            .as_mut()
+            .context("GDI back buffer not initialized")?
+            .present(
+                hwnd,
+                surface,
+                self.last_window_location
+                    .context("window location not initialized")?,
+            )?;
         self.sync_native_thumbnail(hwnd);
-
         Ok(())
     }
 }
@@ -1323,6 +1210,20 @@ unsafe extern "system" fn wnd_proc(
             }
             LRESULT(0)
         }
+        WM_ERASEBKGND => LRESULT(1),
+        WM_DPICHANGED => {
+            let state = window_state(hwnd);
+            if !state.is_null() {
+                let state = &mut *state;
+                state.last_window_location = None;
+                state.surface = None;
+                state.back_buffer = None;
+                if state.visible {
+                    state.show_root(hwnd);
+                }
+            }
+            LRESULT(0)
+        }
         WM_UI_UPDATE => {
             let state = window_state(hwnd);
             if !state.is_null() {
@@ -1344,6 +1245,32 @@ unsafe extern "system" fn wnd_proc(
                     let state = &mut *state;
                     state.cursor_visible = !state.cursor_visible;
                     let _ = (*state).paint(hwnd);
+                }
+            } else if wparam.0 == WM_PREVIEW_LOADING as usize {
+                let _ = KillTimer(Some(hwnd), WM_PREVIEW_LOADING as usize);
+                let state = window_state(hwnd);
+                if !state.is_null() {
+                    let state = &mut *state;
+                    if state.preview_loading {
+                        state.preview_lines = Arc::from([]);
+                        state.preview_image = None;
+                        state.preview_top_line = 0;
+                        state.preview_truncated = false;
+                        state.preview_loading_visible = true;
+                        let _ = state.paint(hwnd);
+                    }
+                }
+            } else if wparam.0 == WM_INDEXING_SPINNER as usize {
+                let state = window_state(hwnd);
+                if !state.is_null() {
+                    let state = &mut *state;
+                    if state.counters.scanning {
+                        state.indexing_spinner_frame =
+                            (state.indexing_spinner_frame + 1) % INDEXING_SPINNER_FRAMES.len();
+                        let _ = state.paint(hwnd);
+                    } else {
+                        let _ = KillTimer(Some(hwnd), WM_INDEXING_SPINNER as usize);
+                    }
                 }
             }
             LRESULT(0)
@@ -1435,6 +1362,13 @@ struct ScreenLocation {
     y: i32,
     width: i32,
     height: i32,
+    dpi: u32,
+}
+
+impl ScreenLocation {
+    fn scale(self) -> f32 {
+        self.dpi as f32 / 96.0
+    }
 }
 
 unsafe fn calculate_window_location() -> ScreenLocation {
@@ -1460,12 +1394,28 @@ unsafe fn calculate_window_location() -> ScreenLocation {
         };
 
         if GetMonitorInfoW(monitor, &mut info).as_bool() {
+            let mut dpi_x = 96;
+            let mut dpi_y = 96;
+            if GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &mut dpi_x, &mut dpi_y).is_err() {
+                dpi_x = 96;
+            }
+            let scale = dpi_x as f32 / 96.0;
             let work = info.rcWork;
             let mon_width = work.right - work.left;
             let mon_height = work.bottom - work.top;
-            let width = DEFAULT_WIDTH.min((mon_width - MONITOR_HORIZONTAL_MARGIN).max(MIN_WIDTH));
+            let horizontal_margin = (MONITOR_HORIZONTAL_MARGIN as f32 * scale).round() as i32;
+            let vertical_margin = (MONITOR_VERTICAL_MARGIN as f32 * scale).round() as i32;
+            let minimum_width = (MIN_WIDTH as f32 * scale).round() as i32;
+            let minimum_height = (MIN_HEIGHT as f32 * scale).round() as i32;
+            let width = (DEFAULT_WIDTH as f32 * scale)
+                .round()
+                .min((mon_width - horizontal_margin).max(minimum_width) as f32)
+                as i32;
             let desired_height = DESIRED_WINDOW_HEIGHT.load(Ordering::Relaxed);
-            let height = desired_height.min((mon_height - MONITOR_VERTICAL_MARGIN).max(MIN_HEIGHT));
+            let height = (desired_height as f32 * scale)
+                .round()
+                .min((mon_height - vertical_margin).max(minimum_height) as f32)
+                as i32;
             let center_x = if preferred_x != DEFAULT_LOCATION_VALUE {
                 preferred_x
             } else {
@@ -1484,6 +1434,7 @@ unsafe fn calculate_window_location() -> ScreenLocation {
                 y,
                 width,
                 height,
+                dpi: dpi_x,
             };
         }
     }
@@ -1493,6 +1444,7 @@ unsafe fn calculate_window_location() -> ScreenLocation {
         y: 100,
         width: DEFAULT_WIDTH,
         height: DEFAULT_HEIGHT,
+        dpi: 96,
     }
 }
 
@@ -1509,156 +1461,170 @@ unsafe fn bring_to_foreground(hwnd: HWND) {
     let _ = SendInput(&[input], std::mem::size_of::<INPUT>() as i32);
 }
 
-fn draw_position_highlights(
-    target: &ID2D1HwndRenderTarget,
-    dwrite_factory: &IDWriteFactory,
-    brush: &ID2D1SolidColorBrush,
-    format: &IDWriteTextFormat,
+#[derive(Clone, Copy)]
+enum TextAlign {
+    Left,
+    Right,
+}
+
+fn fill_paint(color: u32) -> Paint {
+    let mut paint = Paint::default();
+    paint.set_anti_alias(true);
+    paint.set_style(PaintStyle::Fill);
+    paint.set_color(skia_color(color));
+    paint
+}
+
+fn stroke_paint(color: u32, width: f32) -> Paint {
+    let mut paint = fill_paint(color);
+    paint.set_style(PaintStyle::Stroke);
+    paint.set_stroke_width(width);
+    paint
+}
+
+fn skia_color(value: u32) -> Color {
+    Color::from_rgb((value >> 16) as u8, (value >> 8) as u8, value as u8)
+}
+
+fn skia_text_width(font: &Font, paint: &Paint, text: &str) -> f32 {
+    font.measure_str(text, Some(paint)).0
+}
+
+fn draw_skia_text(
+    canvas: &Canvas,
+    font: &Font,
+    paint: &Paint,
+    text: &str,
+    rect: Rect,
+    align: TextAlign,
+) {
+    let save = canvas.save();
+    canvas.clip_rect(
+        SkRect::from_xywh(rect.x, rect.y, rect.width, rect.height),
+        None,
+        false,
+    );
+    let width = skia_text_width(font, paint, text);
+    let x = match align {
+        TextAlign::Left => rect.x,
+        TextAlign::Right => rect.x + rect.width - width,
+    };
+    let (_, metrics) = font.metrics();
+    canvas.draw_str(text, (x, rect.y - metrics.ascent), font, paint);
+    canvas.restore_to_count(save);
+}
+
+fn draw_skia_rect(canvas: &Canvas, paint: &Paint, rect: Rect) {
+    canvas.draw_rect(
+        SkRect::from_xywh(rect.x, rect.y, rect.width, rect.height),
+        paint,
+    );
+}
+
+fn draw_skia_round_rect(canvas: &Canvas, paint: &Paint, rect: Rect, radius: f32) {
+    canvas.draw_rrect(
+        RRect::new_rect_xy(
+            SkRect::from_xywh(rect.x, rect.y, rect.width, rect.height),
+            radius,
+            radius,
+        ),
+        paint,
+    );
+}
+
+fn draw_skia_highlights(
+    canvas: &Canvas,
+    font: &Font,
+    paint: &Paint,
     text: &str,
     positions: &[usize],
-    left: f32,
-    top: f32,
-    width: f32,
-    height: f32,
+    rect: Rect,
 ) {
-    if positions.is_empty() {
-        return;
-    }
-
-    let text_wide = wide(text);
-    let Ok(layout) =
-        (unsafe { dwrite_factory.CreateTextLayout(&text_wide, format, width, height) })
-    else {
-        return;
-    };
-
     for &position in positions {
-        if position >= text_wide.len() {
+        if !text.is_char_boundary(position) {
             continue;
         }
-
-        let mut point_x = 0.0f32;
-        let mut point_y = 0.0f32;
-        let mut metrics = Default::default();
-        if unsafe {
-            layout
-                .HitTestTextPosition(
-                    position as u32,
-                    false,
-                    &mut point_x,
-                    &mut point_y,
-                    &mut metrics,
-                )
-                .is_err()
-        } {
+        let Some(character) = text[position..].chars().next() else {
             continue;
-        }
-
-        if point_x >= width {
+        };
+        let prefix = &text[..position];
+        let x = rect.x + skia_text_width(font, paint, prefix);
+        if x >= rect.x + rect.width {
             break;
         }
-
-        let rect = D2D_RECT_F {
-            left: left + point_x,
-            top,
-            right: (left + point_x + metrics.width).min(left + width),
-            bottom: top + height,
-        };
-        unsafe {
-            target.DrawText(
-                &text_wide[position..position + 1],
-                format,
-                &rect,
-                brush,
-                D2D1_DRAW_TEXT_OPTIONS_CLIP,
-                DWRITE_MEASURING_MODE_NATURAL,
-            );
-        }
-    }
-}
-
-fn draw_rounded_rectangle(
-    target: &ID2D1HwndRenderTarget,
-    brush: &ID2D1SolidColorBrush,
-    rect: Rect,
-    radius: f32,
-) {
-    let rounded_rect = D2D1_ROUNDED_RECT {
-        rect: D2D_RECT_F {
-            left: rect.x,
-            top: rect.y,
-            right: rect.x + rect.width,
-            bottom: rect.y + rect.height,
-        },
-        radiusX: radius,
-        radiusY: radius,
-    };
-
-    unsafe {
-        target.DrawRoundedRectangle(&rounded_rect, brush, 1.2, None);
-    }
-}
-
-fn fill_rounded_rectangle(
-    target: &ID2D1HwndRenderTarget,
-    brush: &ID2D1SolidColorBrush,
-    rect: Rect,
-    radius: f32,
-) {
-    let rounded_rect = D2D1_ROUNDED_RECT {
-        rect: D2D_RECT_F {
-            left: rect.x,
-            top: rect.y,
-            right: rect.x + rect.width,
-            bottom: rect.y + rect.height,
-        },
-        radiusX: radius,
-        radiusY: radius,
-    };
-    unsafe {
-        target.FillRoundedRectangle(&rounded_rect, brush);
-    }
-}
-
-fn draw_text(
-    target: &ID2D1HwndRenderTarget,
-    brush: &ID2D1SolidColorBrush,
-    format: &IDWriteTextFormat,
-    text: &str,
-    rect: Rect,
-) {
-    let text = wide(text);
-    let d2d_rect = D2D_RECT_F {
-        left: rect.x,
-        top: rect.y,
-        right: rect.x + rect.width,
-        bottom: rect.y + rect.height,
-    };
-
-    unsafe {
-        target.DrawText(
-            &text,
-            format,
-            &d2d_rect,
-            brush,
-            D2D1_DRAW_TEXT_OPTIONS_CLIP,
-            DWRITE_MEASURING_MODE_NATURAL,
+        draw_skia_text(
+            canvas,
+            font,
+            paint,
+            &character.to_string(),
+            Rect {
+                x,
+                y: rect.y,
+                width: rect.x + rect.width - x,
+                height: rect.height,
+            },
+            TextAlign::Left,
         );
     }
 }
 
-fn measure_text_width(factory: &IDWriteFactory, format: &IDWriteTextFormat, text: &str) -> f32 {
-    let text = wide(text);
-    unsafe {
-        let Ok(layout) = factory.CreateTextLayout(&text, format, f32::MAX, 1000.0) else {
-            return 0.0;
+fn draw_skia_preview_line(
+    canvas: &Canvas,
+    normal: &Font,
+    bold: &Font,
+    italic: &Font,
+    bold_italic: &Font,
+    line: &PreviewLine,
+    rect: Rect,
+) {
+    let save = canvas.save();
+    canvas.clip_rect(
+        SkRect::from_xywh(rect.x, rect.y, rect.width, rect.height),
+        None,
+        false,
+    );
+    let mut x = rect.x;
+    for span in &line.spans {
+        let font = match (span.style.bold, span.style.italic) {
+            (true, true) => bold_italic,
+            (true, false) => bold,
+            (false, true) => italic,
+            (false, false) => normal,
         };
-        let mut metrics = DWRITE_TEXT_METRICS::default();
-        if layout.GetMetrics(&mut metrics).is_err() {
-            return 0.0;
+        let (foreground, background) = resolved_preview_colors(&span.style);
+        let paint = fill_paint(foreground);
+        let width = skia_text_width(font, &paint, &span.text);
+        if let Some(background) = background {
+            draw_skia_rect(
+                canvas,
+                &fill_paint(background),
+                Rect {
+                    x,
+                    y: rect.y,
+                    width,
+                    height: rect.height,
+                },
+            );
         }
-        metrics.widthIncludingTrailingWhitespace
+        draw_skia_text(
+            canvas,
+            font,
+            &paint,
+            &span.text,
+            Rect {
+                x,
+                y: rect.y,
+                width: (rect.x + rect.width - x).max(0.0),
+                height: rect.height,
+            },
+            TextAlign::Left,
+        );
+        x += width;
+        if x >= rect.x + rect.width {
+            break;
+        }
     }
+    canvas.restore_to_count(save);
 }
 
 fn resolved_preview_colors(style: &PreviewStyle) -> (u32, Option<u32>) {
@@ -1689,19 +1655,6 @@ fn dim_color(color: u32) -> u32 {
     let green = ((color >> 8) & 0xff) * 2 / 3;
     let blue = (color & 0xff) * 2 / 3;
     (red << 16) | (green << 8) | blue
-}
-
-fn rgb(value: u32) -> D2D1_COLOR_F {
-    D2D1_COLOR_F {
-        r: ((value >> 16) & 0xff) as f32 / 255.0,
-        g: ((value >> 8) & 0xff) as f32 / 255.0,
-        b: (value & 0xff) as f32 / 255.0,
-        a: 1.0,
-    }
-}
-
-fn wide(value: &str) -> Vec<u16> {
-    value.encode_utf16().collect()
 }
 
 fn wide_null(value: &str) -> Vec<u16> {
