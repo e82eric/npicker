@@ -2,7 +2,7 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::ptr;
 use std::sync::Arc;
 
-use nfm_search_core::search::{resolve_match_positions, search, SearchOutput};
+use nfm_search_core::search::{search, SearchOutput};
 use nfm_search_core::store::{StreamingItemSnapshot, StreamingItemStore};
 
 #[repr(C)]
@@ -18,8 +18,6 @@ pub struct NfmSearchResult {
     pub score: u32,
     pub text: *const u8,
     pub text_len: usize,
-    pub positions: *const usize,
-    pub position_count: usize,
 }
 
 #[repr(C)]
@@ -37,8 +35,6 @@ pub struct NfmSearchResultUtf16 {
     pub score: u32,
     pub text: *const u16,
     pub text_len: usize,
-    pub positions: *const usize,
-    pub position_count: usize,
 }
 
 #[repr(C)]
@@ -55,17 +51,14 @@ struct OwnedSearchResults {
     header: NfmSearchResults,
     results: Vec<NfmSearchResult>,
     texts: Vec<Vec<u8>>,
-    positions: Vec<Vec<usize>>,
 }
 
 impl OwnedSearchResults {
-    fn new(output: SearchOutput, query: &str) -> Box<Self> {
+    fn new(output: SearchOutput) -> Box<Self> {
         let mut texts = Vec::with_capacity(output.results.len());
-        let mut positions = Vec::with_capacity(output.results.len());
 
         for result in &output.results {
             texts.push(result.path.as_bytes().to_vec());
-            positions.push(resolve_match_positions(query, &result.path));
         }
 
         let mut results = Vec::with_capacity(output.results.len());
@@ -75,8 +68,6 @@ impl OwnedSearchResults {
                 score: result.score,
                 text: texts[index].as_ptr(),
                 text_len: texts[index].len(),
-                positions: positions[index].as_ptr(),
-                position_count: positions[index].len(),
             });
         }
 
@@ -91,7 +82,6 @@ impl OwnedSearchResults {
             header,
             results,
             texts,
-            positions,
         })
     }
 }
@@ -102,21 +92,14 @@ struct OwnedSearchResultsUtf16 {
     header: NfmSearchResultsUtf16,
     results: Vec<NfmSearchResultUtf16>,
     texts: Vec<Vec<u16>>,
-    positions: Vec<Vec<usize>>,
 }
 
 impl OwnedSearchResultsUtf16 {
-    fn new(output: SearchOutput, query: &str) -> Box<Self> {
+    fn new(output: SearchOutput) -> Box<Self> {
         let mut texts: Vec<Vec<u16>> = Vec::with_capacity(output.results.len());
-        let mut positions: Vec<Vec<usize>> = Vec::with_capacity(output.results.len());
 
         for result in &output.results {
             texts.push(result.path.encode_utf16().collect::<Vec<u16>>());
-            let utf8_positions = resolve_match_positions(query, &result.path);
-            positions.push(utf8_positions_to_utf16_offsets(
-                &result.path,
-                &utf8_positions,
-            ));
         }
 
         let mut results = Vec::with_capacity(output.results.len());
@@ -126,8 +109,6 @@ impl OwnedSearchResultsUtf16 {
                 score: result.score,
                 text: texts[index].as_ptr(),
                 text_len: texts[index].len(),
-                positions: positions[index].as_ptr(),
-                position_count: positions[index].len(),
             });
         }
 
@@ -142,25 +123,8 @@ impl OwnedSearchResultsUtf16 {
             header,
             results,
             texts,
-            positions,
         })
     }
-}
-
-fn utf8_positions_to_utf16_offsets(text: &str, positions: &[usize]) -> Vec<usize> {
-    positions
-        .iter()
-        .map(|&position| utf16_offset_for_utf8_position(text, position))
-        .collect()
-}
-
-fn utf16_offset_for_utf8_position(text: &str, position: usize) -> usize {
-    let mut byte_index = position.min(text.len());
-    while !text.is_char_boundary(byte_index) {
-        byte_index -= 1;
-    }
-
-    text[..byte_index].encode_utf16().count()
 }
 
 #[unsafe(no_mangle)]
@@ -285,7 +249,7 @@ pub unsafe extern "C" fn nfm_search_session_search(
         let Some(output) = search(Arc::clone(&session.snapshot), query, || false) else {
             return ptr::null_mut();
         };
-        let owned = OwnedSearchResults::new(output, query);
+        let owned = OwnedSearchResults::new(output);
         Box::into_raw(owned) as *mut NfmSearchResults
     }))
     .unwrap_or(ptr::null_mut())
@@ -315,7 +279,7 @@ pub unsafe extern "C" fn nfm_search_session_search_utf16(
         let Some(output) = search(Arc::clone(&session.snapshot), &query, || false) else {
             return ptr::null_mut();
         };
-        let owned = OwnedSearchResultsUtf16::new(output, &query);
+        let owned = OwnedSearchResultsUtf16::new(output);
         Box::into_raw(owned) as *mut NfmSearchResultsUtf16
     }))
     .unwrap_or(ptr::null_mut())
@@ -403,13 +367,5 @@ mod tests {
             nfm_search_results_utf16_free(results);
             nfm_search_session_destroy(session);
         }
-    }
-
-    #[test]
-    fn converts_utf8_byte_positions_to_utf16_offsets() {
-        assert_eq!(
-            utf8_positions_to_utf16_offsets("aβ𝄞z", &[0, 1, 3, 7]),
-            [0, 1, 2, 4]
-        );
     }
 }
