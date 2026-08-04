@@ -1177,6 +1177,10 @@ impl WindowState {
                     .context("window location not initialized")?,
             )?;
         self.sync_native_thumbnail(hwnd);
+        if self.visible && !self.logged_first_items_paint && !self.results.is_empty() {
+            self.logged_first_items_paint = true;
+            let _ = PostMessageW(Some(hwnd), WM_UI_BRING_TO_FOREGROUND, WPARAM(0), LPARAM(0));
+        }
         Ok(())
     }
 }
