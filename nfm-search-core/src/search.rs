@@ -52,7 +52,6 @@ pub struct SearchResult {
     pub node_index: usize,
     pub score: u32,
     pub path: String,
-    pub positions: Vec<usize>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -376,17 +375,14 @@ where
 
     let append_start = Instant::now();
     let mut path_buffer = Vec::with_capacity(512);
-    let mut position_scratch = MatchScratch::default();
     let results: Vec<SearchResult> = candidates
         .into_iter()
         .map(|candidate| {
             let path = snapshot.get_string_lossy(candidate.node_index, &mut path_buffer);
-            let positions = pattern.positions(path.as_bytes(), &mut position_scratch);
             SearchResult {
                 node_index: candidate.node_index,
                 score: candidate.score,
                 path,
-                positions,
             }
         })
         .collect();
@@ -415,6 +411,20 @@ where
     })
 }
 
+/// Resolves the byte offsets used to highlight one already-ranked result.
+///
+/// Search results contain ranking data only, so callers can pay the
+/// backtracking cost only for results they are about to display.
+pub fn resolve_match_positions(query: &str, text: &str) -> Vec<usize> {
+    if query.is_empty() {
+        return Vec::new();
+    }
+    let Some(pattern) = AsciiPattern::parse(query) else {
+        return Vec::new();
+    };
+    pattern.positions(text.as_bytes(), &mut MatchScratch::default())
+}
+
 fn materialize_unfiltered<S>(
     snapshot: Arc<S>,
     range: Range<usize>,
@@ -430,7 +440,6 @@ where
             node_index,
             score: 0,
             path: snapshot.get_string_lossy(node_index, &mut path_buffer),
-            positions: Vec::new(),
         })
         .collect()
 }
@@ -1416,6 +1425,15 @@ mod search_sort_tests {
                 .collect::<Vec<_>>(),
             vec![0, 2, 3]
         );
+    }
+
+    #[test]
+    fn search_defers_positions_until_the_result_is_materialized() {
+        let snapshot = Arc::new(FlatSnapshot::from_items([("alpha-beta", ())]));
+        let output = search(snapshot, "ab", || false).expect("search should complete");
+
+        assert_eq!(output.results[0].path, "alpha-beta");
+        assert_eq!(resolve_match_positions("ab", "alpha-beta"), vec![0, 6]);
     }
 }
 

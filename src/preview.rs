@@ -1042,7 +1042,6 @@ mod tests {
             node_index: 0,
             score: 1,
             path: "window".into(),
-            positions: Vec::new(),
         };
         let windows = AnyItemSource::Windows(Arc::new(FlatSnapshot::from_items([(
             "window",

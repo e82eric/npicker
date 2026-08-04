@@ -2,7 +2,7 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::ptr;
 use std::sync::Arc;
 
-use nfm_search_core::search::{search, SearchOutput};
+use nfm_search_core::search::{resolve_match_positions, search, SearchOutput};
 use nfm_search_core::store::{StreamingItemSnapshot, StreamingItemStore};
 
 #[repr(C)]
@@ -59,13 +59,13 @@ struct OwnedSearchResults {
 }
 
 impl OwnedSearchResults {
-    fn new(output: SearchOutput) -> Box<Self> {
+    fn new(output: SearchOutput, query: &str) -> Box<Self> {
         let mut texts = Vec::with_capacity(output.results.len());
         let mut positions = Vec::with_capacity(output.results.len());
 
         for result in &output.results {
             texts.push(result.path.as_bytes().to_vec());
-            positions.push(result.positions.clone());
+            positions.push(resolve_match_positions(query, &result.path));
         }
 
         let mut results = Vec::with_capacity(output.results.len());
@@ -106,15 +106,16 @@ struct OwnedSearchResultsUtf16 {
 }
 
 impl OwnedSearchResultsUtf16 {
-    fn new(output: SearchOutput) -> Box<Self> {
+    fn new(output: SearchOutput, query: &str) -> Box<Self> {
         let mut texts: Vec<Vec<u16>> = Vec::with_capacity(output.results.len());
         let mut positions: Vec<Vec<usize>> = Vec::with_capacity(output.results.len());
 
         for result in &output.results {
             texts.push(result.path.encode_utf16().collect::<Vec<u16>>());
+            let utf8_positions = resolve_match_positions(query, &result.path);
             positions.push(utf8_positions_to_utf16_offsets(
                 &result.path,
-                &result.positions,
+                &utf8_positions,
             ));
         }
 
@@ -284,7 +285,7 @@ pub unsafe extern "C" fn nfm_search_session_search(
         let Some(output) = search(Arc::clone(&session.snapshot), query, || false) else {
             return ptr::null_mut();
         };
-        let owned = OwnedSearchResults::new(output);
+        let owned = OwnedSearchResults::new(output, query);
         Box::into_raw(owned) as *mut NfmSearchResults
     }))
     .unwrap_or(ptr::null_mut())
@@ -314,7 +315,7 @@ pub unsafe extern "C" fn nfm_search_session_search_utf16(
         let Some(output) = search(Arc::clone(&session.snapshot), &query, || false) else {
             return ptr::null_mut();
         };
-        let owned = OwnedSearchResultsUtf16::new(output);
+        let owned = OwnedSearchResultsUtf16::new(output, &query);
         Box::into_raw(owned) as *mut NfmSearchResultsUtf16
     }))
     .unwrap_or(ptr::null_mut())

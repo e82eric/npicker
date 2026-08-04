@@ -21,7 +21,7 @@ use crate::source_store::{AnyItemSource, SharedStore};
 use anyhow::{bail, Result};
 use crossbeam_channel::{unbounded, Receiver, Sender};
 use nfm_search_core::fuzzy_search_session::{FuzzySearchSession, FuzzySearchUpdate};
-use nfm_search_core::search::SearchResult;
+use nfm_search_core::search::{resolve_match_positions, SearchResult};
 use nfm_search_core::timing;
 
 const PICKER_DISPLAY_LIMIT: usize = 7;
@@ -55,9 +55,15 @@ pub struct UiCounters {
 
 #[derive(Clone, Debug, Default)]
 pub struct UiUpdate {
-    pub results: Vec<SearchResult>,
+    pub results: Vec<DisplaySearchResult>,
     pub counters: UiCounters,
     pub selected_row: usize,
+}
+
+#[derive(Clone, Debug)]
+pub struct DisplaySearchResult {
+    pub result: SearchResult,
+    pub positions: Vec<usize>,
 }
 
 pub struct ViewModel {
@@ -80,6 +86,7 @@ pub(crate) enum ViewModelEvent {
 struct State {
     active: Option<ActiveRequest>,
     search_text: String,
+    result_query: String,
     cursor_position: usize,
     cursor_selection_anchor: Option<usize>,
     results: Vec<SearchResult>,
@@ -200,6 +207,7 @@ impl ViewModel {
             state: Mutex::new(State {
                 active: None,
                 search_text: String::new(),
+                result_query: String::new(),
                 results: Vec::new(),
                 counters: UiCounters::default(),
                 selected: 0,
@@ -323,6 +331,7 @@ impl ViewModel {
 
             let cursor_position = query.len();
             state.search_text = query;
+            state.result_query = state.search_text.clone();
             state.results.clear();
             state.counters = UiCounters::default();
             state.selected = 0;
@@ -959,6 +968,7 @@ impl ViewModel {
             };
             let old_session = active.search_session;
             state.search_text.clear();
+            state.result_query.clear();
             state.results.clear();
             state.counters = UiCounters::default();
             state.selected = 0;
@@ -1026,6 +1036,7 @@ impl ViewModel {
             }
 
             state.results = search_update.results;
+            state.result_query = search_update.query;
             state.counters = UiCounters {
                 displayed: state.results.len(),
                 matched: search_update.matched,
@@ -1049,8 +1060,13 @@ impl ViewModel {
                 .as_ref()
                 .and_then(|active| active.store.snapshot())
         };
-        self.preview
-            .selected_result_changed(update.results.get(update.selected_row), source.as_deref());
+        self.preview.selected_result_changed(
+            update
+                .results
+                .get(update.selected_row)
+                .map(|display| &display.result),
+            source.as_deref(),
+        );
         let _ = self.events_tx.send(UiEvent::Results(update));
     }
 
@@ -1106,6 +1122,10 @@ impl State {
             .skip(self.viewport_start)
             .take(PICKER_DISPLAY_LIMIT)
             .cloned()
+            .map(|result| {
+                let positions = resolve_match_positions(&self.result_query, &result.path);
+                DisplaySearchResult { result, positions }
+            })
             .collect();
         let selected_row = if visible_results.is_empty() {
             0

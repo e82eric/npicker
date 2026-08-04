@@ -38,8 +38,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use crate::key_binding::{KeyChord, KeyName};
 use crate::preview::{NativeWindowId, PreviewLine, PreviewUpdate};
 use crate::preview_document::PreviewStyle;
-use crate::view_model::{KeyModifiers, PreviewView, UiCounters, UiEvent, ViewModel};
-use nfm_search_core::search::SearchResult;
+use crate::view_model::{
+    DisplaySearchResult, KeyModifiers, PreviewView, UiCounters, UiEvent, ViewModel,
+};
 
 const DEFAULT_WIDTH: i32 = 1600;
 const MIN_WIDTH: i32 = 480;
@@ -296,7 +297,7 @@ struct WindowState {
     selected_paint: Paint,
     selected_accent_paint: Paint,
     stroke_paint: Paint,
-    results: Vec<SearchResult>,
+    results: Vec<DisplaySearchResult>,
     counters: UiCounters,
     selected_row: usize,
     indexing_spinner_frame: usize,
@@ -1125,7 +1126,7 @@ impl WindowState {
                 canvas,
                 &self.font,
                 &self.text_paint,
-                &result.path,
+                &result.result.path,
                 text_rect,
                 TextAlign::Left,
             );
@@ -1133,7 +1134,7 @@ impl WindowState {
                 canvas,
                 &self.font,
                 &self.highlight_paint,
-                &result.path,
+                &result.result.path,
                 &result.positions,
                 text_rect,
             );

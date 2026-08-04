@@ -24,6 +24,7 @@ where
 pub struct FuzzySearchUpdate {
     pub session_id: u64,
     pub generation: u64,
+    pub query: String,
     pub results: Vec<SearchResult>,
     pub matched: usize,
     pub searched: usize,
@@ -248,6 +249,7 @@ where
         let _ = self.updates_tx.send(FuzzySearchUpdate {
             session_id: self.session_id,
             generation: version,
+            query: cache.query.clone(),
             results: output.results,
             matched: output.matched,
             searched: output.total,
