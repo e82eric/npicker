@@ -11,7 +11,7 @@ use rust_nfm::preview::{
 };
 use rust_nfm::request::{
     DelimitedInputOptions, DelimitedStdinRequest, DelimitedTextSelector, DelimitedValueSelector,
-    PickerResponse, StdinRequest,
+    PickerResponse, PickerSelection, StdinRequest,
 };
 #[cfg(windows)]
 use rust_nfm::request::{FileSystemPickerRequest, WindowListPickerRequest};
@@ -283,23 +283,21 @@ fn default_home_directory() -> Result<String> {
 
 fn response_exit_code(response: Result<PickerResponse>) -> i32 {
     match response {
-        Ok(response) if response.status == "selected" => {
-            if let Some(item) = response.selected_item {
-                let mut stdout = std::io::stdout().lock();
-                if writeln!(stdout, "{item}").is_err() || stdout.flush().is_err() {
-                    1
-                } else {
-                    0
-                }
+        Ok(PickerResponse::Selected(selection)) => {
+            let item = match selection {
+                PickerSelection::Text(item) => item,
+                PickerSelection::NativeWindow { text, .. } => text,
+            };
+            let mut stdout = std::io::stdout().lock();
+            if writeln!(stdout, "{item}").is_err() || stdout.flush().is_err() {
+                1
             } else {
                 0
             }
         }
-        Ok(response) if response.status == "cancelled" => 0,
-        Ok(response) => {
-            if let Some(message) = response.error_message {
-                eprintln!("{message}");
-            }
+        Ok(PickerResponse::Cancelled) => 0,
+        Ok(PickerResponse::Error(message)) => {
+            eprintln!("{message}");
             1
         }
         Err(error) => {

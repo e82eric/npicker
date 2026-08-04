@@ -317,7 +317,7 @@ impl ViewModel {
         let response = response_rx
             .recv()
             .unwrap_or_else(|_| PickerResponse::cancelled());
-        timing::write(format!("response status={}", response.status));
+        timing::write(format!("response status={}", response.status_label()));
         Ok(response)
     }
 
@@ -1209,7 +1209,12 @@ mod tests {
         assert_eq!(selected, Some(NativeWindowId(0x1234)));
         view_model.select_current();
         let response = request_thread.join().unwrap().unwrap();
-        assert_eq!(response.status, "selected");
-        assert_eq!(response.selected_window, Some(0x1234));
+        assert_eq!(
+            response,
+            PickerResponse::Selected(crate::request::PickerSelection::NativeWindow {
+                text: "00001234      100 app.exe Window title".into(),
+                hwnd: 0x1234,
+            })
+        );
     }
 }

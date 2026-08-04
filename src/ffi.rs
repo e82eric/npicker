@@ -13,7 +13,10 @@ use crate::preview::{
     CommandPreviewTarget, PreviewCancellation, PreviewConfig, PreviewJob, PreviewOutputType,
     PreviewProfile, PreviewResolver, PreviewService,
 };
-use crate::request::{FileSystemPickerRequest, FlatItemsPickerRequest, WindowListPickerRequest};
+use crate::request::{
+    FileSystemPickerRequest, FlatItemsPickerRequest, PickerResponse, PickerSelection,
+    WindowListPickerRequest,
+};
 use crate::skia_ui as picker_ui;
 use crate::view_model::ViewModel;
 use std::sync::Arc;
@@ -75,8 +78,8 @@ pub extern "C" fn RustNfmShowProgramsList(
             };
 
             match view_model.run_request(&request) {
-                Ok(response) if response.status == "selected" => {
-                    if let (Some(on_select), Some(selected)) = (on_select, response.selected_item) {
+                Ok(PickerResponse::Selected(PickerSelection::Text(selected))) => {
+                    if let Some(on_select) = on_select {
                         if let Ok(selected) = CString::new(selected) {
                             unsafe {
                                 on_select(selected.as_ptr() as *mut c_char, state as *mut c_void);
@@ -125,8 +128,8 @@ pub unsafe extern "C" fn RustNfmShowFileSystem(
                 search_string: None,
             };
             match view_model.run_request(&request) {
-                Ok(response) if response.status == "selected" => {
-                    if let (Some(on_select), Some(selected)) = (on_select, response.selected_item) {
+                Ok(PickerResponse::Selected(PickerSelection::Text(selected))) => {
+                    if let Some(on_select) = on_select {
                         if let Ok(selected) = CString::new(selected) {
                             unsafe {
                                 on_select(selected.as_ptr() as *mut c_char, state as *mut c_void)
@@ -165,8 +168,8 @@ pub extern "C" fn RustNfmShowWindows(
         thread::spawn(move || {
             let request = WindowListPickerRequest { items };
             match view_model.run_request(&request) {
-                Ok(response) if response.status == "selected" => {
-                    if let (Some(on_select), Some(hwnd)) = (on_select, response.selected_window) {
+                Ok(PickerResponse::Selected(PickerSelection::NativeWindow { hwnd, .. })) => {
+                    if let Some(on_select) = on_select {
                         unsafe { on_select(hwnd, state as *mut c_void) };
                     }
                 }
@@ -238,8 +241,8 @@ pub extern "C" fn RustNfmShowItemsList(
             };
 
             match view_model.run_request(&request) {
-                Ok(response) if response.status == "selected" => {
-                    if let (Some(on_select), Some(selected)) = (on_select, response.selected_item) {
+                Ok(PickerResponse::Selected(PickerSelection::Text(selected))) => {
+                    if let Some(on_select) = on_select {
                         if let Ok(selected) = CString::new(selected) {
                             unsafe {
                                 on_select(selected.as_ptr() as *mut c_char, state as *mut c_void);

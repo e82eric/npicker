@@ -300,48 +300,40 @@ impl PickerRequest for StdinRequest {
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
-pub struct PickerResponse {
-    pub status: String,
-    pub selected_item: Option<String>,
-    pub selected_path: Option<String>,
-    pub error_message: Option<String>,
-    pub selected_window: Option<isize>,
+pub enum PickerResponse {
+    Selected(PickerSelection),
+    Cancelled,
+    Error(String),
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub enum PickerSelection {
+    Text(String),
+    NativeWindow { text: String, hwnd: isize },
 }
 
 impl PickerResponse {
     pub fn selected(path: String) -> Self {
-        Self {
-            status: "selected".to_string(),
-            selected_item: Some(path.clone()),
-            selected_path: Some(path),
-            error_message: None,
-            selected_window: None,
-        }
+        Self::Selected(PickerSelection::Text(path))
     }
 
     pub fn selected_window(path: String, hwnd: isize) -> Self {
-        let mut response = Self::selected(path);
-        response.selected_window = Some(hwnd);
-        response
+        Self::Selected(PickerSelection::NativeWindow { text: path, hwnd })
     }
 
     pub fn cancelled() -> Self {
-        Self {
-            status: "cancelled".to_string(),
-            selected_item: None,
-            selected_path: None,
-            error_message: None,
-            selected_window: None,
-        }
+        Self::Cancelled
     }
 
     pub fn error(message: impl Into<String>) -> Self {
-        Self {
-            status: "error".to_string(),
-            selected_item: None,
-            selected_path: None,
-            error_message: Some(message.into()),
-            selected_window: None,
+        Self::Error(message.into())
+    }
+
+    pub fn status_label(&self) -> &'static str {
+        match self {
+            Self::Selected(_) => "selected",
+            Self::Cancelled => "cancelled",
+            Self::Error(_) => "error",
         }
     }
 }
