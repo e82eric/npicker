@@ -161,9 +161,7 @@ pub extern "C" fn RustNfmShowWindows(
             Err(_) => return 0,
         };
         let view_model = ensure_initialized();
-        // Native thumbnail previews are a separate UI change. Keep this
-        // initial FFI entry point preview-free.
-        view_model.set_preview_visible(false);
+        view_model.set_preview_visible(true);
         let state = state as usize;
         thread::spawn(move || {
             let request = WindowListPickerRequest { items };
@@ -231,6 +229,7 @@ pub extern "C" fn RustNfmShowItemsList(
 ) {
     let _ = catch_unwind(AssertUnwindSafe(|| {
         let view_model = ensure_initialized();
+        view_model.set_preview_visible(false);
         let items = collect_items(native_items_action, state);
         let state = state as usize;
 
@@ -304,9 +303,9 @@ fn ensure_initialized() -> Arc<ViewModel> {
             "ffi-parent".into(),
         );
         let view_model = ViewModel::new_with_services_and_bindings(
-            PreviewService::new(PreviewConfig::Command(PreviewResolver::Function(
-                resolve_native_file_preview,
-            ))),
+            PreviewService::new(PreviewConfig::CommandOrNativeWindow(
+                PreviewResolver::Function(resolve_native_file_preview),
+            )),
             ActionService::new(ActionConfig { resolvers }),
             bindings,
             false,

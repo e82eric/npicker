@@ -89,6 +89,17 @@ impl ItemsSource for AnyItemSource {
 }
 
 impl AnyItemSource {
+    pub fn is_window_source(&self) -> bool {
+        #[cfg(windows)]
+        {
+            matches!(self, Self::Windows(_))
+        }
+        #[cfg(not(windows))]
+        {
+            false
+        }
+    }
+
     #[cfg(windows)]
     pub fn native_window(&self, node_index: usize) -> Option<isize> {
         let Self::Windows(source) = self else {

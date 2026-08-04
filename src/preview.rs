@@ -232,6 +232,7 @@ pub enum PreviewConfig {
     None,
     Command(PreviewResolver),
     NativeWindow,
+    CommandOrNativeWindow(PreviewResolver),
 }
 
 pub struct PreviewService {
@@ -299,6 +300,42 @@ fn build_preview_backend(
             events,
             selected: Mutex::new(None),
         }),
+        PreviewConfig::CommandOrNativeWindow(resolver) => Box::new(SourcePreviewBackend {
+            command: CommandPreviewBackend {
+                controller: CommandPreviewController::new(resolver, events.clone()),
+                selected: Mutex::new(None),
+            },
+            native_window: NativeWindowPreviewBackend {
+                events,
+                selected: Mutex::new(None),
+            },
+        }),
+    }
+}
+
+struct SourcePreviewBackend {
+    command: CommandPreviewBackend,
+    native_window: NativeWindowPreviewBackend,
+}
+
+impl PreviewBackend for SourcePreviewBackend {
+    fn selected_result_changed(
+        &self,
+        result: Option<&SearchResult>,
+        source: Option<&AnyItemSource>,
+    ) {
+        if source.is_some_and(AnyItemSource::is_window_source) {
+            self.command.clear();
+            self.native_window.selected_result_changed(result, source);
+        } else {
+            self.native_window.clear();
+            self.command.selected_result_changed(result, source);
+        }
+    }
+
+    fn clear(&self) {
+        self.command.clear();
+        self.native_window.clear();
     }
 }
 
@@ -973,5 +1010,56 @@ mod tests {
             ViewModelEvent::Preview(PreviewEvent::NativeWindow(None))
         ));
         assert!(receiver.try_recv().is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn source_preview_backend_routes_and_clears_by_source_type() {
+        use crate::list_windows::WindowPayload;
+        use nfm_search_core::store::FlatSnapshot;
+
+        fn no_command_preview(
+            _target: &CommandPreviewTarget,
+        ) -> Result<Option<PreviewJob>, String> {
+            Ok(None)
+        }
+
+        let (events, receiver) = bounded(8);
+        let backend = SourcePreviewBackend {
+            command: CommandPreviewBackend {
+                controller: CommandPreviewController::new(
+                    PreviewResolver::Function(no_command_preview),
+                    events.clone(),
+                ),
+                selected: Mutex::new(None),
+            },
+            native_window: NativeWindowPreviewBackend {
+                events,
+                selected: Mutex::new(None),
+            },
+        };
+        let result = SearchResult {
+            node_index: 0,
+            score: 1,
+            path: "window".into(),
+            positions: Vec::new(),
+        };
+        let windows = AnyItemSource::Windows(Arc::new(FlatSnapshot::from_items([(
+            "window",
+            WindowPayload { hwnd: 42 },
+        )])));
+
+        backend.selected_result_changed(Some(&result), Some(&windows));
+        assert!(matches!(
+            receiver.recv().unwrap(),
+            ViewModelEvent::Preview(PreviewEvent::NativeWindow(Some(NativeWindowId(42))))
+        ));
+
+        let items = AnyItemSource::Flat(Arc::new(FlatSnapshot::from_items([("item", ())])));
+        backend.selected_result_changed(Some(&result), Some(&items));
+        assert!(matches!(
+            receiver.recv().unwrap(),
+            ViewModelEvent::Preview(PreviewEvent::NativeWindow(None))
+        ));
     }
 }
