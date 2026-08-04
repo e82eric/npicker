@@ -1,4 +1,6 @@
 pub mod action;
+#[cfg(windows)]
+mod clipboard;
 mod delimited_store;
 #[cfg(windows)]
 pub mod ffi;

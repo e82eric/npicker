@@ -3,6 +3,7 @@ use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::Duration;
 
 use crate::action::{
     ActionController, ActionEvent, ActionResolution, ActionSelection, ActionService, ActionState,
@@ -31,6 +32,7 @@ pub enum UiEvent {
     Results(UiUpdate),
     Preview(PreviewView),
     PreviewVisibilityChanged { visible: bool },
+    ShowToast { text: String, duration: Duration },
     Hide,
 }
 
@@ -116,6 +118,7 @@ pub enum InputCommand {
     PreviewPageUp,
     PreviewPageDown,
     TogglePreview,
+    CopySelection,
 }
 
 struct ActiveRequest {
@@ -398,6 +401,7 @@ impl ViewModel {
             InputCommand::PreviewPageUp => self.page_preview(-1),
             InputCommand::PreviewPageDown => self.page_preview(1),
             InputCommand::TogglePreview => self.toggle_preview(),
+            InputCommand::CopySelection => self.copy_selection(),
         }
     }
 
@@ -817,11 +821,17 @@ impl ViewModel {
     }
 
     pub fn select_current(&self) {
-        let selection = {
+        let selection = self.current_selection();
+        match selection {
+            Some((value, native_window)) => self.complete_accept(value, native_window),
+            None => self.complete_cancelled(),
+        }
+    }
+
+    fn current_selection(&self) -> Option<(String, Option<isize>)> {
+        {
             let state = self.state.lock().expect("view model poisoned");
-            let Some(active) = state.active.as_ref() else {
-                return;
-            };
+            let active = state.active.as_ref()?;
             state.results.get(state.selected).map(|result| {
                 let source = active.store.snapshot();
                 let value = source
@@ -832,11 +842,21 @@ impl ViewModel {
                     source.and_then(|source| source.native_window(result.node_index));
                 (value, native_window)
             })
-        };
-        match selection {
-            Some((value, native_window)) => self.complete_accept(value, native_window),
-            None => self.complete_cancelled(),
         }
+    }
+
+    fn copy_selection(&self) {
+        let Some((value, _)) = self.current_selection() else {
+            return;
+        };
+        let text = match crate::clipboard::copy_text(&value) {
+            Ok(()) => format!("Copied '{value}' to clipboard"),
+            Err(error) => format!("Copy failed: {error}"),
+        };
+        let _ = self.events_tx.send(UiEvent::ShowToast {
+            text,
+            duration: Duration::from_secs(3),
+        });
     }
 
     fn complete_accept(&self, value: String, native_window: Option<isize>) {

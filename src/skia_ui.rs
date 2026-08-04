@@ -66,6 +66,7 @@ const WM_SHOW_ROOT: u32 = WM_APP + 4;
 const WM_EXIT: u32 = WM_APP + 5;
 const WM_PREVIEW_LOADING: u32 = WM_APP + 6;
 const WM_INDEXING_SPINNER: u32 = WM_APP + 7;
+const WM_TOAST: u32 = WM_APP + 8;
 const PREVIEW_LOADING_DELAY_MS: u32 = 400;
 const INDEXING_SPINNER_INTERVAL_MS: u32 = 80;
 const INDEXING_SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -76,6 +77,8 @@ const COLOR_BORDER: u32 = 0x928374;
 const COLOR_MATCH: u32 = 0xfb4934;
 const COLOR_SELECTED: u32 = 0x3c3836;
 const COLOR_SELECTED_ACCENT: u32 = 0xb8bb26;
+const TOAST_HORIZONTAL_PADDING: f32 = 18.0;
+const TOAST_VERTICAL_PADDING: f32 = 12.0;
 const DEFAULT_LOCATION_VALUE: i32 = i32::MIN;
 
 static PREFERRED_CENTER_X: AtomicI32 = AtomicI32::new(DEFAULT_LOCATION_VALUE);
@@ -316,7 +319,13 @@ struct WindowState {
     native_thumbnail: Option<DwmThumbnailPreview>,
     pending_high_surrogate: Option<u16>,
     input_ready_at: Instant,
+    toast: Option<Toast>,
     layout: Layout,
+}
+
+struct Toast {
+    text: String,
+    expires_at: Instant,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -644,6 +653,7 @@ impl WindowState {
             native_thumbnail: None,
             pending_high_surrogate: None,
             input_ready_at: Instant::now(),
+            toast: None,
             layout: app_layout,
         })
     }
@@ -765,6 +775,14 @@ impl WindowState {
                         self.show_root(hwnd);
                     }
                 },
+                UiEvent::ShowToast { text, duration } => unsafe {
+                    self.toast = Some(Toast {
+                        text,
+                        expires_at: Instant::now() + duration,
+                    });
+                    let milliseconds = duration.as_millis().clamp(1, u32::MAX as u128) as u32;
+                    let _ = SetTimer(Some(hwnd), WM_TOAST as usize, milliseconds, None);
+                },
                 UiEvent::Hide => unsafe {
                     self.visible = false;
                     self.window_shown = false;
@@ -774,6 +792,8 @@ impl WindowState {
                     let _ = ShowWindow(hwnd, SW_HIDE);
                     let _ = KillTimer(Some(hwnd), WM_PREVIEW_LOADING as usize);
                     let _ = KillTimer(Some(hwnd), WM_INDEXING_SPINNER as usize);
+                    let _ = KillTimer(Some(hwnd), WM_TOAST as usize);
+                    self.toast = None;
                     self.logged_first_items_paint = false;
                 },
             }
@@ -1118,6 +1138,33 @@ impl WindowState {
                 text_rect,
             );
         }
+        if let Some(toast) = &self.toast {
+            let maximum_width = (self.layout.window.width - PADDING * 4.0).max(0.0);
+            let text_width = skia_text_width(&self.font, &self.text_paint, &toast.text);
+            let width = (text_width + TOAST_HORIZONTAL_PADDING * 2.0).min(maximum_width);
+            let height = self.layout.text_height + TOAST_VERTICAL_PADDING * 2.0;
+            let rect = Rect {
+                x: (self.layout.window.width - width) / 2.0,
+                y: (self.layout.window.height - height) / 2.0,
+                width,
+                height,
+            };
+            draw_skia_round_rect(canvas, &self.selected_paint, rect, 8.0);
+            draw_skia_round_rect(canvas, &self.stroke_paint, rect, 8.0);
+            draw_skia_text(
+                canvas,
+                &self.font,
+                &self.text_paint,
+                &toast.text,
+                Rect {
+                    x: rect.x + TOAST_HORIZONTAL_PADDING,
+                    y: rect.y + TOAST_VERTICAL_PADDING,
+                    width: (rect.width - TOAST_HORIZONTAL_PADDING * 2.0).max(0.0),
+                    height: self.layout.text_height,
+                },
+                TextAlign::Left,
+            );
+        }
         canvas.restore_to_count(frame_save_count);
         self.back_buffer
             .as_mut()
@@ -1183,6 +1230,7 @@ fn fallback_command(chord: KeyChord, preview_available: bool) -> Option<InputCom
         KeyName::Character('p') if chord.modifiers.ctrl && preview_available => {
             Some(InputCommand::TogglePreview)
         }
+        KeyName::Character('c') if chord.modifiers.ctrl => Some(InputCommand::CopySelection),
         _ => None,
     }
 }
@@ -1272,6 +1320,20 @@ unsafe extern "system" fn wnd_proc(
                         let _ = KillTimer(Some(hwnd), WM_INDEXING_SPINNER as usize);
                     }
                 }
+            } else if wparam.0 == WM_TOAST as usize {
+                let _ = KillTimer(Some(hwnd), WM_TOAST as usize);
+                let state = window_state(hwnd);
+                if !state.is_null() {
+                    let state = &mut *state;
+                    if state
+                        .toast
+                        .as_ref()
+                        .is_some_and(|toast| Instant::now() >= toast.expires_at)
+                    {
+                        state.toast = None;
+                        let _ = state.paint(hwnd);
+                    }
+                }
             }
             LRESULT(0)
         }
@@ -1325,6 +1387,7 @@ unsafe extern "system" fn wnd_proc(
                                     InputCommand::Accept
                                         | InputCommand::Cancel
                                         | InputCommand::TogglePreview
+                                        | InputCommand::CopySelection
                                 ))
                             {
                                 state.view_model.handle_command(command, modifiers);
@@ -1663,7 +1726,10 @@ fn wide_null(value: &str) -> Vec<u16> {
 
 #[cfg(test)]
 mod tests {
-    use super::{calculate_layout, fit_thumbnail_rect, Rect, DISPLAY_ROWS, PADDING};
+    use super::{
+        calculate_layout, fallback_command, fit_thumbnail_rect, InputCommand, KeyChord,
+        KeyModifiers, KeyName, Rect, DISPLAY_ROWS, PADDING,
+    };
     use windows::Win32::Foundation::{RECT, SIZE};
 
     #[test]
@@ -1716,5 +1782,20 @@ mod tests {
             SIZE::default(),
         )
         .is_none());
+    }
+
+    #[test]
+    fn control_c_copies_the_current_selection() {
+        let command = fallback_command(
+            KeyChord {
+                key: KeyName::Character('c'),
+                modifiers: KeyModifiers {
+                    ctrl: true,
+                    ..Default::default()
+                },
+            },
+            false,
+        );
+        assert_eq!(command, Some(InputCommand::CopySelection));
     }
 }
