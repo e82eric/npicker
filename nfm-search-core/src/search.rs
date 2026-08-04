@@ -4,6 +4,7 @@ use std::ops::Range;
 use std::sync::Arc;
 use std::time::Instant;
 
+use frizbee::{Config as FrizbeeConfig, Matcher as FrizbeeMatcher, Scoring as FrizbeeScoring};
 use rayon::prelude::*;
 
 use crate::store::ItemsSource;
@@ -12,16 +13,35 @@ use crate::timing;
 pub const DISPLAY_LIMIT: usize = 15;
 pub const RESULT_LIMIT: usize = 1_000;
 const SEARCH_TIMING_SAMPLE_RATE: usize = 256;
+#[cfg(test)]
 const SLAB_CAP: usize = 2_000_000;
-
+#[cfg(test)]
 const SCORE_MATCH: i32 = 16;
+#[cfg(test)]
 const SCORE_GAP_START: i32 = -3;
+#[cfg(test)]
 const SCORE_GAP_EXTENSION: i32 = -1;
+#[cfg(test)]
 const BOUNDARY_BONUS: i32 = SCORE_MATCH / 2;
+#[cfg(test)]
 const NON_WORD_BONUS: i32 = SCORE_MATCH / 2;
+#[cfg(test)]
 const CAMEL_CASE_BONUS: i32 = BOUNDARY_BONUS + SCORE_GAP_EXTENSION;
+#[cfg(test)]
 const BONUS_CONSECUTIVE: i32 = -(SCORE_GAP_START + SCORE_GAP_EXTENSION);
+#[cfg(test)]
 const BONUS_FIRST_CHAR_MULTIPLIER: i32 = 2;
+
+fn frizbee_config() -> FrizbeeConfig {
+    let mut scoring = FrizbeeScoring::default();
+    scoring.gap_open_penalty = 3;
+    scoring.capitalization_bonus = 7;
+    scoring.delimiter_bonus = 8;
+    scoring.matching_case_bonus = 0;
+    scoring.consecutive_bonus = 4;
+    scoring.first_match_boundary_multiplier = 2;
+    FrizbeeConfig::default().max_typos(Some(0)).scoring(scoring)
+}
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum SearchSortMode {
@@ -149,7 +169,6 @@ impl CandidateCollector {
 struct SearchAccumulator {
     candidates: CandidateCollector,
     matched: usize,
-    scratch: MatchScratch,
     path_buffer: Vec<u8>,
     stack_path_buffer: Box<[u8; 4096]>,
     utf8_count: usize,
@@ -165,7 +184,6 @@ impl SearchAccumulator {
         Self {
             candidates: CandidateCollector::new(sort_mode),
             matched: 0,
-            scratch: MatchScratch::default(),
             path_buffer: Vec::with_capacity(512),
             stack_path_buffer: Box::new([0u8; 4096]),
             utf8_count: 0,
@@ -275,32 +293,27 @@ where
     }
 
     let parse_start = Instant::now();
-    let Some(pattern) = AsciiPattern::parse(query) else {
-        let total_us = timing::elapsed_us(total_start);
-        timing::write(format!(
-            "search_detail mode=fuzzy total_us={total_us} parse_us=0 match_us=0 sort_us=0 append_us=0 utf8_path_estimate_us=0 ascii_score_estimate_us=0 char_fallback_estimate_us=0 heap_estimate_us=0 timing_sample_rate={SEARCH_TIMING_SAMPLE_RATE} timing_samples=0 utf8_count=0 fallback_count={searched} shown=0 matched=0 total={total}",
-        ));
-        return Some(SearchOutput {
-            results: Vec::new(),
-            matched: 0,
-            total,
-        });
-    };
+    let config = frizbee_config();
     let parse_us = timing::elapsed_us(parse_start);
 
     let match_start = Instant::now();
     let accumulator = (start_index..end_index)
         .into_par_iter()
         .fold(
-            || SearchAccumulator::new(sort_mode),
-            |mut state, node_index| {
+            || {
+                (
+                    SearchAccumulator::new(sort_mode),
+                    FrizbeeMatcher::from_query(query, &config),
+                )
+            },
+            |(mut state, mut matcher), node_index| {
                 if state.cancelled {
-                    return state;
+                    return (state, matcher);
                 }
 
                 if (node_index & 0x3ff) == 0 && is_cancelled() {
                     state.cancelled = true;
-                    return state;
+                    return (state, matcher);
                 }
 
                 let time_sample = (node_index & (SEARCH_TIMING_SAMPLE_RATE - 1)) == 0;
@@ -315,13 +328,13 @@ where
                     state.timing_samples += 1;
                 }
 
-                state.utf8_count += 1;
+                state.utf8_count += usize::from(!path_bytes.is_ascii());
                 let score_start = time_sample.then(Instant::now);
-                let score = if path_bytes.is_ascii() {
-                    pattern.score(path_bytes, &mut state.scratch)
-                } else {
-                    None
-                };
+                let score = std::str::from_utf8(path_bytes).ok().and_then(|path| {
+                    matcher
+                        .match_one(path, node_index as u32)
+                        .map(|matched| matched.score as u32)
+                });
                 if let Some(score_start) = score_start {
                     state.score_us += timing::elapsed_us(score_start);
                 }
@@ -339,16 +352,22 @@ where
                     }
                 }
 
-                state
+                (state, matcher)
             },
         )
         .reduce(
-            || SearchAccumulator::new(sort_mode),
-            |mut left, right| {
-                left.merge(right);
-                left
+            || {
+                (
+                    SearchAccumulator::new(sort_mode),
+                    FrizbeeMatcher::from_query(query, &config),
+                )
             },
-        );
+            |(mut left, matcher), (right, _)| {
+                left.merge(right);
+                (left, matcher)
+            },
+        )
+        .0;
     let match_us = timing::elapsed_us(match_start);
     let SearchAccumulator {
         candidates,
@@ -419,10 +438,24 @@ pub fn resolve_match_positions(query: &str, text: &str) -> Vec<usize> {
     if query.is_empty() {
         return Vec::new();
     }
-    let Some(pattern) = AsciiPattern::parse(query) else {
+    let mut matcher = FrizbeeMatcher::from_query(query, &frizbee_config());
+    let Some(mut matched) = matcher.match_one_indices(text, 0) else {
         return Vec::new();
     };
-    pattern.positions(text.as_bytes(), &mut MatchScratch::default())
+    matched.indices.reverse();
+    let mut positions: Vec<_> = matched
+        .indices
+        .into_iter()
+        .map(|index| {
+            let mut index = index as usize;
+            while index > 0 && !text.is_char_boundary(index) {
+                index -= 1;
+            }
+            index
+        })
+        .collect();
+    positions.dedup();
+    positions
 }
 
 fn materialize_unfiltered<S>(
@@ -460,6 +493,12 @@ fn push_bounded(heap: &mut BinaryHeap<WorstFirst>, candidate: Candidate, limit: 
         heap.push(WorstFirst(candidate));
     }
 }
+
+#[cfg(test)]
+#[rustfmt::skip]
+#[allow(dead_code)]
+mod legacy_fzf {
+use super::*;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum MatchKind {
@@ -1710,4 +1749,6 @@ mod tests_from_fzf {
         assert_eq!(result.end, u16::MAX as isize + 2);
         assert_eq!(result.score, SCORE_MATCH * 2 + BONUS_CONSECUTIVE);
     }
+}
+
 }

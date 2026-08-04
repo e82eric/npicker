@@ -6,3 +6,4 @@ edition = "2021"
 [dependencies]
 rayon = "1.12.0"
 crossbeam-channel = "0.5.15"
+frizbee = { git = "https://github.com/e82eric/frizbee", branch = "nfm-fzf-scoring-clean" }
