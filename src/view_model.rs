@@ -9,8 +9,8 @@ use crate::action::{
     ActionController, ActionEvent, ActionResolution, ActionSelection, ActionService, ActionState,
     PickerState,
 };
-use crate::key_binding::KeyChord;
 pub use crate::key_binding::KeyModifiers;
+use crate::key_binding::{KeyChord, KeyName};
 use crate::preview::{
     NativeWindowId, PreviewCoordinator, PreviewEvent, PreviewService, PreviewUpdate,
 };
@@ -119,6 +119,36 @@ pub enum InputCommand {
     PreviewPageDown,
     TogglePreview,
     CopySelection,
+}
+
+fn default_command(chord: KeyChord) -> Option<InputCommand> {
+    match chord.key {
+        KeyName::Enter => Some(InputCommand::Accept),
+        KeyName::Escape => Some(InputCommand::Cancel),
+        KeyName::Up => Some(InputCommand::MoveUp),
+        KeyName::Down => Some(InputCommand::MoveDown),
+        KeyName::Left => Some(InputCommand::MoveLeft),
+        KeyName::Right => Some(InputCommand::MoveRight),
+        KeyName::Home => Some(InputCommand::MoveHome),
+        KeyName::End => Some(InputCommand::MoveEnd),
+        KeyName::Backspace => Some(InputCommand::Backspace),
+        KeyName::Delete => Some(InputCommand::Delete),
+        KeyName::PageUp if chord.modifiers.ctrl => Some(InputCommand::PreviewPageUp),
+        KeyName::PageDown if chord.modifiers.ctrl => Some(InputCommand::PreviewPageDown),
+        KeyName::Character('p') if chord.modifiers.ctrl => Some(InputCommand::TogglePreview),
+        KeyName::Character('c') if chord.modifiers.ctrl => Some(InputCommand::CopySelection),
+        _ => None,
+    }
+}
+
+fn command_suppresses_repeat(command: InputCommand) -> bool {
+    matches!(
+        command,
+        InputCommand::Accept
+            | InputCommand::Cancel
+            | InputCommand::TogglePreview
+            | InputCommand::CopySelection
+    )
 }
 
 struct ActiveRequest {
@@ -405,13 +435,20 @@ impl ViewModel {
         }
     }
 
-    pub fn handle_key(&self, chord: KeyChord, repeat: bool) -> bool {
-        let Some(action) = self.bindings.get(&chord) else {
+    pub fn handle_key(self: &Arc<Self>, chord: KeyChord, repeat: bool) -> bool {
+        if let Some(action) = self.bindings.get(&chord) {
+            if !repeat {
+                self.invoke_action(action);
+            }
+            return true;
+        }
+        let Some(command) = default_command(chord) else {
             return false;
         };
-        if !repeat {
-            self.invoke_action(action);
+        if repeat && command_suppresses_repeat(command) {
+            return true;
         }
+        self.handle_command(command, chord.modifiers);
         true
     }
 
@@ -1098,6 +1135,16 @@ mod tests {
             shift,
             alt: false,
         }
+    }
+
+    #[test]
+    fn default_control_c_maps_to_copy_selection() {
+        let command = default_command(KeyChord {
+            key: KeyName::Character('c'),
+            modifiers: modifiers(true, false),
+        });
+        assert_eq!(command, Some(InputCommand::CopySelection));
+        assert!(command_suppresses_repeat(command.unwrap()));
     }
 
     #[test]

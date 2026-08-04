@@ -38,7 +38,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use crate::key_binding::{KeyChord, KeyName};
 use crate::preview::{NativeWindowId, PreviewLine, PreviewUpdate};
 use crate::preview_document::PreviewStyle;
-use crate::view_model::{InputCommand, KeyModifiers, PreviewView, UiCounters, UiEvent, ViewModel};
+use crate::view_model::{KeyModifiers, PreviewView, UiCounters, UiEvent, ViewModel};
 use nfm_search_core::search::SearchResult;
 
 const DEFAULT_WIDTH: i32 = 1600;
@@ -1213,28 +1213,6 @@ fn key_chord(vkey: usize, modifiers: KeyModifiers) -> Option<KeyChord> {
     Some(KeyChord { key, modifiers })
 }
 
-fn fallback_command(chord: KeyChord, preview_available: bool) -> Option<InputCommand> {
-    match chord.key {
-        KeyName::Enter => Some(InputCommand::Accept),
-        KeyName::Escape => Some(InputCommand::Cancel),
-        KeyName::Up => Some(InputCommand::MoveUp),
-        KeyName::Down => Some(InputCommand::MoveDown),
-        KeyName::Left => Some(InputCommand::MoveLeft),
-        KeyName::Right => Some(InputCommand::MoveRight),
-        KeyName::Home => Some(InputCommand::MoveHome),
-        KeyName::End => Some(InputCommand::MoveEnd),
-        KeyName::Backspace => Some(InputCommand::Backspace),
-        KeyName::Delete => Some(InputCommand::Delete),
-        KeyName::PageUp if chord.modifiers.ctrl => Some(InputCommand::PreviewPageUp),
-        KeyName::PageDown if chord.modifiers.ctrl => Some(InputCommand::PreviewPageDown),
-        KeyName::Character('p') if chord.modifiers.ctrl && preview_available => {
-            Some(InputCommand::TogglePreview)
-        }
-        KeyName::Character('c') if chord.modifiers.ctrl => Some(InputCommand::CopySelection),
-        _ => None,
-    }
-}
-
 unsafe extern "system" fn wnd_proc(
     hwnd: HWND,
     msg: u32,
@@ -1379,21 +1357,7 @@ unsafe extern "system" fn wnd_proc(
                 if let Some(chord) = key_chord(wparam.0, modifiers) {
                     let repeat = (lparam.0 as u32 & (1 << 30)) != 0;
                     let state = &mut *state;
-                    if !state.view_model.handle_key(chord, repeat) {
-                        if let Some(command) = fallback_command(chord, state.preview_available) {
-                            if !(repeat
-                                && matches!(
-                                    command,
-                                    InputCommand::Accept
-                                        | InputCommand::Cancel
-                                        | InputCommand::TogglePreview
-                                        | InputCommand::CopySelection
-                                ))
-                            {
-                                state.view_model.handle_command(command, modifiers);
-                            }
-                        }
-                    }
+                    state.view_model.handle_key(chord, repeat);
                 }
                 let _ = (*state).paint(hwnd);
             }
@@ -1726,10 +1690,7 @@ fn wide_null(value: &str) -> Vec<u16> {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        calculate_layout, fallback_command, fit_thumbnail_rect, InputCommand, KeyChord,
-        KeyModifiers, KeyName, Rect, DISPLAY_ROWS, PADDING,
-    };
+    use super::{calculate_layout, fit_thumbnail_rect, Rect, DISPLAY_ROWS, PADDING};
     use windows::Win32::Foundation::{RECT, SIZE};
 
     #[test]
@@ -1782,20 +1743,5 @@ mod tests {
             SIZE::default(),
         )
         .is_none());
-    }
-
-    #[test]
-    fn control_c_copies_the_current_selection() {
-        let command = fallback_command(
-            KeyChord {
-                key: KeyName::Character('c'),
-                modifiers: KeyModifiers {
-                    ctrl: true,
-                    ..Default::default()
-                },
-            },
-            false,
-        );
-        assert_eq!(command, Some(InputCommand::CopySelection));
     }
 }
