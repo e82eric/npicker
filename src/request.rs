@@ -305,6 +305,7 @@ pub struct PickerResponse {
     pub selected_item: Option<String>,
     pub selected_path: Option<String>,
     pub error_message: Option<String>,
+    pub selected_window: Option<isize>,
 }
 
 impl PickerResponse {
@@ -314,7 +315,14 @@ impl PickerResponse {
             selected_item: Some(path.clone()),
             selected_path: Some(path),
             error_message: None,
+            selected_window: None,
         }
+    }
+
+    pub fn selected_window(path: String, hwnd: isize) -> Self {
+        let mut response = Self::selected(path);
+        response.selected_window = Some(hwnd);
+        response
     }
 
     pub fn cancelled() -> Self {
@@ -323,6 +331,7 @@ impl PickerResponse {
             selected_item: None,
             selected_path: None,
             error_message: None,
+            selected_window: None,
         }
     }
 
@@ -332,6 +341,7 @@ impl PickerResponse {
             selected_item: None,
             selected_path: None,
             error_message: Some(message.into()),
+            selected_window: None,
         }
     }
 }

@@ -8,11 +8,12 @@ use crate::action::{
     ActionConfig, ActionDefinition, ActionResolution, ActionService, ActionState, PickerState,
 };
 use crate::key_binding::{KeyChord, KeyModifiers, KeyName};
+use crate::list_windows::list_windows;
 use crate::preview::{
     CommandPreviewTarget, PreviewCancellation, PreviewConfig, PreviewJob, PreviewOutputType,
     PreviewProfile, PreviewResolver, PreviewService,
 };
-use crate::request::{FileSystemPickerRequest, FlatItemsPickerRequest};
+use crate::request::{FileSystemPickerRequest, FlatItemsPickerRequest, WindowListPickerRequest};
 use crate::skia_ui as picker_ui;
 use crate::view_model::ViewModel;
 use std::sync::Arc;
@@ -20,6 +21,7 @@ use std::thread;
 
 type NativeItemsAction = unsafe extern "C" fn(*mut c_void) -> *mut *mut c_char;
 type OnSelect = unsafe extern "C" fn(*mut c_char, *mut c_void);
+type OnWindowSelect = unsafe extern "C" fn(isize, *mut c_void);
 type OnClosed = unsafe extern "C" fn();
 
 static VIEW_MODEL: OnceLock<Arc<ViewModel>> = OnceLock::new();
@@ -130,6 +132,42 @@ pub unsafe extern "C" fn RustNfmShowFileSystem(
                                 on_select(selected.as_ptr() as *mut c_char, state as *mut c_void)
                             };
                         }
+                    }
+                }
+                _ => {
+                    if let Some(on_closed) = on_closed {
+                        unsafe { on_closed() };
+                    }
+                }
+            }
+        });
+        1
+    }))
+    .unwrap_or(0)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn RustNfmShowWindows(
+    on_select: Option<OnWindowSelect>,
+    on_closed: Option<OnClosed>,
+    state: *mut c_void,
+) -> c_int {
+    catch_unwind(AssertUnwindSafe(|| {
+        let items = match list_windows() {
+            Ok(items) => items,
+            Err(_) => return 0,
+        };
+        let view_model = ensure_initialized();
+        // Native thumbnail previews are a separate UI change. Keep this
+        // initial FFI entry point preview-free.
+        view_model.set_preview_visible(false);
+        let state = state as usize;
+        thread::spawn(move || {
+            let request = WindowListPickerRequest { items };
+            match view_model.run_request(&request) {
+                Ok(response) if response.status == "selected" => {
+                    if let (Some(on_select), Some(hwnd)) = (on_select, response.selected_window) {
+                        unsafe { on_select(hwnd, state as *mut c_void) };
                     }
                 }
                 _ => {
@@ -443,6 +481,9 @@ fn resolve_file_system_accept(state: &ActionState) -> Result<ActionResolution, S
     let Some(selection) = &state.selection else {
         return Ok(ActionResolution::None);
     };
+    if matches!(state.picker, PickerState::Windows) {
+        return Ok(ActionResolution::Complete);
+    }
     if std::path::Path::new(&selection.item).is_dir() {
         Ok(ActionResolution::FileWalker {
             roots: vec![selection.item.clone()],
@@ -554,5 +595,24 @@ mod tests {
     fn parent_action_keeps_the_drive_list_idempotent() {
         let drives = vec![r"C:\".to_owned(), r"D:\".to_owned()];
         assert_eq!(file_system_parent_roots(&drives, drives.clone()), drives);
+    }
+
+    #[test]
+    fn window_accept_completes_instead_of_treating_the_title_as_a_path() {
+        let state = ActionState {
+            selection: Some(crate::action::ActionSelection {
+                item: "00001234 app.exe Window title".into(),
+                value: "00001234 app.exe Window title".into(),
+                line: None,
+                native_window: Some(0x1234),
+            }),
+            picker: PickerState::Windows,
+            query: String::new(),
+        };
+
+        assert!(matches!(
+            resolve_file_system_accept(&state),
+            Ok(ActionResolution::Complete)
+        ));
     }
 }

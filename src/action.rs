@@ -45,6 +45,7 @@ pub struct ActionSelection {
     pub item: String,
     pub value: String,
     pub line: Option<usize>,
+    pub native_window: Option<isize>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -316,6 +317,7 @@ mod tests {
                 item: r"G:\src\file.rs".into(),
                 value: "value".into(),
                 line: Some(42),
+                native_window: None,
             }),
             picker: PickerState::Filewalker {
                 roots: vec![r"G:\src".into()],

@@ -236,7 +236,7 @@ impl ViewModel {
         match event.result {
             Ok(ActionResolution::None) => {}
             Ok(ActionResolution::Complete) => match event.state.selection {
-                Some(selection) => self.complete_accept(selection.value),
+                Some(selection) => self.complete_accept(selection.value, selection.native_window),
                 None => eprintln!("action resolver cannot complete without a selection"),
             },
             Ok(ActionResolution::FileWalker { roots }) => self.transition_to_filewalker(roots),
@@ -425,10 +425,13 @@ impl ViewModel {
                 return;
             };
             let selection = state.results.get(state.selected).map(|result| {
-                let metadata = active
-                    .store
-                    .snapshot()
+                let source = active.store.snapshot();
+                let metadata = source
+                    .as_ref()
                     .and_then(|source| source.delimited_metadata(result.node_index));
+                let native_window = source
+                    .as_ref()
+                    .and_then(|source| source.native_window(result.node_index));
                 match metadata {
                     Some(metadata) => ActionSelection {
                         item: metadata
@@ -437,11 +440,13 @@ impl ViewModel {
                             .unwrap_or_else(|| metadata.value.clone()),
                         value: metadata.value,
                         line: metadata.preview_center_line,
+                        native_window,
                     },
                     None => ActionSelection {
                         item: result.path.clone(),
                         value: result.path.clone(),
                         line: None,
+                        native_window,
                     },
                 }
             });
@@ -812,27 +817,34 @@ impl ViewModel {
     }
 
     pub fn select_current(&self) {
-        let value = {
+        let selection = {
             let state = self.state.lock().expect("view model poisoned");
             let Some(active) = state.active.as_ref() else {
                 return;
             };
             state.results.get(state.selected).map(|result| {
-                active
-                    .store
-                    .snapshot()
+                let source = active.store.snapshot();
+                let value = source
+                    .as_ref()
                     .and_then(|source| source.delimited_metadata(result.node_index))
-                    .map_or_else(|| result.path.clone(), |metadata| metadata.value)
+                    .map_or_else(|| result.path.clone(), |metadata| metadata.value);
+                let native_window =
+                    source.and_then(|source| source.native_window(result.node_index));
+                (value, native_window)
             })
         };
-        match value {
-            Some(value) => self.complete_accept(value),
+        match selection {
+            Some((value, native_window)) => self.complete_accept(value, native_window),
             None => self.complete_cancelled(),
         }
     }
 
-    fn complete_accept(&self, value: String) {
-        self.complete(PickerResponse::selected(value));
+    fn complete_accept(&self, value: String, native_window: Option<isize>) {
+        let response = match native_window {
+            Some(hwnd) => PickerResponse::selected_window(value, hwnd),
+            None => PickerResponse::selected(value),
+        };
+        self.complete(response);
     }
 
     fn complete_cancelled(&self) {
@@ -1195,7 +1207,9 @@ mod tests {
             }
         }
         assert_eq!(selected, Some(NativeWindowId(0x1234)));
-        view_model.cancel();
-        request_thread.join().unwrap().unwrap();
+        view_model.select_current();
+        let response = request_thread.join().unwrap().unwrap();
+        assert_eq!(response.status, "selected");
+        assert_eq!(response.selected_window, Some(0x1234));
     }
 }
