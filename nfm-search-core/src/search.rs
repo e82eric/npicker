@@ -64,6 +64,96 @@ pub struct SearchOutput {
     pub results: Vec<SearchResult>,
     pub matched: usize,
     pub total: usize,
+    pub(crate) match_bitmap: Option<MatchBitmap>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct MatchBitmap {
+    words: Vec<u64>,
+    covered_len: usize,
+}
+
+impl MatchBitmap {
+    fn from_indexes(covered_len: usize, indexes: &[u32]) -> Self {
+        let mut words = vec![0; covered_len.div_ceil(64)];
+        for &index in indexes {
+            let index = index as usize;
+            words[index / 64] |= 1u64 << (index % 64);
+        }
+        Self { words, covered_len }
+    }
+
+    pub(crate) fn merge(&mut self, other: &Self) {
+        if other.covered_len > self.covered_len {
+            self.words.resize(other.words.len(), 0);
+            self.covered_len = other.covered_len;
+        }
+        for (target, source) in self.words.iter_mut().zip(&other.words) {
+            *target |= source;
+        }
+    }
+
+    fn matching_indexes(&self, end: usize) -> impl ParallelIterator<Item = usize> + '_ {
+        self.words
+            .par_iter()
+            .enumerate()
+            .flat_map_iter(move |(word_index, &remaining)| SetBitIndexes {
+                base: word_index * 64,
+                remaining,
+                end,
+            })
+            .chain(self.covered_len.min(end)..end)
+    }
+
+    fn count_matches(&self, end: usize) -> usize {
+        let covered = end.min(self.covered_len);
+        let full_words = covered / 64;
+        let mut count: usize = self.words[..full_words]
+            .iter()
+            .map(|word| word.count_ones() as usize)
+            .sum();
+        let trailing = covered % 64;
+        if trailing != 0 {
+            count += (self.words[full_words] & ((1u64 << trailing) - 1)).count_ones() as usize;
+        }
+        count + end.saturating_sub(self.covered_len)
+    }
+}
+
+struct SetBitIndexes {
+    base: usize,
+    remaining: u64,
+    end: usize,
+}
+
+impl Iterator for SetBitIndexes {
+    type Item = usize;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        while self.remaining != 0 {
+            let bit = self.remaining.trailing_zeros() as usize;
+            self.remaining &= self.remaining - 1;
+            let index = self.base + bit;
+            if index < self.end {
+                return Some(index);
+            }
+        }
+        None
+    }
+}
+
+#[cfg(test)]
+mod match_bitmap_tests {
+    use super::*;
+
+    #[test]
+    fn iterates_only_matches_and_the_uncovered_tail() {
+        let bitmap = MatchBitmap::from_indexes(70, &[0, 2, 63, 64, 69]);
+        let mut indexes: Vec<_> = bitmap.matching_indexes(73).collect();
+        indexes.sort_unstable();
+        assert_eq!(indexes, vec![0, 2, 63, 64, 69, 70, 71, 72]);
+        assert_eq!(bitmap.count_matches(73), indexes.len());
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -176,11 +266,13 @@ struct SearchAccumulator {
     path_us: u128,
     score_us: u128,
     retention_us: u128,
+    matched_indexes: Option<Vec<u32>>,
+    processed_since_fold_start: usize,
     cancelled: bool,
 }
 
 impl SearchAccumulator {
-    fn new(sort_mode: SearchSortMode) -> Self {
+    fn new(sort_mode: SearchSortMode, collect_matches: bool) -> Self {
         Self {
             candidates: CandidateCollector::new(sort_mode),
             matched: 0,
@@ -191,6 +283,8 @@ impl SearchAccumulator {
             path_us: 0,
             score_us: 0,
             retention_us: 0,
+            matched_indexes: collect_matches.then(Vec::new),
+            processed_since_fold_start: 0,
             cancelled: false,
         }
     }
@@ -203,107 +297,33 @@ impl SearchAccumulator {
         self.path_us += other.path_us;
         self.score_us += other.score_us;
         self.retention_us += other.retention_us;
+        if let (Some(left), Some(mut right)) = (&mut self.matched_indexes, other.matched_indexes) {
+            left.append(&mut right);
+        }
         self.cancelled |= other.cancelled;
     }
 }
 
-pub fn search<S, F>(snapshot: Arc<S>, query: &str, is_cancelled: F) -> Option<SearchOutput>
-where
-    S: ItemsSource + Send + Sync,
-    F: Fn() -> bool + Sync,
-{
-    search_with_sort(snapshot, query, SearchSortMode::Score, is_cancelled)
-}
-
-pub fn search_with_sort<S, F>(
+fn accumulate_frizbee<S, F, I>(
     snapshot: Arc<S>,
+    indexes: I,
     query: &str,
+    config: &FrizbeeConfig,
     sort_mode: SearchSortMode,
-    is_cancelled: F,
-) -> Option<SearchOutput>
+    is_cancelled: &F,
+    collect_matches: bool,
+) -> SearchAccumulator
 where
     S: ItemsSource + Send + Sync,
     F: Fn() -> bool + Sync,
+    I: ParallelIterator<Item = usize>,
 {
-    let end = snapshot.len();
-    search_range_with_sort(snapshot, query, 0..end, sort_mode, is_cancelled)
-}
-
-pub fn search_range<S, F>(
-    snapshot: Arc<S>,
-    query: &str,
-    range: Range<usize>,
-    is_cancelled: F,
-) -> Option<SearchOutput>
-where
-    S: ItemsSource + Send + Sync,
-    F: Fn() -> bool + Sync,
-{
-    search_range_with_sort(snapshot, query, range, SearchSortMode::Score, is_cancelled)
-}
-
-pub fn search_range_with_sort<S, F>(
-    snapshot: Arc<S>,
-    query: &str,
-    range: Range<usize>,
-    sort_mode: SearchSortMode,
-    is_cancelled: F,
-) -> Option<SearchOutput>
-where
-    S: ItemsSource + Send + Sync,
-    F: Fn() -> bool + Sync,
-{
-    let total_start = Instant::now();
-    let total = snapshot.len();
-    let start_index = range.start.min(total);
-    let end_index = range.end.min(total);
-    let searched = end_index.saturating_sub(start_index);
-    if is_cancelled() {
-        return None;
-    }
-
-    if snapshot.is_empty() || searched == 0 {
-        let total_us = timing::elapsed_us(total_start);
-        timing::write(format!(
-            "search_detail total_us={total_us} parse_us=0 match_us=0 sort_us=0 append_us=0 shown=0 matched=0 total={total}",
-        ));
-        return Some(SearchOutput {
-            results: Vec::new(),
-            matched: 0,
-            total,
-        });
-    }
-
-    if query.is_empty() {
-        let append_start = Instant::now();
-        let output = SearchOutput {
-            results: materialize_unfiltered(snapshot, start_index..end_index, RESULT_LIMIT),
-            matched: searched,
-            total,
-        };
-        let append_us = timing::elapsed_us(append_start);
-        let total_us = timing::elapsed_us(total_start);
-        timing::write(format!(
-            "search_detail mode=unfiltered total_us={total_us} parse_us=0 match_us=0 sort_us=0 append_us={append_us} shown={} matched={} total={}",
-            output.results.len(),
-            output.matched,
-            output.total
-        ));
-        return Some(output);
-    }
-
-    let parse_start = Instant::now();
-    let config = frizbee_config();
-    let parse_us = timing::elapsed_us(parse_start);
-
-    let match_start = Instant::now();
-    let accumulator = (start_index..end_index)
-        .into_par_iter()
+    indexes
         .fold(
             || {
                 (
-                    SearchAccumulator::new(sort_mode),
-                    FrizbeeMatcher::from_query(query, &config),
+                    SearchAccumulator::new(sort_mode, collect_matches),
+                    FrizbeeMatcher::from_query(query, config),
                 )
             },
             |(mut state, mut matcher), node_index| {
@@ -311,10 +331,11 @@ where
                     return (state, matcher);
                 }
 
-                if (node_index & 0x3ff) == 0 && is_cancelled() {
+                if (state.processed_since_fold_start & 0x3ff) == 0 && is_cancelled() {
                     state.cancelled = true;
                     return (state, matcher);
                 }
+                state.processed_since_fold_start += 1;
 
                 let time_sample = (node_index & (SEARCH_TIMING_SAMPLE_RATE - 1)) == 0;
                 let path_start = time_sample.then(Instant::now);
@@ -341,6 +362,9 @@ where
 
                 if let Some(score) = score {
                     state.matched += 1;
+                    if let Some(indexes) = &mut state.matched_indexes {
+                        indexes.push(node_index as u32);
+                    }
                     let retention_start = time_sample.then(Instant::now);
                     state.candidates.push(Candidate {
                         node_index,
@@ -355,19 +379,199 @@ where
                 (state, matcher)
             },
         )
+        .map(|(state, _)| state)
         .reduce(
-            || {
-                (
-                    SearchAccumulator::new(sort_mode),
-                    FrizbeeMatcher::from_query(query, &config),
-                )
-            },
-            |(mut left, matcher), (right, _)| {
+            || SearchAccumulator::new(sort_mode, collect_matches),
+            |mut left, right| {
                 left.merge(right);
-                (left, matcher)
+                left
             },
         )
-        .0;
+}
+
+pub fn search<S, F>(snapshot: Arc<S>, query: &str, is_cancelled: F) -> Option<SearchOutput>
+where
+    S: ItemsSource + Send + Sync,
+    F: Fn() -> bool + Sync,
+{
+    search_with_sort(snapshot, query, SearchSortMode::Score, is_cancelled)
+}
+
+pub fn search_with_sort<S, F>(
+    snapshot: Arc<S>,
+    query: &str,
+    sort_mode: SearchSortMode,
+    is_cancelled: F,
+) -> Option<SearchOutput>
+where
+    S: ItemsSource + Send + Sync,
+    F: Fn() -> bool + Sync,
+{
+    let end = snapshot.len();
+    search_range_with_options(
+        snapshot,
+        query,
+        0..end,
+        sort_mode,
+        is_cancelled,
+        None,
+        false,
+    )
+}
+
+pub fn search_range<S, F>(
+    snapshot: Arc<S>,
+    query: &str,
+    range: Range<usize>,
+    is_cancelled: F,
+) -> Option<SearchOutput>
+where
+    S: ItemsSource + Send + Sync,
+    F: Fn() -> bool + Sync,
+{
+    search_range_with_options(
+        snapshot,
+        query,
+        range,
+        SearchSortMode::Score,
+        is_cancelled,
+        None,
+        false,
+    )
+}
+
+pub fn search_range_with_sort<S, F>(
+    snapshot: Arc<S>,
+    query: &str,
+    range: Range<usize>,
+    sort_mode: SearchSortMode,
+    is_cancelled: F,
+) -> Option<SearchOutput>
+where
+    S: ItemsSource + Send + Sync,
+    F: Fn() -> bool + Sync,
+{
+    search_range_with_options(snapshot, query, range, sort_mode, is_cancelled, None, false)
+}
+
+pub(crate) fn search_range_with_match_collection<S, F>(
+    snapshot: Arc<S>,
+    query: &str,
+    range: Range<usize>,
+    sort_mode: SearchSortMode,
+    is_cancelled: F,
+) -> Option<SearchOutput>
+where
+    S: ItemsSource + Send + Sync,
+    F: Fn() -> bool + Sync,
+{
+    search_range_with_options(snapshot, query, range, sort_mode, is_cancelled, None, true)
+}
+
+pub(crate) fn search_with_match_cache<S, F>(
+    snapshot: Arc<S>,
+    query: &str,
+    sort_mode: SearchSortMode,
+    is_cancelled: F,
+    filter: Option<&MatchBitmap>,
+) -> Option<SearchOutput>
+where
+    S: ItemsSource + Send + Sync,
+    F: Fn() -> bool + Sync,
+{
+    let end = snapshot.len();
+    search_range_with_options(
+        snapshot,
+        query,
+        0..end,
+        sort_mode,
+        is_cancelled,
+        filter,
+        true,
+    )
+}
+
+fn search_range_with_options<S, F>(
+    snapshot: Arc<S>,
+    query: &str,
+    range: Range<usize>,
+    sort_mode: SearchSortMode,
+    is_cancelled: F,
+    filter: Option<&MatchBitmap>,
+    collect_matches: bool,
+) -> Option<SearchOutput>
+where
+    S: ItemsSource + Send + Sync,
+    F: Fn() -> bool + Sync,
+{
+    let total_start = Instant::now();
+    let total = snapshot.len();
+    let start_index = range.start.min(total);
+    let end_index = range.end.min(total);
+    let searched = end_index.saturating_sub(start_index);
+    if is_cancelled() {
+        return None;
+    }
+
+    if snapshot.is_empty() || searched == 0 {
+        let total_us = timing::elapsed_us(total_start);
+        timing::write(format!(
+            "search_detail total_us={total_us} parse_us=0 match_us=0 sort_us=0 append_us=0 shown=0 matched=0 total={total}",
+        ));
+        return Some(SearchOutput {
+            results: Vec::new(),
+            matched: 0,
+            total,
+            match_bitmap: None,
+        });
+    }
+
+    if query.is_empty() {
+        let append_start = Instant::now();
+        let output = SearchOutput {
+            results: materialize_unfiltered(snapshot, start_index..end_index, RESULT_LIMIT),
+            matched: searched,
+            total,
+            match_bitmap: None,
+        };
+        let append_us = timing::elapsed_us(append_start);
+        let total_us = timing::elapsed_us(total_start);
+        timing::write(format!(
+            "search_detail mode=unfiltered total_us={total_us} parse_us=0 match_us=0 sort_us=0 append_us={append_us} shown={} matched={} total={}",
+            output.results.len(),
+            output.matched,
+            output.total
+        ));
+        return Some(output);
+    }
+
+    let parse_start = Instant::now();
+    let config = frizbee_config();
+    let parse_us = timing::elapsed_us(parse_start);
+
+    let match_start = Instant::now();
+    debug_assert!(filter.is_none() || start_index == 0);
+    let accumulator = if let Some(filter) = filter {
+        accumulate_frizbee(
+            Arc::clone(&snapshot),
+            filter.matching_indexes(end_index),
+            query,
+            &config,
+            sort_mode,
+            &is_cancelled,
+            collect_matches,
+        )
+    } else {
+        accumulate_frizbee(
+            Arc::clone(&snapshot),
+            (start_index..end_index).into_par_iter(),
+            query,
+            &config,
+            sort_mode,
+            &is_cancelled,
+            collect_matches,
+        )
+    };
     let match_us = timing::elapsed_us(match_start);
     let SearchAccumulator {
         candidates,
@@ -378,6 +582,7 @@ where
         score_us,
         retention_us,
         cancelled,
+        matched_indexes,
         ..
     } = accumulator;
     if cancelled || is_cancelled() {
@@ -417,6 +622,11 @@ where
     let ascii_score_estimate_us = score_us * sampled_scale;
     let retention_estimate_us = retention_us * sampled_scale;
 
+    let searched = filter.map_or(searched, |filter| filter.count_matches(end_index));
+    let match_bitmap = matched_indexes
+        .as_deref()
+        .map(|indexes| MatchBitmap::from_indexes(end_index, indexes));
+
     timing::write(format!(
         "search_detail mode={} total_us={total_us} parse_us={parse_us} match_us={match_us} sort_us={sort_us} append_us={append_us} utf8_path_estimate_us={utf8_path_estimate_us} ascii_score_estimate_us={ascii_score_estimate_us} char_fallback_estimate_us=0 retention_estimate_us={retention_estimate_us} timing_sample_rate={SEARCH_TIMING_SAMPLE_RATE} timing_samples={timing_samples} utf8_count={utf8_count} fallback_count=0 shown={} matched={matched} total={total} searched={searched}",
         sort_mode.timing_label(),
@@ -427,6 +637,7 @@ where
         results,
         matched,
         total,
+        match_bitmap,
     })
 }
 
