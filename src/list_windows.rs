@@ -1,11 +1,11 @@
 #![cfg(windows)]
 
+use std::collections::HashSet;
 use std::path::Path;
 
 use anyhow::Result;
 use windows::core::{BOOL, PWSTR};
 use windows::Win32::Foundation::{CloseHandle, HWND, LPARAM};
-use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED};
 use windows::Win32::System::Threading::{
     OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
 };
@@ -30,6 +30,7 @@ struct WindowInfo {
     hwnd: HWND,
     process_id: u32,
     process_name: String,
+    class_name: String,
     title: String,
 }
 
@@ -41,6 +42,7 @@ pub fn list_windows() -> Result<Vec<WindowListItem>> {
             LPARAM((&mut windows as *mut Vec<WindowInfo>) as isize),
         )?;
     }
+    remove_app_frame_duplicates(&mut windows);
 
     let process_width = windows
         .iter()
@@ -78,7 +80,11 @@ unsafe fn window_info(hwnd: HWND) -> Option<WindowInfo> {
 
     let style = unsafe { GetWindowLongW(hwnd, GWL_STYLE) } as u32;
     let extended_style = unsafe { GetWindowLongW(hwnd, GWL_EXSTYLE) } as u32;
-    if style & WS_VISIBLE.0 == 0 || extended_style & WS_EX_TOOLWINDOW.0 != 0 || is_cloaked(hwnd) {
+    // A cloaked top-level window can represent an inactive workspace in an
+    // external window manager. Cloaking does not make it ineligible for the
+    // window picker; the remaining Alt-Tab-style checks still reject shell,
+    // tool, child, and no-activate windows.
+    if style & WS_VISIBLE.0 == 0 || extended_style & WS_EX_TOOLWINDOW.0 != 0 {
         return None;
     }
 
@@ -108,22 +114,31 @@ unsafe fn window_info(hwnd: HWND) -> Option<WindowInfo> {
         hwnd,
         process_id,
         process_name: process_name(process_id),
+        class_name,
         title,
     })
 }
 
-fn is_cloaked(hwnd: HWND) -> bool {
-    let mut cloaked = 0u32;
-    unsafe {
-        DwmGetWindowAttribute(
-            hwnd,
-            DWMWA_CLOAKED,
-            (&mut cloaked as *mut u32).cast(),
-            size_of::<u32>() as u32,
-        )
-        .is_ok()
-            && cloaked != 0
+fn remove_app_frame_duplicates(windows: &mut Vec<WindowInfo>) {
+    let hosted_titles: HashSet<_> = windows
+        .iter()
+        .filter(|window| {
+            window.class_name == "ApplicationFrameWindow"
+                && window
+                    .process_name
+                    .eq_ignore_ascii_case("ApplicationFrameHost.exe")
+        })
+        .map(|window| window.title.clone())
+        .collect();
+    if hosted_titles.is_empty() {
+        return;
     }
+    windows.retain(|window| {
+        !hosted_titles.contains(&window.title)
+            || window
+                .process_name
+                .eq_ignore_ascii_case("ApplicationFrameHost.exe")
+    });
 }
 
 fn is_alt_tab_window(hwnd: HWND) -> bool {
@@ -177,4 +192,54 @@ fn process_name(process_id: u32) -> String {
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn window(hwnd: isize, process_name: &str, class_name: &str, title: &str) -> WindowInfo {
+        WindowInfo {
+            hwnd: HWND(hwnd as *mut _),
+            process_id: hwnd as u32,
+            process_name: process_name.into(),
+            class_name: class_name.into(),
+            title: title.into(),
+        }
+    }
+
+    #[test]
+    fn application_frame_host_replaces_duplicate_app_window() {
+        let mut windows = vec![
+            window(
+                1,
+                "ApplicationFrameHost.exe",
+                "ApplicationFrameWindow",
+                "Media Player",
+            ),
+            window(
+                2,
+                "Microsoft.Media.Player.exe",
+                "SomeAppWindow",
+                "Media Player",
+            ),
+        ];
+
+        remove_app_frame_duplicates(&mut windows);
+
+        assert_eq!(windows.len(), 1);
+        assert_eq!(windows[0].hwnd, HWND(1 as *mut _));
+    }
+
+    #[test]
+    fn equal_titles_without_an_application_frame_are_preserved() {
+        let mut windows = vec![
+            window(1, "explorer.exe", "CabinetWClass", "Downloads"),
+            window(2, "explorer.exe", "CabinetWClass", "Downloads"),
+        ];
+
+        remove_app_frame_duplicates(&mut windows);
+
+        assert_eq!(windows.len(), 2);
+    }
 }

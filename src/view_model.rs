@@ -29,6 +29,7 @@ const PICKER_DISPLAY_LIMIT: usize = 7;
 #[derive(Clone, Debug)]
 pub enum UiEvent {
     Show,
+    Focus,
     Results(UiUpdate),
     Preview(PreviewView),
     PreviewVisibilityChanged { visible: bool },
@@ -383,7 +384,6 @@ impl ViewModel {
         };
 
         if let Some((search_session, search_text)) = search_update {
-            self.clear_preview_selection();
             search_session.set_query(search_text);
         }
     }
@@ -937,6 +937,10 @@ impl ViewModel {
 
     pub fn hide(&self) {
         let _ = self.events_tx.send(UiEvent::Hide);
+    }
+
+    pub fn focus(&self) {
+        let _ = self.events_tx.send(UiEvent::Focus);
     }
 
     pub fn cancel(&self) {

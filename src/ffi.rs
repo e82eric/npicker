@@ -269,6 +269,15 @@ pub extern "C" fn RustNfmHide() {
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn RustNfmFocus() {
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        if let Some(view_model) = VIEW_MODEL.get() {
+            view_model.focus();
+        }
+    }));
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn RustNfmSetMenuLocation(x: i32, y: i32) {
     picker_ui::set_preferred_center(x, y);
 }

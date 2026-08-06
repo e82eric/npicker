@@ -70,8 +70,10 @@ const WM_INDEXING_SPINNER: u32 = WM_APP + 7;
 const WM_TOAST: u32 = WM_APP + 8;
 const PREVIEW_LOADING_DELAY_MS: u32 = 400;
 const INDEXING_SPINNER_INTERVAL_MS: u32 = 80;
-const INDEXING_SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+const INDEXING_SPINNER_FRAME_COUNT: usize = 8;
 const DEFAULT_HEIGHT: i32 = 320;
+const FONT_FAMILY: &str = "Hack Nerd Font";
+const FONT_SIZE: f32 = 15.0;
 const COLOR_BACKGROUND: u32 = 0x282828;
 const COLOR_TEXT: u32 = 0xebdbb2;
 const COLOR_BORDER: u32 = 0x928374;
@@ -366,6 +368,7 @@ struct DwmThumbnailPreview {
     destination: HWND,
     thumbnail: Option<isize>,
     source: Option<isize>,
+    last_destination: Option<windows::Win32::Foundation::RECT>,
 }
 
 impl DwmThumbnailPreview {
@@ -374,6 +377,7 @@ impl DwmThumbnailPreview {
             destination,
             thumbnail: None,
             source: None,
+            last_destination: None,
         }
     }
 
@@ -397,10 +401,11 @@ impl DwmThumbnailPreview {
                 .context("DwmRegisterThumbnail failed")?,
         );
         self.source = Some(source);
+        self.last_destination = None;
         Ok(())
     }
 
-    fn update_layout(&self, container: Rect, scale: f32) -> Result<()> {
+    fn update_layout(&mut self, container: Rect, scale: f32) -> Result<()> {
         use windows::Win32::Foundation::RECT;
         use windows::Win32::Graphics::Dwm::{
             DwmQueryThumbnailSourceSize, DwmUpdateThumbnailProperties, DWM_THUMBNAIL_PROPERTIES,
@@ -409,6 +414,13 @@ impl DwmThumbnailPreview {
         let Some(thumbnail) = self.thumbnail else {
             return Ok(());
         };
+        // Match the C# implementation: determine the destination once for a
+        // registration. Some sources report a slightly different size after
+        // their redirected surface settles; accepting that later value makes
+        // an already-visible thumbnail visibly resize.
+        if self.last_destination.is_some() {
+            return Ok(());
+        }
         let source = unsafe { DwmQueryThumbnailSourceSize(thumbnail) }
             .context("DwmQueryThumbnailSourceSize failed")?;
         let destination = fit_thumbnail_rect(
@@ -429,7 +441,13 @@ impl DwmThumbnailPreview {
             ..Default::default()
         };
         unsafe { DwmUpdateThumbnailProperties(thumbnail, &properties) }
-            .context("DwmUpdateThumbnailProperties failed")
+            .context("DwmUpdateThumbnailProperties failed")?;
+        self.last_destination = Some(destination);
+        Ok(())
+    }
+
+    fn invalidate_layout(&mut self) {
+        self.last_destination = None;
     }
 
     fn unregister(&mut self) {
@@ -437,6 +455,7 @@ impl DwmThumbnailPreview {
             let _ = unsafe { windows::Win32::Graphics::Dwm::DwmUnregisterThumbnail(thumbnail) };
         }
         self.source = None;
+        self.last_destination = None;
     }
 }
 
@@ -584,14 +603,14 @@ impl WindowState {
     ) -> Result<Self> {
         let font_manager = FontMgr::default();
         let typeface = font_manager
-            .legacy_make_typeface("Cascadia Mono", FontStyle::normal())
+            .legacy_make_typeface(FONT_FAMILY, FontStyle::normal())
             .or_else(|| font_manager.legacy_make_typeface(None, FontStyle::normal()))
             .context("failed to create Skia typeface")?;
         let make_font = |style| {
             let face = font_manager
-                .legacy_make_typeface("Cascadia Mono", style)
+                .legacy_make_typeface(FONT_FAMILY, style)
                 .unwrap_or_else(|| typeface.clone());
-            let mut font = Font::new(face, 15.0);
+            let mut font = Font::new(face, FONT_SIZE);
             font.set_subpixel(true);
             font
         };
@@ -599,7 +618,7 @@ impl WindowState {
         let bold_font = make_font(FontStyle::bold());
         let italic_font = make_font(FontStyle::italic());
         let bold_italic_font = make_font(FontStyle::bold_italic());
-        let counter_font = Font::new(typeface, 15.0);
+        let counter_font = Font::new(typeface, FONT_SIZE);
         let text_height = font.metrics().0;
         let desired_height =
             desired_window_height(text_height, PADDING, DISPLAY_ROWS, preview_visible);
@@ -669,6 +688,12 @@ impl WindowState {
                 UiEvent::Show => unsafe {
                     self.visible = true;
                     self.show_root(hwnd);
+                },
+                UiEvent::Focus => unsafe {
+                    if self.visible {
+                        bring_to_foreground(hwnd);
+                        let _ = SetFocus(Some(hwnd));
+                    }
                 },
                 UiEvent::Results(update) => {
                     let was_scanning = self.counters.scanning;
@@ -762,6 +787,16 @@ impl WindowState {
                 }
                 UiEvent::Preview(PreviewView::NativeWindow(source)) => {
                     self.pending_native_preview = source;
+                    self.preview_lines = Arc::from([]);
+                    self.preview_image = None;
+                    self.preview_top_line = 0;
+                    self.preview_loading = false;
+                    self.preview_loading_visible = false;
+                    self.preview_truncated = false;
+                    self.preview_error = None;
+                    unsafe {
+                        let _ = KillTimer(Some(hwnd), WM_PREVIEW_LOADING as usize);
+                    }
                 }
                 UiEvent::PreviewVisibilityChanged { visible } => unsafe {
                     if self.preview_available && self.preview_enabled != visible {
@@ -808,6 +843,9 @@ impl WindowState {
         let first_show = !self.window_shown;
         let location = calculate_window_location();
         if self.last_window_location != Some(location) {
+            if let Some(thumbnail) = &mut self.native_thumbnail {
+                thumbnail.invalidate_layout();
+            }
             self.surface = None;
             self.back_buffer = None;
             self.last_window_location = Some(location);
@@ -1000,16 +1038,8 @@ impl WindowState {
         }
 
         let search = self.view_model.current_search_text();
-        let prompt = if self.counters.scanning {
-            format!(
-                "{} ",
-                INDEXING_SPINNER_FRAMES
-                    [self.indexing_spinner_frame % INDEXING_SPINNER_FRAMES.len()]
-            )
-        } else {
-            "> ".to_owned()
-        };
-        let prompt_width = skia_text_width(&self.font, &self.text_paint, &prompt);
+        let prompt = "> ";
+        let prompt_width = skia_text_width(&self.font, &self.text_paint, prompt);
         draw_skia_round_rect(canvas, &self.stroke_paint, self.layout.search_border, 8.0);
         if let Some(selection) = search.selection {
             let prefix_width = skia_text_width(
@@ -1033,14 +1063,23 @@ impl WindowState {
                 },
             );
         }
-        draw_skia_text(
-            canvas,
-            &self.font,
-            &self.text_paint,
-            &prompt,
-            self.layout.search_box,
-            TextAlign::Left,
-        );
+        if self.counters.scanning {
+            draw_indexing_spinner(
+                canvas,
+                self.layout.search_box,
+                prompt_width,
+                self.indexing_spinner_frame,
+            );
+        } else {
+            draw_skia_text(
+                canvas,
+                &self.font,
+                &self.text_paint,
+                prompt,
+                self.layout.search_box,
+                TextAlign::Left,
+            );
+        }
         let query = Rect {
             x: self.layout.search_box.x + prompt_width,
             y: self.layout.search_box.y,
@@ -1133,6 +1172,7 @@ impl WindowState {
             draw_skia_highlights(
                 canvas,
                 &self.font,
+                &self.bold_font,
                 &self.highlight_paint,
                 &result.result.path,
                 &result.positions,
@@ -1297,7 +1337,7 @@ unsafe extern "system" fn wnd_proc(
                     let state = &mut *state;
                     if state.counters.scanning {
                         state.indexing_spinner_frame =
-                            (state.indexing_spinner_frame + 1) % INDEXING_SPINNER_FRAMES.len();
+                            (state.indexing_spinner_frame + 1) % INDEXING_SPINNER_FRAME_COUNT;
                         let _ = state.paint(hwnd);
                     } else {
                         let _ = KillTimer(Some(hwnd), WM_INDEXING_SPINNER as usize);
@@ -1564,9 +1604,47 @@ fn draw_skia_round_rect(canvas: &Canvas, paint: &Paint, rect: Rect, radius: f32)
     );
 }
 
+fn draw_indexing_spinner(canvas: &Canvas, rect: Rect, prompt_width: f32, frame: usize) {
+    const ALPHAS: [u8; INDEXING_SPINNER_FRAME_COUNT] = [255, 210, 170, 130, 95, 70, 50, 35];
+    const PERIMETER: [(f32, f32); INDEXING_SPINNER_FRAME_COUNT] = [
+        (-1.0, -1.0),
+        (0.0, -1.0),
+        (1.0, -1.0),
+        (1.0, 0.0),
+        (1.0, 1.0),
+        (0.0, 1.0),
+        (-1.0, 1.0),
+        (-1.0, 0.0),
+    ];
+    let center_x = rect.x + prompt_width * 0.3;
+    let center_y = rect.y + rect.height / 2.0;
+    let radius = (prompt_width.min(rect.height) * 0.24).max(3.2);
+    let dot_radius = (radius * 0.28).max(1.1);
+    let active = frame % INDEXING_SPINNER_FRAME_COUNT;
+
+    for dot in 0..INDEXING_SPINNER_FRAME_COUNT {
+        let age = (active + INDEXING_SPINNER_FRAME_COUNT - dot) % INDEXING_SPINNER_FRAME_COUNT;
+        let mut paint = fill_paint(COLOR_SELECTED_ACCENT);
+        paint.set_alpha(ALPHAS[age]);
+        let (offset_x, offset_y) = PERIMETER[dot];
+        let x = center_x + offset_x * radius;
+        let y = center_y + offset_y * radius;
+        canvas.draw_rect(
+            SkRect::from_xywh(
+                x - dot_radius,
+                y - dot_radius,
+                dot_radius * 2.0,
+                dot_radius * 2.0,
+            ),
+            &paint,
+        );
+    }
+}
+
 fn draw_skia_highlights(
     canvas: &Canvas,
-    font: &Font,
+    normal_font: &Font,
+    highlight_font: &Font,
     paint: &Paint,
     text: &str,
     positions: &[usize],
@@ -1580,13 +1658,13 @@ fn draw_skia_highlights(
             continue;
         };
         let prefix = &text[..position];
-        let x = rect.x + skia_text_width(font, paint, prefix);
+        let x = rect.x + skia_text_width(normal_font, paint, prefix);
         if x >= rect.x + rect.width {
             break;
         }
         draw_skia_text(
             canvas,
-            font,
+            highlight_font,
             paint,
             &character.to_string(),
             Rect {
