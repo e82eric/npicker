@@ -60,6 +60,41 @@ preview filenames remain relative to the producer's directory. The selected
 preview file and center line are exposed to that child as `NFM_PREVIEW_ITEM`
 and `NFM_PREVIEW_LINE`. Use `--delimiter '\t'` for tab-delimited input.
 
+Structured CSV input streams complete CSV records into a schema-aware store.
+By default, the first record supplies the column names:
+
+```powershell
+Get-Process |
+    Select-Object Name,Id,CPU |
+    ConvertTo-Csv -NoTypeInformation |
+    nfm-rust-win32host --input-format csv
+```
+
+When the stream contains data records only, provide the headers explicitly:
+
+```text
+producer | nfm-rust-win32host --input-format csv --csv-columns Name,Id,CPU
+```
+
+`--csv-delimiter` selects another single-byte delimiter. The CSV decoder
+supports quoted delimiters, escaped quotes, and quoted multiline fields.
+Multiline values are escaped for the one-line picker display while the accepted
+value remains a valid CSV record.
+
+Structured queries use the same slash syntax as the C# picker. Ordinary query
+text continues to use fuzzy matching, while complete structured expressions
+are compiled against the CSV schema:
+
+```text
+server /:Status==Running /:CPU>=10 /!Descending==CPU
+```
+
+Supported filter operators are `==`, `!=`, `=~`, `!~`, `>`, `>=`, `<`, and
+`<=`. Multiple values may be separated with commas. Type `/` to open
+autocomplete; it suggests actions, column names, operators, sort directions,
+and up to 1,000 distinct values observed in the selected column. Use the arrow
+keys and Enter to select a suggestion, or Escape to dismiss it.
+
 On Windows, scan the current user's home directory without stdin:
 
 ```text
@@ -170,6 +205,19 @@ nfm-rust-win32host listwindows --window-preview
 
 An explicitly supplied `--preview` command takes precedence over the native
 window thumbnail.
+
+On Windows, list running processes in a structured picker:
+
+```text
+nfm-rust-win32host listprocesses
+```
+
+The picker displays Name, PID, working set, private bytes, and CPU time. It
+supports the structured column expressions and autocomplete and writes the
+selected row to stdout. The preview pane shows the selected process fields
+without launching another process. It starts hidden; press Ctrl+P or pass
+`--preview-visible true` to show it. Press Ctrl+K to terminate the selected
+process, or Ctrl+R to refresh the process list.
 
 Add a non-blocking preview pane above the results with `--preview`. Its value is
 an executable, and each repeatable `--preview-arg` supplies one argument. The

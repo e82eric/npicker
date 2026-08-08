@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 use crossbeam_channel::{bounded, RecvTimeoutError, Sender};
 use serde::{Deserialize, Serialize};
 
+use crate::selection::SelectedItem;
 use crate::view_model::ViewModelEvent;
 
 const OUTPUT_LIMIT: usize = 64 * 1024;
@@ -35,17 +36,9 @@ pub struct ActionConfig {
 
 #[derive(Clone, Debug, Serialize)]
 pub struct ActionState {
-    pub selection: Option<ActionSelection>,
+    pub selection: Option<SelectedItem>,
     pub picker: PickerState,
     pub query: String,
-}
-
-#[derive(Clone, Debug, Serialize)]
-pub struct ActionSelection {
-    pub item: String,
-    pub value: String,
-    pub line: Option<usize>,
-    pub native_window: Option<isize>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -54,7 +47,7 @@ pub enum PickerState {
     Filewalker { roots: Vec<String> },
     Stdin,
     DelimitedStdin,
-    Windows,
+    StructuredStdin,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -313,11 +306,11 @@ mod tests {
     #[test]
     fn action_state_serializes_as_one_json_document() {
         let state = ActionState {
-            selection: Some(ActionSelection {
+            selection: Some(SelectedItem {
                 item: r"G:\src\file.rs".into(),
                 value: "value".into(),
                 line: Some(42),
-                native_window: None,
+                fields: HashMap::new(),
             }),
             picker: PickerState::Filewalker {
                 roots: vec![r"G:\src".into()],

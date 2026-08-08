@@ -1,7 +1,42 @@
 use crate::fuzzy_search_session::SearchSnapshotProvider;
 use crate::snapshot_store::SnapshotStore;
+use std::cmp::Ordering as CmpOrdering;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+
+pub trait SearchPlan: Send + Sync {
+    fn fuzzy_query(&self) -> &str;
+
+    fn filters_items(&self) -> bool {
+        false
+    }
+
+    fn includes(&self, _index: usize) -> bool {
+        true
+    }
+
+    fn compare(&self, _left: usize, _right: usize) -> CmpOrdering {
+        CmpOrdering::Equal
+    }
+
+    fn has_custom_sort(&self) -> bool {
+        false
+    }
+
+    fn display_text(&self, _index: usize) -> Option<String> {
+        None
+    }
+}
+
+struct PlainSearchPlan {
+    query: String,
+}
+
+impl SearchPlan for PlainSearchPlan {
+    fn fuzzy_query(&self) -> &str {
+        &self.query
+    }
+}
 
 const ITEM_CHUNK_SIZE: usize = 64 * 1024;
 const BYTE_CHUNK_SIZE: usize = 1024 * 1024;
@@ -19,6 +54,12 @@ pub trait ItemsSource {
     ) -> &'a [u8];
 
     fn get_string_lossy(&self, node_index: usize, out: &mut Vec<u8>) -> String;
+
+    fn create_search_plan(&self, query: &str) -> Box<dyn SearchPlan + '_> {
+        Box::new(PlainSearchPlan {
+            query: query.to_owned(),
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug)]

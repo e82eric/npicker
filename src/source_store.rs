@@ -1,13 +1,15 @@
 #[cfg(windows)]
 use nfm_file_system::walker::{PublishedSnapshot, ScanEventSink, ScanStatus};
 use nfm_search_core::fuzzy_search_session::SearchSnapshotProvider;
-use nfm_search_core::store::{FlatSnapshot, ItemsSource, StreamingItemSnapshot};
+use nfm_search_core::store::{FlatSnapshot, ItemsSource, SearchPlan, StreamingItemSnapshot};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 
 use crate::delimited_store::{DelimitedItemMetadata, DelimitedStreamingSnapshot};
 #[cfg(windows)]
 use crate::list_windows::WindowPayload;
+use crate::structured_store::{CompletionSuggestion, StructuredStreamingSnapshot};
 
 pub enum AnyItemSource {
     #[cfg(windows)]
@@ -17,6 +19,7 @@ pub enum AnyItemSource {
     Flat(Arc<FlatSnapshot<()>>),
     Streaming(Arc<StreamingItemSnapshot>),
     Delimited(Arc<DelimitedStreamingSnapshot>),
+    Structured(Arc<StructuredStreamingSnapshot>),
 }
 
 impl ItemsSource for AnyItemSource {
@@ -29,6 +32,7 @@ impl ItemsSource for AnyItemSource {
             AnyItemSource::Flat(source) => source.version(),
             AnyItemSource::Streaming(source) => source.version(),
             AnyItemSource::Delimited(source) => source.version(),
+            AnyItemSource::Structured(source) => source.version(),
         }
     }
 
@@ -41,6 +45,7 @@ impl ItemsSource for AnyItemSource {
             AnyItemSource::Flat(source) => source.len(),
             AnyItemSource::Streaming(source) => source.len(),
             AnyItemSource::Delimited(source) => source.len(),
+            AnyItemSource::Structured(source) => source.len(),
         }
     }
 
@@ -53,6 +58,7 @@ impl ItemsSource for AnyItemSource {
             AnyItemSource::Flat(source) => source.is_empty(),
             AnyItemSource::Streaming(source) => source.is_empty(),
             AnyItemSource::Delimited(source) => source.is_empty(),
+            AnyItemSource::Structured(source) => source.is_empty(),
         }
     }
 
@@ -72,6 +78,9 @@ impl ItemsSource for AnyItemSource {
             AnyItemSource::Flat(source) => source.get_string(index, stack_buffer, heap_buffer),
             AnyItemSource::Streaming(source) => source.get_string(index, stack_buffer, heap_buffer),
             AnyItemSource::Delimited(source) => source.get_string(index, stack_buffer, heap_buffer),
+            AnyItemSource::Structured(source) => {
+                source.get_string(index, stack_buffer, heap_buffer)
+            }
         }
     }
 
@@ -84,6 +93,20 @@ impl ItemsSource for AnyItemSource {
             AnyItemSource::Flat(source) => source.get_string_lossy(node_index, out),
             AnyItemSource::Streaming(source) => source.get_string_lossy(node_index, out),
             AnyItemSource::Delimited(source) => source.get_string_lossy(node_index, out),
+            AnyItemSource::Structured(source) => source.get_string_lossy(node_index, out),
+        }
+    }
+
+    fn create_search_plan(&self, query: &str) -> Box<dyn SearchPlan + '_> {
+        match self {
+            #[cfg(windows)]
+            AnyItemSource::FileSystem(source) => source.create_search_plan(query),
+            #[cfg(windows)]
+            AnyItemSource::Windows(source) => source.create_search_plan(query),
+            AnyItemSource::Flat(source) => source.create_search_plan(query),
+            AnyItemSource::Streaming(source) => source.create_search_plan(query),
+            AnyItemSource::Delimited(source) => source.create_search_plan(query),
+            AnyItemSource::Structured(source) => source.create_search_plan(query),
         }
     }
 }
@@ -118,6 +141,60 @@ impl AnyItemSource {
             return None;
         };
         Some(source.metadata(node_index))
+    }
+
+    pub fn structured_value(&self, node_index: usize) -> Option<String> {
+        match self {
+            Self::Structured(source) => Some(source.value(node_index)),
+            _ => None,
+        }
+    }
+
+    pub fn item_fields(&self, node_index: usize) -> HashMap<String, String> {
+        match self {
+            Self::Structured(source) => source.fields(node_index),
+            #[cfg(windows)]
+            Self::Windows(source) => HashMap::from([(
+                "NativeWindow".into(),
+                source.payload(node_index).hwnd.to_string(),
+            )]),
+            _ => HashMap::new(),
+        }
+    }
+
+    pub fn structured_columns(&self) -> Option<&[String]> {
+        match self {
+            Self::Structured(source) => Some(&source.schema().columns),
+            _ => None,
+        }
+    }
+
+    pub fn structured_header(&self, query: &str) -> Option<String> {
+        match self {
+            Self::Structured(source) => Some(source.header(query)),
+            _ => None,
+        }
+    }
+
+    pub fn structured_display(&self, node_index: usize, query: &str) -> Option<String> {
+        match self {
+            Self::Structured(source) => Some(source.display_row(node_index, query)),
+            _ => None,
+        }
+    }
+
+    pub fn completions(&self, input: &str, cursor: usize) -> Vec<CompletionSuggestion> {
+        match self {
+            Self::Structured(source) => source.completions(input, cursor),
+            _ => Vec::new(),
+        }
+    }
+
+    pub fn effective_fuzzy_query(&self, input: &str) -> String {
+        match self {
+            Self::Structured(_) => crate::structured_store::fuzzy_query(input),
+            _ => input.to_owned(),
+        }
     }
 }
 

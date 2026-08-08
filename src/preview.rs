@@ -232,6 +232,7 @@ pub enum PreviewConfig {
     None,
     Command(PreviewResolver),
     NativeWindow,
+    Formatted,
     CommandOrNativeWindow(PreviewResolver),
 }
 
@@ -261,6 +262,10 @@ trait PreviewBackend: Send + Sync {
         result: Option<&SearchResult>,
         source: Option<&AnyItemSource>,
     );
+    fn formatted_preview_changed(&self, preview: Option<Result<String, String>>) {
+        let _ = preview;
+        self.clear();
+    }
     fn clear(&self);
 }
 
@@ -279,6 +284,10 @@ impl PreviewCoordinator {
         source: Option<&AnyItemSource>,
     ) {
         self.backend.selected_result_changed(result, source);
+    }
+
+    pub fn formatted_preview_changed(&self, preview: Option<Result<String, String>>) {
+        self.backend.formatted_preview_changed(preview);
     }
 
     pub fn clear(&self) {
@@ -300,14 +309,24 @@ fn build_preview_backend(
             events,
             selected: Mutex::new(None),
         }),
+        PreviewConfig::Formatted => Box::new(FormattedPreviewBackend {
+            events,
+            selected: Mutex::new(None),
+            generation: AtomicU64::new(0),
+        }),
         PreviewConfig::CommandOrNativeWindow(resolver) => Box::new(SourcePreviewBackend {
             command: CommandPreviewBackend {
                 controller: CommandPreviewController::new(resolver, events.clone()),
                 selected: Mutex::new(None),
             },
             native_window: NativeWindowPreviewBackend {
-                events,
+                events: events.clone(),
                 selected: Mutex::new(None),
+            },
+            formatted: FormattedPreviewBackend {
+                events: events.clone(),
+                selected: Mutex::new(None),
+                generation: AtomicU64::new(0),
             },
         }),
     }
@@ -316,6 +335,7 @@ fn build_preview_backend(
 struct SourcePreviewBackend {
     command: CommandPreviewBackend,
     native_window: NativeWindowPreviewBackend,
+    formatted: FormattedPreviewBackend,
 }
 
 impl PreviewBackend for SourcePreviewBackend {
@@ -326,16 +346,88 @@ impl PreviewBackend for SourcePreviewBackend {
     ) {
         if source.is_some_and(AnyItemSource::is_window_source) {
             self.command.clear();
+            self.formatted.clear();
             self.native_window.selected_result_changed(result, source);
         } else {
             self.native_window.clear();
+            self.formatted.clear();
             self.command.selected_result_changed(result, source);
         }
+    }
+
+    fn formatted_preview_changed(&self, preview: Option<Result<String, String>>) {
+        self.command.clear();
+        self.native_window.clear();
+        self.formatted.formatted_preview_changed(preview);
     }
 
     fn clear(&self) {
         self.command.clear();
         self.native_window.clear();
+        self.formatted.clear();
+    }
+}
+
+struct FormattedPreviewBackend {
+    events: Sender<ViewModelEvent>,
+    selected: Mutex<Option<Result<String, String>>>,
+    generation: AtomicU64,
+}
+
+impl PreviewBackend for FormattedPreviewBackend {
+    fn selected_result_changed(
+        &self,
+        result: Option<&SearchResult>,
+        source: Option<&AnyItemSource>,
+    ) {
+        let _ = (result, source);
+        self.formatted_preview_changed(None);
+    }
+
+    fn formatted_preview_changed(&self, preview: Option<Result<String, String>>) {
+        {
+            let mut selected = self.selected.lock().expect("preview backend poisoned");
+            if *selected == preview {
+                return;
+            }
+            *selected = preview.clone();
+        }
+        let generation = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
+        send_preview(
+            &self.events,
+            PreviewEvent::Command(PreviewUpdate::Clear { generation }),
+        );
+        let Some(preview) = preview else {
+            return;
+        };
+        let text = match preview {
+            Ok(text) => text,
+            Err(message) => {
+                send_preview(
+                    &self.events,
+                    PreviewEvent::Command(PreviewUpdate::Error {
+                        generation,
+                        message,
+                    }),
+                );
+                return;
+            }
+        };
+        let mut document = PreviewDocument::default();
+        document.push(PreviewStream::Stdout, text.as_bytes());
+        send_preview(
+            &self.events,
+            PreviewEvent::Command(PreviewUpdate::Ready {
+                generation,
+                lines: Arc::from(document.into_lines()),
+                truncated: false,
+                center_line: None,
+            }),
+        );
+    }
+
+    fn clear(&self) {
+        self.formatted_preview_changed(None);
     }
 }
 
@@ -1012,6 +1104,35 @@ mod tests {
         assert!(receiver.try_recv().is_err());
     }
 
+    #[test]
+    fn formatted_preview_backend_parses_injected_text() {
+        let (events, receiver) = bounded(4);
+        let backend = FormattedPreviewBackend {
+            events,
+            selected: Mutex::new(None),
+            generation: AtomicU64::new(0),
+        };
+
+        backend.formatted_preview_changed(Some(Ok("Name: example.exe\nPID: 1234".into())));
+
+        assert!(matches!(
+            receiver.recv().unwrap(),
+            ViewModelEvent::Preview(PreviewEvent::Command(PreviewUpdate::Clear {
+                generation: 1
+            }))
+        ));
+        let ViewModelEvent::Preview(PreviewEvent::Command(PreviewUpdate::Ready {
+            generation,
+            lines,
+            ..
+        })) = receiver.recv().unwrap()
+        else {
+            panic!("expected formatted preview")
+        };
+        assert_eq!(generation, 1);
+        assert_eq!(lines.len(), 2);
+    }
+
     #[cfg(windows)]
     #[test]
     fn source_preview_backend_routes_and_clears_by_source_type() {
@@ -1034,8 +1155,13 @@ mod tests {
                 selected: Mutex::new(None),
             },
             native_window: NativeWindowPreviewBackend {
+                events: events.clone(),
+                selected: Mutex::new(None),
+            },
+            formatted: FormattedPreviewBackend {
                 events,
                 selected: Mutex::new(None),
+                generation: AtomicU64::new(0),
             },
         };
         let result = SearchResult {

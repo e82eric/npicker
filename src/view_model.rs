@@ -6,8 +6,7 @@ use std::thread;
 use std::time::Duration;
 
 use crate::action::{
-    ActionController, ActionEvent, ActionResolution, ActionSelection, ActionService, ActionState,
-    PickerState,
+    ActionController, ActionEvent, ActionResolution, ActionService, ActionState, PickerState,
 };
 pub use crate::key_binding::KeyModifiers;
 use crate::key_binding::{KeyChord, KeyName};
@@ -17,7 +16,9 @@ use crate::preview::{
 #[cfg(windows)]
 use crate::request::FileSystemPickerRequest;
 use crate::request::{PickerRequest, PickerResponse};
+use crate::selection::SelectedItem;
 use crate::source_store::{AnyItemSource, SharedStore};
+use crate::structured_store::CompletionSuggestion;
 use anyhow::{bail, Result};
 use crossbeam_channel::{unbounded, Receiver, Sender};
 use nfm_search_core::fuzzy_search_session::{FuzzySearchSession, FuzzySearchUpdate};
@@ -59,6 +60,7 @@ pub struct UiUpdate {
     pub results: Vec<DisplaySearchResult>,
     pub counters: UiCounters,
     pub selected_row: usize,
+    pub header: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -77,6 +79,37 @@ pub struct ViewModel {
     preview: PreviewCoordinator,
     actions: ActionController,
     bindings: HashMap<KeyChord, String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PickerActionOutcome {
+    None,
+    Refresh,
+    RefreshWithToast(String),
+    Toast(String),
+}
+
+pub type PickerAction =
+    Arc<dyn Fn(Option<&SelectedItem>) -> Result<PickerActionOutcome, String> + Send + Sync>;
+pub type PickerRefresh = Arc<dyn Fn() -> Result<Arc<SharedStore>, String> + Send + Sync>;
+pub type PickerPreviewFormatter =
+    Arc<dyn Fn(&SelectedItem) -> Result<String, String> + Send + Sync>;
+
+#[derive(Clone)]
+pub struct PickerInteractions {
+    pub bindings: HashMap<KeyChord, PickerAction>,
+    pub refresh: Option<PickerRefresh>,
+    pub preview: Option<PickerPreviewFormatter>,
+}
+
+impl Default for PickerInteractions {
+    fn default() -> Self {
+        Self {
+            bindings: HashMap::new(),
+            refresh: None,
+            preview: None,
+        }
+    }
 }
 
 pub(crate) enum ViewModelEvent {
@@ -102,6 +135,8 @@ struct State {
     preview_update: Option<PreviewUpdate>,
     preview_visible: bool,
     action_generation: Option<u64>,
+    suggestions: Vec<CompletionSuggestion>,
+    suggestion_selected: usize,
 }
 
 #[derive(Clone)]
@@ -109,6 +144,18 @@ pub struct SearchInputState {
     pub text: String,
     pub cursor_position: usize,
     pub selection: Option<Range<usize>>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct AutocompleteState {
+    pub suggestions: Vec<AutocompleteItem>,
+    pub selected: usize,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct AutocompleteItem {
+    pub text: String,
+    pub positions: Vec<usize>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -165,6 +212,7 @@ struct ActiveRequest {
     search_session: FuzzySearchSession<AnyItemSource, SharedStore>,
     store: Arc<SharedStore>,
     picker_state: PickerState,
+    interactions: PickerInteractions,
 }
 
 impl ViewModel {
@@ -223,6 +271,8 @@ impl ViewModel {
                 preview_update: None,
                 preview_visible,
                 action_generation: None,
+                suggestions: Vec::new(),
+                suggestion_selected: 0,
             }),
             request_generation: AtomicU64::new(0),
             search_update_tx,
@@ -274,11 +324,13 @@ impl ViewModel {
                 return;
             }
             state.action_generation = None;
+            state.suggestions.clear();
+            state.suggestion_selected = 0;
         }
         match event.result {
             Ok(ActionResolution::None) => {}
             Ok(ActionResolution::Complete) => match event.state.selection {
-                Some(selection) => self.complete_accept(selection.value, selection.native_window),
+                Some(selection) => self.complete(PickerResponse::selected(selection)),
                 None => eprintln!("action resolver cannot complete without a selection"),
             },
             Ok(ActionResolution::FileWalker { roots }) => self.transition_to_filewalker(roots),
@@ -303,6 +355,17 @@ impl ViewModel {
     }
 
     pub fn run_request<R>(self: &Arc<Self>, request: &R) -> Result<PickerResponse>
+    where
+        R: PickerRequest,
+    {
+        self.run_request_with_interactions(request, PickerInteractions::default())
+    }
+
+    pub fn run_request_with_interactions<R>(
+        self: &Arc<Self>,
+        request: &R,
+        interactions: PickerInteractions,
+    ) -> Result<PickerResponse>
     where
         R: PickerRequest,
     {
@@ -346,6 +409,7 @@ impl ViewModel {
                 search_session: session.clone(),
                 store: Arc::clone(&store),
                 picker_state: request.picker_state(),
+                interactions,
             });
             state.visible_update()
         };
@@ -373,6 +437,14 @@ impl ViewModel {
             if changed {
                 state.selected = 0;
                 state.viewport_start = 0;
+                let completions = state
+                    .active
+                    .as_ref()
+                    .and_then(|active| active.store.snapshot())
+                    .map(|source| source.completions(&state.search_text, state.cursor_position))
+                    .unwrap_or_default();
+                state.suggestions = completions;
+                state.suggestion_selected = 0;
 
                 state
                     .active
@@ -445,9 +517,54 @@ impl ViewModel {
     }
 
     pub fn handle_key(self: &Arc<Self>, chord: KeyChord, repeat: bool) -> bool {
+        if !chord.modifiers.ctrl && !chord.modifiers.alt && !chord.modifiers.shift {
+            let has_suggestions = !self
+                .state
+                .lock()
+                .expect("view model poisoned")
+                .suggestions
+                .is_empty();
+            if has_suggestions {
+                match chord.key {
+                    KeyName::Up => {
+                        self.move_suggestion(-1);
+                        return true;
+                    }
+                    KeyName::Down => {
+                        self.move_suggestion(1);
+                        return true;
+                    }
+                    KeyName::Enter if !repeat => {
+                        self.apply_suggestion();
+                        return true;
+                    }
+                    KeyName::Escape if !repeat => {
+                        let mut state = self.state.lock().expect("view model poisoned");
+                        state.suggestions.clear();
+                        state.suggestion_selected = 0;
+                        return true;
+                    }
+                    _ => {}
+                }
+            }
+        }
         if let Some(action) = self.bindings.get(&chord) {
             if !repeat {
                 self.invoke_action(action);
+            }
+            return true;
+        }
+        let picker_action = {
+            let state = self.state.lock().expect("view model poisoned");
+            state
+                .active
+                .as_ref()
+                .and_then(|active| active.interactions.bindings.get(&chord))
+                .cloned()
+        };
+        if let Some(action) = picker_action {
+            if !repeat {
+                self.invoke_picker_action(&action);
             }
             return true;
         }
@@ -459,6 +576,43 @@ impl ViewModel {
         }
         self.handle_command(command, chord.modifiers);
         true
+    }
+
+    fn move_suggestion(&self, delta: isize) {
+        let mut state = self.state.lock().expect("view model poisoned");
+        let len = state.suggestions.len();
+        if len == 0 {
+            return;
+        }
+        state.suggestion_selected = if delta < 0 {
+            state
+                .suggestion_selected
+                .checked_sub(delta.unsigned_abs())
+                .unwrap_or(len - 1)
+        } else {
+            (state.suggestion_selected + delta as usize) % len
+        };
+    }
+
+    fn apply_suggestion(self: &Arc<Self>) {
+        let suggestion = {
+            let state = self.state.lock().expect("view model poisoned");
+            state.suggestions.get(state.suggestion_selected).cloned()
+        };
+        let Some(suggestion) = suggestion else {
+            return;
+        };
+        self.update_search_text(|state| {
+            if suggestion.replace.end > state.search_text.len() {
+                return false;
+            }
+            state
+                .search_text
+                .replace_range(suggestion.replace.clone(), &suggestion.replacement);
+            state.cursor_position = suggestion.replace.start + suggestion.replacement.len();
+            state.cursor_selection_anchor = None;
+            true
+        });
     }
 
     pub fn invoke_action(&self, name: &str) {
@@ -474,32 +628,7 @@ impl ViewModel {
             let Some(active) = state.active.as_ref() else {
                 return;
             };
-            let selection = state.results.get(state.selected).map(|result| {
-                let source = active.store.snapshot();
-                let metadata = source
-                    .as_ref()
-                    .and_then(|source| source.delimited_metadata(result.node_index));
-                let native_window = source
-                    .as_ref()
-                    .and_then(|source| source.native_window(result.node_index));
-                match metadata {
-                    Some(metadata) => ActionSelection {
-                        item: metadata
-                            .preview_item
-                            .clone()
-                            .unwrap_or_else(|| metadata.value.clone()),
-                        value: metadata.value,
-                        line: metadata.preview_center_line,
-                        native_window,
-                    },
-                    None => ActionSelection {
-                        item: result.path.clone(),
-                        value: result.path.clone(),
-                        line: None,
-                        native_window,
-                    },
-                }
-            });
+            let selection = Self::selected_item(&state);
             let picker = active.picker_state.clone();
             let query = state.search_text.clone();
             let generation = self
@@ -867,32 +996,49 @@ impl ViewModel {
     }
 
     pub fn select_current(&self) {
-        let selection = self.current_selection();
+        let selection = {
+            let state = self.state.lock().expect("view model poisoned");
+            Self::selected_item(&state)
+        };
         match selection {
-            Some((value, native_window)) => self.complete_accept(value, native_window),
+            Some(selection) => self.complete(PickerResponse::selected(selection)),
             None => self.complete_cancelled(),
         }
     }
 
-    fn current_selection(&self) -> Option<(String, Option<isize>)> {
-        {
-            let state = self.state.lock().expect("view model poisoned");
-            let active = state.active.as_ref()?;
-            state.results.get(state.selected).map(|result| {
-                let source = active.store.snapshot();
-                let value = source
-                    .as_ref()
-                    .and_then(|source| source.delimited_metadata(result.node_index))
-                    .map_or_else(|| result.path.clone(), |metadata| metadata.value);
-                let native_window =
-                    source.and_then(|source| source.native_window(result.node_index));
-                (value, native_window)
-            })
-        }
+    fn selected_item(state: &State) -> Option<SelectedItem> {
+        let active = state.active.as_ref()?;
+        let result = state.results.get(state.selected)?;
+        let source = active.store.snapshot()?;
+        let metadata = source.delimited_metadata(result.node_index);
+        let structured_value = source.structured_value(result.node_index);
+        let (item, value, line) = match metadata {
+            Some(metadata) => (
+                metadata
+                    .preview_item
+                    .unwrap_or_else(|| metadata.value.clone()),
+                metadata.value,
+                metadata.preview_center_line,
+            ),
+            None => {
+                let value = structured_value.unwrap_or_else(|| result.path.clone());
+                (value.clone(), value, None)
+            }
+        };
+        Some(SelectedItem {
+            item,
+            value,
+            line,
+            fields: source.item_fields(result.node_index),
+        })
     }
 
     fn copy_selection(&self) {
-        let Some((value, _)) = self.current_selection() else {
+        let value = {
+            let state = self.state.lock().expect("view model poisoned");
+            Self::selected_item(&state).map(|item| item.value)
+        };
+        let Some(value) = value else {
             return;
         };
         let text = match crate::clipboard::copy_text(&value) {
@@ -905,12 +1051,47 @@ impl ViewModel {
         });
     }
 
-    fn complete_accept(&self, value: String, native_window: Option<isize>) {
-        let response = match native_window {
-            Some(hwnd) => PickerResponse::selected_window(value, hwnd),
-            None => PickerResponse::selected(value),
+    fn invoke_picker_action(&self, action: &PickerAction) {
+        let item = {
+            let state = self.state.lock().expect("view model poisoned");
+            Self::selected_item(&state)
         };
-        self.complete(response);
+
+        match action(item.as_ref()) {
+            Ok(PickerActionOutcome::None) => {}
+            Ok(PickerActionOutcome::Refresh) => self.refresh_active_source(),
+            Ok(PickerActionOutcome::RefreshWithToast(text)) => {
+                self.show_toast(text);
+                self.refresh_active_source();
+            }
+            Ok(PickerActionOutcome::Toast(text)) => self.show_toast(text),
+            Err(error) => self.show_toast(error),
+        }
+    }
+
+    fn refresh_active_source(&self) {
+        let refresh = {
+            let state = self.state.lock().expect("view model poisoned");
+            let Some(active) = state.active.as_ref() else {
+                return;
+            };
+            let Some(refresh) = active.interactions.refresh.clone() else {
+                return;
+            };
+            refresh
+        };
+
+        match refresh() {
+            Ok(store) => self.replace_active_source(store),
+            Err(error) => self.show_toast(error),
+        }
+    }
+
+    fn show_toast(&self, text: String) {
+        let _ = self.events_tx.send(UiEvent::ShowToast {
+            text,
+            duration: Duration::from_secs(3),
+        });
     }
 
     fn complete_cancelled(&self) {
@@ -987,6 +1168,51 @@ impl ViewModel {
                 picker_state: PickerState::Filewalker {
                     roots: request.root_directories,
                 },
+                interactions: PickerInteractions::default(),
+            });
+            old_session
+        };
+        old_session.stop();
+        self.clear_preview_selection();
+        session.start();
+    }
+
+    fn replace_active_source(&self, store: Arc<SharedStore>) {
+        let request_id = self.request_generation.fetch_add(1, Ordering::AcqRel) + 1;
+        let query = self
+            .state
+            .lock()
+            .expect("view model poisoned")
+            .search_text
+            .clone();
+        let session = FuzzySearchSession::new(
+            request_id,
+            Arc::clone(&store),
+            query.clone(),
+            self.search_update_tx.clone(),
+        );
+        let old_session = {
+            let mut state = self.state.lock().expect("view model poisoned");
+            let Some(active) = state.active.take() else {
+                return;
+            };
+            let old_session = active.search_session;
+            let picker_state = active.picker_state;
+            let interactions = active.interactions;
+            state.result_query = query;
+            state.results.clear();
+            state.counters = UiCounters::default();
+            state.selected = 0;
+            state.viewport_start = 0;
+            state.suggestions.clear();
+            state.suggestion_selected = 0;
+            state.active = Some(ActiveRequest {
+                id: request_id,
+                response_tx: active.response_tx,
+                search_session: session.clone(),
+                store,
+                picker_state,
+                interactions,
             });
             old_session
         };
@@ -1027,6 +1253,21 @@ impl ViewModel {
         }
     }
 
+    pub fn current_autocomplete(&self) -> AutocompleteState {
+        let state = self.state.lock().expect("view model poisoned");
+        AutocompleteState {
+            suggestions: state
+                .suggestions
+                .iter()
+                .map(|suggestion| AutocompleteItem {
+                    text: suggestion.text.clone(),
+                    positions: suggestion.positions.clone(),
+                })
+                .collect(),
+            selected: state.suggestion_selected,
+        }
+    }
+
     fn apply_search_update(&self, search_update: FuzzySearchUpdate) {
         let ui_update = {
             let mut state = self.state.lock().expect("view model poisoned");
@@ -1038,9 +1279,19 @@ impl ViewModel {
             if search_update.session_id != active.id {
                 return;
             }
+            let store = Arc::clone(&active.store);
 
             state.results = search_update.results;
-            state.result_query = search_update.query;
+            state.result_query = store
+                .snapshot()
+                .map(|source| source.effective_fuzzy_query(&search_update.query))
+                .unwrap_or_else(|| search_update.query.clone());
+            if let Some(source) = store.snapshot() {
+                state.suggestions = source.completions(&state.search_text, state.cursor_position);
+                state.suggestion_selected = state
+                    .suggestion_selected
+                    .min(state.suggestions.len().saturating_sub(1));
+            }
             state.counters = UiCounters {
                 displayed: state.results.len(),
                 matched: search_update.matched,
@@ -1057,20 +1308,31 @@ impl ViewModel {
     }
 
     fn publish_results(&self, update: UiUpdate) {
-        let source = {
+        let (source, item, formatter) = {
             let state = self.state.lock().expect("view model poisoned");
-            state
+            let source = state
                 .active
                 .as_ref()
-                .and_then(|active| active.store.snapshot())
+                .and_then(|active| active.store.snapshot());
+            let item = Self::selected_item(&state);
+            let formatter = state
+                .active
+                .as_ref()
+                .and_then(|active| active.interactions.preview.clone());
+            (source, item, formatter)
         };
-        self.preview.selected_result_changed(
-            update
-                .results
-                .get(update.selected_row)
-                .map(|display| &display.result),
-            source.as_deref(),
-        );
+        if let Some(formatter) = formatter {
+            self.preview
+                .formatted_preview_changed(item.as_ref().map(|item| formatter(item)));
+        } else {
+            self.preview.selected_result_changed(
+                update
+                    .results
+                    .get(update.selected_row)
+                    .map(|display| &display.result),
+                source.as_deref(),
+            );
+        }
         let _ = self.events_tx.send(UiEvent::Results(update));
     }
 
@@ -1109,24 +1371,49 @@ impl State {
             return;
         }
 
-        let max_viewport_start = self.results.len().saturating_sub(PICKER_DISPLAY_LIMIT);
+        let display_limit = self.result_display_limit();
+        let max_viewport_start = self.results.len().saturating_sub(display_limit);
         self.viewport_start = self.viewport_start.min(max_viewport_start);
 
         if self.selected < self.viewport_start {
             self.viewport_start = self.selected;
-        } else if self.selected >= self.viewport_start + PICKER_DISPLAY_LIMIT {
-            self.viewport_start = self.selected + 1 - PICKER_DISPLAY_LIMIT;
+        } else if self.selected >= self.viewport_start + display_limit {
+            self.viewport_start = self.selected + 1 - display_limit;
         }
     }
 
+    fn structured_header(&self) -> Option<String> {
+        self.active
+            .as_ref()
+            .and_then(|active| active.store.snapshot())
+            .and_then(|source| source.structured_header(&self.search_text))
+    }
+
+    fn result_display_limit(&self) -> usize {
+        PICKER_DISPLAY_LIMIT - usize::from(self.structured_header().is_some())
+    }
+
     fn visible_update(&self) -> UiUpdate {
+        let source = self
+            .active
+            .as_ref()
+            .and_then(|active| active.store.snapshot());
+        let header = source
+            .as_ref()
+            .and_then(|source| source.structured_header(&self.search_text));
+        let display_limit = PICKER_DISPLAY_LIMIT - usize::from(header.is_some());
         let visible_results: Vec<_> = self
             .results
             .iter()
             .skip(self.viewport_start)
-            .take(PICKER_DISPLAY_LIMIT)
+            .take(display_limit)
             .cloned()
-            .map(|result| {
+            .map(|mut result| {
+                if let Some(display) = source.as_ref().and_then(|source| {
+                    source.structured_display(result.node_index, &self.search_text)
+                }) {
+                    result.path = display;
+                }
                 let positions = resolve_match_positions(&self.result_query, &result.path);
                 DisplaySearchResult { result, positions }
             })
@@ -1140,10 +1427,11 @@ impl State {
         UiUpdate {
             results: visible_results,
             counters: UiCounters {
-                displayed: self.results.len().min(PICKER_DISPLAY_LIMIT),
+                displayed: self.results.len().min(display_limit),
                 ..self.counters.clone()
             },
             selected_row,
+            header,
         }
     }
 }
@@ -1169,6 +1457,19 @@ mod tests {
         });
         assert_eq!(command, Some(InputCommand::CopySelection));
         assert!(command_suppresses_repeat(command.unwrap()));
+    }
+
+    #[test]
+    fn picker_specific_shortcuts_are_not_builtin_commands() {
+        for key in ['k', 'r'] {
+            assert_eq!(
+                default_command(KeyChord {
+                    key: KeyName::Character(key),
+                    modifiers: modifiers(true, false),
+                }),
+                None
+            );
+        }
     }
 
     #[test]
@@ -1302,9 +1603,11 @@ mod tests {
         let response = request_thread.join().unwrap().unwrap();
         assert_eq!(
             response,
-            PickerResponse::Selected(crate::request::PickerSelection::NativeWindow {
-                text: "00001234      100 app.exe Window title".into(),
-                hwnd: 0x1234,
+            PickerResponse::Selected(SelectedItem {
+                item: "00001234      100 app.exe Window title".into(),
+                value: "00001234      100 app.exe Window title".into(),
+                line: None,
+                fields: HashMap::from([("NativeWindow".into(), "4660".into())]),
             })
         );
     }

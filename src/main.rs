@@ -10,13 +10,17 @@ use rust_nfm::preview::{
     PreviewConfig, PreviewOutputType, PreviewProfile, PreviewResolver, PreviewService,
 };
 use rust_nfm::request::{
-    DelimitedInputOptions, DelimitedStdinRequest, DelimitedTextSelector, DelimitedValueSelector,
-    PickerResponse, PickerSelection, StdinRequest,
+    CsvHeaderMode, DelimitedInputOptions, DelimitedStdinRequest, DelimitedTextSelector,
+    DelimitedValueSelector, PickerRequest, PickerResponse, StdinRequest, StructuredCsvOptions,
+    StructuredCsvStdinRequest,
 };
 #[cfg(windows)]
-use rust_nfm::request::{FileSystemPickerRequest, WindowListPickerRequest};
+use rust_nfm::request::{
+    FileSystemPickerRequest, ProcessListPickerRequest, WindowListPickerRequest,
+};
+use rust_nfm::selection::SelectedItem;
 use rust_nfm::skia_ui as picker_ui;
-use rust_nfm::view_model::ViewModel;
+use rust_nfm::view_model::{PickerActionOutcome, PickerInteractions, ViewModel};
 
 fn output_timing(line: &str) {
     #[cfg(windows)]
@@ -43,11 +47,12 @@ fn main() -> Result<()> {
 
     nfm_search_core::timing::set_sink(output_timing);
     let is_window_list = matches!(&options.input, InputMode::ListWindows);
+    let is_process_list = matches!(&options.input, InputMode::ListProcesses);
     let command_preview =
         options.preview_program.is_some() || options.preview_resolver_program.is_some();
     let native_window_preview =
         resolve_native_window_preview(is_window_list, options.window_preview, command_preview)?;
-    let preview_enabled = command_preview || native_window_preview;
+    let preview_enabled = command_preview || native_window_preview || is_process_list;
     let preview_config = match options.preview_resolver_program {
         Some(program) => PreviewConfig::Command(PreviewResolver::Process {
             program: program.into(),
@@ -79,10 +84,11 @@ fn main() -> Result<()> {
                 output_type: options.preview_output_type,
             })),
             None if native_window_preview => PreviewConfig::NativeWindow,
+            None if is_process_list => PreviewConfig::Formatted,
             None => PreviewConfig::None,
         },
     };
-    let preview_visible = preview_enabled && options.preview_visible;
+    let preview_visible = preview_enabled && options.preview_visible.unwrap_or(!is_process_list);
     let action_config = ActionConfig {
         resolvers: options
             .actions
@@ -113,10 +119,16 @@ fn main() -> Result<()> {
         InputMode::Stdin(Some(options)) => {
             run_delimited_request(Arc::clone(&view_model), options, completion_tx)
         }
+        InputMode::StructuredCsv(options) => {
+            run_structured_csv_request(Arc::clone(&view_model), options, completion_tx)
+        }
         InputMode::FileWalker(roots) => {
             run_filewalker_request(Arc::clone(&view_model), roots, completion_tx)?
         }
         InputMode::ListWindows => run_list_windows_request(Arc::clone(&view_model), completion_tx)?,
+        InputMode::ListProcesses => {
+            run_list_processes_request(Arc::clone(&view_model), completion_tx)?
+        }
     }
     let code = picker_ui::run(
         view_model,
@@ -197,6 +209,18 @@ fn run_delimited_request(
     });
 }
 
+fn run_structured_csv_request(
+    view_model: Arc<ViewModel>,
+    options: StructuredCsvOptions,
+    completion: crossbeam_channel::Sender<i32>,
+) {
+    std::thread::spawn(move || {
+        let request = StructuredCsvStdinRequest::new(options, None);
+        let code = response_exit_code(view_model.run_request(&request));
+        let _ = completion.send(code);
+    });
+}
+
 fn debug_wait() {
     eprintln!("pid: {}", std::process::id());
     eprintln!("Attach debugger now...");
@@ -223,6 +247,89 @@ fn run_list_windows_request(
         let _ = completion.send(code);
     });
     Ok(())
+}
+
+#[cfg(windows)]
+fn run_list_processes_request(
+    view_model: Arc<ViewModel>,
+    completion: crossbeam_channel::Sender<i32>,
+) -> Result<()> {
+    let items = rust_nfm::list_processes::list_processes()?;
+    std::thread::spawn(move || {
+        let request = ProcessListPickerRequest { items };
+        let code = response_exit_code(
+            view_model.run_request_with_interactions(&request, process_interactions()),
+        );
+        let _ = completion.send(code);
+    });
+    Ok(())
+}
+
+#[cfg(windows)]
+fn process_interactions() -> PickerInteractions {
+    let refresh = Arc::new(|| {
+        let items = rust_nfm::list_processes::list_processes()
+            .map_err(|error| format!("Failed to refresh processes: {error}"))?;
+        Ok(ProcessListPickerRequest { items }.run())
+    });
+    let kill = Arc::new(|selected: Option<&SelectedItem>| {
+        let pid = selected
+            .and_then(|item| item.fields.get("PID"))
+            .ok_or_else(|| "No process selected".to_owned())?
+            .parse::<u32>()
+            .map_err(|error| format!("Selected item has an invalid PID: {error}"))?;
+        rust_nfm::list_processes::terminate_process(pid)
+            .map_err(|error| format!("Failed to terminate process {pid}: {error}"))?;
+        Ok(PickerActionOutcome::RefreshWithToast(format!(
+            "Terminated process {pid}"
+        )))
+    });
+    let refresh_action = Arc::new(|_: Option<&SelectedItem>| Ok(PickerActionOutcome::Refresh));
+    let preview = Arc::new(|item: &SelectedItem| {
+        Ok(["Name", "PID", "WorkingSet", "PrivateBytes", "CPU"]
+            .into_iter()
+            .filter_map(|name| {
+                item.fields
+                    .get(name)
+                    .map(|value| format!("{name}: {value}"))
+            })
+            .collect::<Vec<_>>()
+            .join("\n"))
+    });
+    PickerInteractions {
+        bindings: HashMap::from([
+            (
+                KeyChord {
+                    key: KeyName::Character('k'),
+                    modifiers: KeyModifiers {
+                        ctrl: true,
+                        ..KeyModifiers::default()
+                    },
+                },
+                kill as _,
+            ),
+            (
+                KeyChord {
+                    key: KeyName::Character('r'),
+                    modifiers: KeyModifiers {
+                        ctrl: true,
+                        ..KeyModifiers::default()
+                    },
+                },
+                refresh_action as _,
+            ),
+        ]),
+        refresh: Some(refresh),
+        preview: Some(preview),
+    }
+}
+
+#[cfg(not(windows))]
+fn run_list_processes_request(
+    _view_model: Arc<ViewModel>,
+    _completion: crossbeam_channel::Sender<i32>,
+) -> Result<()> {
+    anyhow::bail!("the listprocesses command is currently available only on Windows")
 }
 
 #[cfg(not(windows))]
@@ -284,12 +391,8 @@ fn default_home_directory() -> Result<String> {
 fn response_exit_code(response: Result<PickerResponse>) -> i32 {
     match response {
         Ok(PickerResponse::Selected(selection)) => {
-            let item = match selection {
-                PickerSelection::Text(item) => item,
-                PickerSelection::NativeWindow { text, .. } => text,
-            };
             let mut stdout = std::io::stdout().lock();
-            if writeln!(stdout, "{item}").is_err() || stdout.flush().is_err() {
+            if writeln!(stdout, "{}", selection.value).is_err() || stdout.flush().is_err() {
                 1
             } else {
                 0
@@ -309,8 +412,10 @@ fn response_exit_code(response: Result<PickerResponse>) -> i32 {
 
 enum InputMode {
     Stdin(Option<DelimitedInputOptions>),
+    StructuredCsv(StructuredCsvOptions),
     FileWalker(Vec<String>),
     ListWindows,
+    ListProcesses,
 }
 
 struct AppOptions {
@@ -324,7 +429,7 @@ struct AppOptions {
     preview_resolver_arguments: Vec<String>,
     preview_profiles: HashMap<String, PreviewProfileOptions>,
     preview_default_profile: Option<String>,
-    preview_visible: bool,
+    preview_visible: Option<bool>,
     window_preview: bool,
     accept_resolver_program: Option<String>,
     accept_resolver_arguments: Vec<String>,
@@ -359,7 +464,7 @@ fn app_options() -> AppOptions {
         preview_resolver_arguments: Vec::new(),
         preview_profiles: HashMap::new(),
         preview_default_profile: None,
-        preview_visible: true,
+        preview_visible: None,
         window_preview: false,
         accept_resolver_program: None,
         accept_resolver_arguments: Vec::new(),
@@ -368,8 +473,12 @@ fn app_options() -> AppOptions {
     };
     let mut filewalker = false;
     let mut list_windows = false;
+    let mut list_processes = false;
     let mut roots = Vec::new();
     let mut delimiter = None;
+    let mut csv_input = false;
+    let mut csv_columns = None;
+    let mut csv_delimiter = b',';
     let mut text = DelimitedTextSelector::FullLine;
     let mut value = DelimitedValueSelector::FullLine;
     let mut preview_file_field = None;
@@ -379,7 +488,32 @@ fn app_options() -> AppOptions {
         match arg.as_str() {
             "filewalker" if !filewalker => filewalker = true,
             "listwindows" | "ListWindows" if !filewalker => list_windows = true,
+            "listprocesses" | "ListProcesses" if !filewalker => list_processes = true,
             "--stdin" if !filewalker => {}
+            "--input-format" if !filewalker => match args.next().as_deref() {
+                Some("csv") => csv_input = true,
+                Some(value) => eprintln!("unsupported input format: {value}"),
+                None => eprintln!("--input-format requires a value"),
+            },
+            "--csv-columns" if !filewalker => {
+                csv_columns = args
+                    .next()
+                    .map(|value| value.split(',').map(str::to_owned).collect());
+                if csv_columns.is_none() {
+                    eprintln!("--csv-columns requires comma-separated names");
+                }
+            }
+            "--csv-delimiter" if !filewalker => {
+                match args
+                    .next()
+                    .as_deref()
+                    .and_then(parse_delimiter)
+                    .filter(|ch| ch.is_ascii())
+                {
+                    Some(delimiter) => csv_delimiter = delimiter as u8,
+                    None => eprintln!("--csv-delimiter requires one ASCII character or \\t"),
+                }
+            }
             "--debug-wait" => options.debug_wait = true,
             "--preview" => {
                 if let Some(program) = args.next() {
@@ -471,8 +605,8 @@ fn app_options() -> AppOptions {
                 }
             }
             "--preview-visible" => match args.next().as_deref() {
-                Some("true") => options.preview_visible = true,
-                Some("false") => options.preview_visible = false,
+                Some("true") => options.preview_visible = Some(true),
+                Some("false") => options.preview_visible = Some(false),
                 Some(value) => eprintln!("--preview-visible requires true or false, got: {value}"),
                 None => eprintln!("--preview-visible requires true or false"),
             },
@@ -570,8 +704,15 @@ fn app_options() -> AppOptions {
     }
     if list_windows {
         options.input = InputMode::ListWindows;
+    } else if list_processes {
+        options.input = InputMode::ListProcesses;
     } else if filewalker {
         options.input = InputMode::FileWalker(roots);
+    } else if csv_input {
+        options.input = InputMode::StructuredCsv(StructuredCsvOptions {
+            headers: csv_columns.map_or(CsvHeaderMode::FirstRecord, CsvHeaderMode::Explicit),
+            delimiter: csv_delimiter,
+        });
     } else if let Some(delimiter) = delimiter {
         options.input = InputMode::Stdin(Some(DelimitedInputOptions {
             delimiter,

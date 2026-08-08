@@ -60,6 +60,10 @@ const RESULT_VERTICAL_PADDING: f32 = 5.0;
 const RESULT_GAP: f32 = 3.0;
 const SELECTED_ACCENT_WIDTH: f32 = 3.0;
 const COUNTER_WIDTH: f32 = 300.0;
+const AUTOCOMPLETE_MIN_WIDTH: f32 = 280.0;
+const AUTOCOMPLETE_HORIZONTAL_PADDING: f32 = 12.0;
+const AUTOCOMPLETE_VERTICAL_PADDING: f32 = 8.0;
+const AUTOCOMPLETE_SEARCH_GAP: f32 = 4.0;
 const WM_UI_UPDATE: u32 = WM_APP + 1;
 const WM_UI_BRING_TO_FOREGROUND: u32 = WM_APP + 2;
 const WM_CURSOR_BLINK: u32 = WM_APP + 3;
@@ -80,6 +84,8 @@ const COLOR_BORDER: u32 = 0x928374;
 const COLOR_MATCH: u32 = 0xfb4934;
 const COLOR_SELECTED: u32 = 0x3c3836;
 const COLOR_SELECTED_ACCENT: u32 = 0xb8bb26;
+const COLOR_HEADER_TEXT: u32 = 0xfabd2f;
+const COLOR_HEADER_DIVIDER: u32 = 0xd79921;
 const TOAST_HORIZONTAL_PADDING: f32 = 18.0;
 const TOAST_VERTICAL_PADDING: f32 = 12.0;
 const DEFAULT_LOCATION_VALUE: i32 = i32::MIN;
@@ -300,6 +306,7 @@ struct WindowState {
     selected_accent_paint: Paint,
     stroke_paint: Paint,
     results: Vec<DisplaySearchResult>,
+    results_header: Option<String>,
     counters: UiCounters,
     selected_row: usize,
     indexing_spinner_frame: usize,
@@ -651,6 +658,7 @@ impl WindowState {
             selected_accent_paint: fill_paint(COLOR_SELECTED_ACCENT),
             stroke_paint: stroke_paint(COLOR_BORDER, PANEL_BORDER),
             results: Vec::new(),
+            results_header: None,
             counters: UiCounters::default(),
             selected_row: 0,
             indexing_spinner_frame: 0,
@@ -698,6 +706,7 @@ impl WindowState {
                 UiEvent::Results(update) => {
                     let was_scanning = self.counters.scanning;
                     self.results = update.results;
+                    self.results_header = update.header;
                     self.counters = update.counters;
                     self.selected_row = update.selected_row;
                     unsafe {
@@ -1127,6 +1136,36 @@ impl WindowState {
         );
 
         draw_skia_round_rect(canvas, &self.stroke_paint, self.layout.list_border, 8.0);
+        if let Some(header) = &self.results_header {
+            let header_rect = Rect {
+                x: self.layout.list_box.x,
+                y: self.layout.list_box.y,
+                width: self.layout.list_box.width,
+                height: self.layout.row_size.height - RESULT_GAP,
+            };
+            draw_skia_text(
+                canvas,
+                &self.bold_font,
+                &fill_paint(COLOR_HEADER_TEXT),
+                header,
+                Rect {
+                    x: self.layout.list_box.x + RESULT_HORIZONTAL_PADDING,
+                    y: self.layout.list_box.y + RESULT_VERTICAL_PADDING,
+                    width: (self.layout.list_box.width - RESULT_HORIZONTAL_PADDING * 2.0).max(0.0),
+                    height: self.layout.text_height,
+                },
+                TextAlign::Left,
+            );
+            let divider_y = header_rect.y + header_rect.height;
+            canvas.draw_line(
+                (header_rect.x + RESULT_HORIZONTAL_PADDING, divider_y),
+                (
+                    header_rect.x + header_rect.width - RESULT_HORIZONTAL_PADDING,
+                    divider_y,
+                ),
+                &stroke_paint(COLOR_HEADER_DIVIDER, 1.5),
+            );
+        }
         for visual_row in 0..DISPLAY_ROWS as usize {
             let index = DISPLAY_ROWS as usize - visual_row - 1;
             let result = self.results.get(index);
@@ -1178,6 +1217,75 @@ impl WindowState {
                 &result.positions,
                 text_rect,
             );
+        }
+        let autocomplete = self.view_model.current_autocomplete();
+        if !autocomplete.suggestions.is_empty() {
+            let visible = autocomplete.suggestions.len().min(6);
+            let height =
+                visible as f32 * self.layout.row_size.height + AUTOCOMPLETE_VERTICAL_PADDING * 2.0;
+            let content_width = autocomplete
+                .suggestions
+                .iter()
+                .map(|suggestion| skia_text_width(&self.font, &self.text_paint, &suggestion.text))
+                .fold(0.0_f32, f32::max);
+            let width = (content_width + AUTOCOMPLETE_HORIZONTAL_PADDING * 2.0)
+                .max(AUTOCOMPLETE_MIN_WIDTH)
+                .min(self.layout.search_box.width);
+            let token_start = active_token_start(&search.text, search.cursor_position);
+            let token_x = query.x
+                + skia_text_width(&self.font, &self.text_paint, &search.text[..token_start]);
+            let minimum_x = self.layout.search_box.x;
+            let maximum_x =
+                (self.layout.search_box.x + self.layout.search_box.width - width).max(minimum_x);
+            let panel = Rect {
+                x: token_x.clamp(minimum_x, maximum_x),
+                y: (self.layout.search_border.y - height - AUTOCOMPLETE_SEARCH_GAP).max(PADDING),
+                width,
+                height,
+            };
+            draw_skia_round_rect(canvas, &fill_paint(COLOR_BACKGROUND), panel, 8.0);
+            draw_skia_round_rect(canvas, &self.stroke_paint, panel, 8.0);
+            let first = autocomplete
+                .selected
+                .saturating_sub(visible - 1)
+                .min(autocomplete.suggestions.len() - visible);
+            for (visual_index, (index, suggestion)) in autocomplete
+                .suggestions
+                .iter()
+                .enumerate()
+                .skip(first)
+                .take(visible)
+                .enumerate()
+            {
+                let row = Rect {
+                    x: panel.x + AUTOCOMPLETE_HORIZONTAL_PADDING,
+                    y: panel.y
+                        + AUTOCOMPLETE_VERTICAL_PADDING
+                        + visual_index as f32 * self.layout.row_size.height,
+                    width: panel.width - AUTOCOMPLETE_HORIZONTAL_PADDING * 2.0,
+                    height: self.layout.row_size.height,
+                };
+                if index == autocomplete.selected {
+                    draw_skia_round_rect(canvas, &self.selected_paint, row, 6.0);
+                }
+                draw_skia_text(
+                    canvas,
+                    &self.font,
+                    &self.text_paint,
+                    &suggestion.text,
+                    row,
+                    TextAlign::Left,
+                );
+                draw_skia_highlights(
+                    canvas,
+                    &self.font,
+                    &self.bold_font,
+                    &self.highlight_paint,
+                    &suggestion.text,
+                    &suggestion.positions,
+                    row,
+                );
+            }
         }
         if let Some(toast) = &self.toast {
             let maximum_width = (self.layout.window.width - PADDING * 4.0).max(0.0);
@@ -1348,13 +1456,24 @@ unsafe extern "system" fn wnd_proc(
                 let state = window_state(hwnd);
                 if !state.is_null() {
                     let state = &mut *state;
-                    if state
-                        .toast
-                        .as_ref()
-                        .is_some_and(|toast| Instant::now() >= toast.expires_at)
-                    {
-                        state.toast = None;
-                        let _ = state.paint(hwnd);
+                    if let Some(toast) = &state.toast {
+                        let now = Instant::now();
+                        if now >= toast.expires_at {
+                            state.toast = None;
+                            let _ = state.paint(hwnd);
+                        } else {
+                            // WM_TIMER may be delivered just before the Instant deadline.
+                            // Keep the expiry guard for stale timer messages, but re-arm the
+                            // timer so an early delivery cannot leave the toast permanently
+                            // visible.
+                            let remaining = toast.expires_at.saturating_duration_since(now);
+                            let milliseconds = remaining
+                                .as_millis()
+                                .saturating_add(1)
+                                .clamp(1, u32::MAX as u128)
+                                as u32;
+                            let _ = SetTimer(Some(hwnd), WM_TOAST as usize, milliseconds, None);
+                        }
                     }
                 }
             }
@@ -1560,6 +1679,17 @@ fn skia_color(value: u32) -> Color {
 
 fn skia_text_width(font: &Font, paint: &Paint, text: &str) -> f32 {
     font.measure_str(text, Some(paint)).0
+}
+
+fn active_token_start(text: &str, cursor: usize) -> usize {
+    if cursor > text.len() || !text.is_char_boundary(cursor) {
+        return 0;
+    }
+    text[..cursor]
+        .char_indices()
+        .rev()
+        .find(|(_, character)| character.is_whitespace())
+        .map_or(0, |(index, character)| index + character.len_utf8())
 }
 
 fn draw_skia_text(
@@ -1773,7 +1903,9 @@ fn wide_null(value: &str) -> Vec<u16> {
 
 #[cfg(test)]
 mod tests {
-    use super::{calculate_layout, fit_thumbnail_rect, Rect, DISPLAY_ROWS, PADDING};
+    use super::{
+        active_token_start, calculate_layout, fit_thumbnail_rect, Rect, DISPLAY_ROWS, PADDING,
+    };
     use windows::Win32::Foundation::{RECT, SIZE};
 
     #[test]
@@ -1826,5 +1958,13 @@ mod tests {
             SIZE::default(),
         )
         .is_none());
+    }
+
+    #[test]
+    fn autocomplete_anchor_tracks_the_active_token() {
+        let text = "needle /:Name==alpha /!Descending==CPU";
+        assert_eq!(active_token_start(text, text.len()), 21);
+        assert_eq!(active_token_start("/:Name", 6), 0);
+        assert_eq!(active_token_start("needle ", 7), 7);
     }
 }

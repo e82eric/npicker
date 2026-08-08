@@ -7,7 +7,7 @@ use std::time::Instant;
 use frizbee::{Config as FrizbeeConfig, Matcher as FrizbeeMatcher, Scoring as FrizbeeScoring};
 use rayon::prelude::*;
 
-use crate::store::ItemsSource;
+use crate::store::{ItemsSource, SearchPlan};
 use crate::timing;
 
 pub const DISPLAY_LIMIT: usize = 15;
@@ -312,6 +312,8 @@ fn accumulate_frizbee<S, F, I>(
     sort_mode: SearchSortMode,
     is_cancelled: &F,
     collect_matches: bool,
+    plan: &(dyn SearchPlan + '_),
+    filters_items: bool,
 ) -> SearchAccumulator
 where
     S: ItemsSource + Send + Sync,
@@ -336,6 +338,10 @@ where
                     return (state, matcher);
                 }
                 state.processed_since_fold_start += 1;
+
+                if filters_items && !plan.includes(node_index) {
+                    return (state, matcher);
+                }
 
                 let time_sample = (node_index & (SEARCH_TIMING_SAMPLE_RATE - 1)) == 0;
                 let path_start = time_sample.then(Instant::now);
@@ -505,6 +511,9 @@ where
     F: Fn() -> bool + Sync,
 {
     let total_start = Instant::now();
+    let plan = snapshot.create_search_plan(query);
+    let fuzzy_query = plan.fuzzy_query();
+    let filters_items = plan.filters_items();
     let total = snapshot.len();
     let start_index = range.start.min(total);
     let end_index = range.end.min(total);
@@ -526,14 +535,30 @@ where
         });
     }
 
-    if query.is_empty() {
+    if fuzzy_query.is_empty() {
         let append_start = Instant::now();
-        let output = SearchOutput {
-            results: materialize_unfiltered(snapshot, start_index..end_index, RESULT_LIMIT),
-            matched: searched,
+        let mut included = Vec::with_capacity(RESULT_LIMIT.min(searched));
+        let mut matched = 0;
+        for index in start_index..end_index {
+            if !filters_items || plan.includes(index) {
+                matched += 1;
+                if included.len() < RESULT_LIMIT {
+                    included.push(index);
+                }
+            }
+        }
+        let mut output = SearchOutput {
+            results: materialize_indexes(
+                Arc::clone(&snapshot),
+                included.into_iter(),
+                RESULT_LIMIT,
+                plan.as_ref(),
+            ),
+            matched,
             total,
             match_bitmap: None,
         };
+        apply_custom_sort(&mut output.results, plan.as_ref());
         let append_us = timing::elapsed_us(append_start);
         let total_us = timing::elapsed_us(total_start);
         timing::write(format!(
@@ -555,21 +580,25 @@ where
         accumulate_frizbee(
             Arc::clone(&snapshot),
             filter.matching_indexes(end_index),
-            query,
+            fuzzy_query,
             &config,
             sort_mode,
             &is_cancelled,
             collect_matches,
+            plan.as_ref(),
+            filters_items,
         )
     } else {
         accumulate_frizbee(
             Arc::clone(&snapshot),
             (start_index..end_index).into_par_iter(),
-            query,
+            fuzzy_query,
             &config,
             sort_mode,
             &is_cancelled,
             collect_matches,
+            plan.as_ref(),
+            filters_items,
         )
     };
     let match_us = timing::elapsed_us(match_start);
@@ -599,10 +628,12 @@ where
 
     let append_start = Instant::now();
     let mut path_buffer = Vec::with_capacity(512);
-    let results: Vec<SearchResult> = candidates
+    let mut results: Vec<SearchResult> = candidates
         .into_iter()
         .map(|candidate| {
-            let path = snapshot.get_string_lossy(candidate.node_index, &mut path_buffer);
+            let path = plan.display_text(candidate.node_index).unwrap_or_else(|| {
+                snapshot.get_string_lossy(candidate.node_index, &mut path_buffer)
+            });
             SearchResult {
                 node_index: candidate.node_index,
                 score: candidate.score,
@@ -610,6 +641,7 @@ where
             }
         })
         .collect();
+    apply_custom_sort(&mut results, plan.as_ref());
     let append_us = timing::elapsed_us(append_start);
     let total_us = timing::elapsed_us(total_start);
 
@@ -669,23 +701,37 @@ pub fn resolve_match_positions(query: &str, text: &str) -> Vec<usize> {
     positions
 }
 
-fn materialize_unfiltered<S>(
+fn materialize_indexes<S, I>(
     snapshot: Arc<S>,
-    range: Range<usize>,
+    indexes: I,
     limit: usize,
+    plan: &(dyn SearchPlan + '_),
 ) -> Vec<SearchResult>
 where
     S: ItemsSource + Send + Sync,
+    I: Iterator<Item = usize>,
 {
     let mut path_buffer = Vec::with_capacity(512);
-    range
+    indexes
         .take(limit)
         .map(|node_index| SearchResult {
             node_index,
             score: 0,
-            path: snapshot.get_string_lossy(node_index, &mut path_buffer),
+            path: plan
+                .display_text(node_index)
+                .unwrap_or_else(|| snapshot.get_string_lossy(node_index, &mut path_buffer)),
         })
         .collect()
+}
+
+fn apply_custom_sort(results: &mut [SearchResult], plan: &(dyn SearchPlan + '_)) {
+    if plan.has_custom_sort() {
+        results.sort_by(|left, right| {
+            plan.compare(left.node_index, right.node_index)
+                .then_with(|| right.score.cmp(&left.score))
+                .then_with(|| left.node_index.cmp(&right.node_index))
+        });
+    }
 }
 
 fn push_bounded(heap: &mut BinaryHeap<WorstFirst>, candidate: Candidate, limit: usize) {

@@ -8,23 +8,26 @@ use crate::action::{
     ActionConfig, ActionDefinition, ActionResolution, ActionService, ActionState, PickerState,
 };
 use crate::key_binding::{KeyChord, KeyModifiers, KeyName};
+use crate::list_processes::{list_processes, terminate_process};
 use crate::list_windows::list_windows;
 use crate::preview::{
     CommandPreviewTarget, PreviewCancellation, PreviewConfig, PreviewJob, PreviewOutputType,
     PreviewProfile, PreviewResolver, PreviewService,
 };
 use crate::request::{
-    FileSystemPickerRequest, FlatItemsPickerRequest, PickerResponse, PickerSelection,
-    WindowListPickerRequest,
+    FileSystemPickerRequest, FlatItemsPickerRequest, PickerRequest, PickerResponse,
+    ProcessListPickerRequest, WindowListPickerRequest,
 };
+use crate::selection::SelectedItem;
 use crate::skia_ui as picker_ui;
-use crate::view_model::ViewModel;
+use crate::view_model::{PickerActionOutcome, PickerInteractions, ViewModel};
 use std::sync::Arc;
 use std::thread;
 
 type NativeItemsAction = unsafe extern "C" fn(*mut c_void) -> *mut *mut c_char;
 type OnSelect = unsafe extern "C" fn(*mut c_char, *mut c_void);
 type OnWindowSelect = unsafe extern "C" fn(isize, *mut c_void);
+type OnProcessSelect = unsafe extern "C" fn(u32, *mut c_void);
 type OnClosed = unsafe extern "C" fn();
 
 static VIEW_MODEL: OnceLock<Arc<ViewModel>> = OnceLock::new();
@@ -78,9 +81,9 @@ pub extern "C" fn RustNfmShowProgramsList(
             };
 
             match view_model.run_request(&request) {
-                Ok(PickerResponse::Selected(PickerSelection::Text(selected))) => {
+                Ok(PickerResponse::Selected(selected)) => {
                     if let Some(on_select) = on_select {
-                        if let Ok(selected) = CString::new(selected) {
+                        if let Ok(selected) = CString::new(selected.value) {
                             unsafe {
                                 on_select(selected.as_ptr() as *mut c_char, state as *mut c_void);
                             }
@@ -95,6 +98,64 @@ pub extern "C" fn RustNfmShowProgramsList(
             }
         });
     }));
+}
+
+fn process_interactions() -> PickerInteractions {
+    let refresh = Arc::new(|| {
+        let items =
+            list_processes().map_err(|error| format!("Failed to refresh processes: {error}"))?;
+        Ok(ProcessListPickerRequest { items }.run())
+    });
+    let kill = Arc::new(|selected: Option<&SelectedItem>| {
+        let pid = selected
+            .and_then(|item| item.fields.get("PID"))
+            .ok_or_else(|| "No process selected".to_owned())?
+            .parse::<u32>()
+            .map_err(|error| format!("Selected item has an invalid PID: {error}"))?;
+        terminate_process(pid)
+            .map_err(|error| format!("Failed to terminate process {pid}: {error}"))?;
+        Ok(PickerActionOutcome::RefreshWithToast(format!(
+            "Terminated process {pid}"
+        )))
+    });
+    let refresh_action = Arc::new(|_: Option<&SelectedItem>| Ok(PickerActionOutcome::Refresh));
+    let preview = Arc::new(|item: &SelectedItem| {
+        Ok(["Name", "PID", "WorkingSet", "PrivateBytes", "CPU"]
+            .into_iter()
+            .filter_map(|name| {
+                item.fields
+                    .get(name)
+                    .map(|value| format!("{name}: {value}"))
+            })
+            .collect::<Vec<_>>()
+            .join("\n"))
+    });
+    PickerInteractions {
+        bindings: HashMap::from([
+            (
+                KeyChord {
+                    key: KeyName::Character('k'),
+                    modifiers: KeyModifiers {
+                        ctrl: true,
+                        ..KeyModifiers::default()
+                    },
+                },
+                kill as _,
+            ),
+            (
+                KeyChord {
+                    key: KeyName::Character('r'),
+                    modifiers: KeyModifiers {
+                        ctrl: true,
+                        ..KeyModifiers::default()
+                    },
+                },
+                refresh_action as _,
+            ),
+        ]),
+        refresh: Some(refresh),
+        preview: Some(preview),
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -128,9 +189,9 @@ pub unsafe extern "C" fn RustNfmShowFileSystem(
                 search_string: None,
             };
             match view_model.run_request(&request) {
-                Ok(PickerResponse::Selected(PickerSelection::Text(selected))) => {
+                Ok(PickerResponse::Selected(selected)) => {
                     if let Some(on_select) = on_select {
-                        if let Ok(selected) = CString::new(selected) {
+                        if let Ok(selected) = CString::new(selected.value) {
                             unsafe {
                                 on_select(selected.as_ptr() as *mut c_char, state as *mut c_void)
                             };
@@ -166,9 +227,65 @@ pub extern "C" fn RustNfmShowWindows(
         thread::spawn(move || {
             let request = WindowListPickerRequest { items };
             match view_model.run_request(&request) {
-                Ok(PickerResponse::Selected(PickerSelection::NativeWindow { hwnd, .. })) => {
-                    if let Some(on_select) = on_select {
-                        unsafe { on_select(hwnd, state as *mut c_void) };
+                Ok(PickerResponse::Selected(selected)) => {
+                    let hwnd = selected
+                        .fields
+                        .get("NativeWindow")
+                        .and_then(|value| value.parse::<isize>().ok());
+                    match (hwnd, on_select) {
+                        (Some(hwnd), Some(on_select)) => unsafe {
+                            on_select(hwnd, state as *mut c_void)
+                        },
+                        _ => {
+                            if let Some(on_closed) = on_closed {
+                                unsafe { on_closed() };
+                            }
+                        }
+                    }
+                }
+                _ => {
+                    if let Some(on_closed) = on_closed {
+                        unsafe { on_closed() };
+                    }
+                }
+            }
+        });
+        1
+    }))
+    .unwrap_or(0)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn RustNfmShowProcesses(
+    on_select: Option<OnProcessSelect>,
+    on_closed: Option<OnClosed>,
+    state: *mut c_void,
+) -> c_int {
+    catch_unwind(AssertUnwindSafe(|| {
+        let items = match list_processes() {
+            Ok(items) => items,
+            Err(_) => return 0,
+        };
+        let view_model = ensure_initialized();
+        view_model.set_preview_visible(false);
+        let state = state as usize;
+        thread::spawn(move || {
+            let request = ProcessListPickerRequest { items };
+            match view_model.run_request_with_interactions(&request, process_interactions()) {
+                Ok(PickerResponse::Selected(selected)) => {
+                    let pid = selected
+                        .fields
+                        .get("PID")
+                        .and_then(|value| value.parse::<u32>().ok());
+                    match (pid, on_select) {
+                        (Some(pid), Some(on_select)) => unsafe {
+                            on_select(pid, state as *mut c_void)
+                        },
+                        _ => {
+                            if let Some(on_closed) = on_closed {
+                                unsafe { on_closed() };
+                            }
+                        }
                     }
                 }
                 _ => {
@@ -240,9 +357,9 @@ pub extern "C" fn RustNfmShowItemsList(
             };
 
             match view_model.run_request(&request) {
-                Ok(PickerResponse::Selected(PickerSelection::Text(selected))) => {
+                Ok(PickerResponse::Selected(selected)) => {
                     if let Some(on_select) = on_select {
-                        if let Ok(selected) = CString::new(selected) {
+                        if let Ok(selected) = CString::new(selected.value) {
                             unsafe {
                                 on_select(selected.as_ptr() as *mut c_char, state as *mut c_void);
                             }
@@ -492,7 +609,7 @@ fn resolve_file_system_accept(state: &ActionState) -> Result<ActionResolution, S
     let Some(selection) = &state.selection else {
         return Ok(ActionResolution::None);
     };
-    if matches!(state.picker, PickerState::Windows) {
+    if selection.fields.contains_key("NativeWindow") {
         return Ok(ActionResolution::Complete);
     }
     if std::path::Path::new(&selection.item).is_dir() {
@@ -611,13 +728,13 @@ mod tests {
     #[test]
     fn window_accept_completes_instead_of_treating_the_title_as_a_path() {
         let state = ActionState {
-            selection: Some(crate::action::ActionSelection {
+            selection: Some(crate::selection::SelectedItem {
                 item: "00001234 app.exe Window title".into(),
                 value: "00001234 app.exe Window title".into(),
                 line: None,
-                native_window: Some(0x1234),
+                fields: HashMap::from([("NativeWindow".into(), "4660".into())]),
             }),
-            picker: PickerState::Windows,
+            picker: PickerState::Stdin,
             query: String::new(),
         };
 

@@ -1,6 +1,9 @@
 use crate::delimited_store::{DelimitedStreamingSnapshot, DelimitedStreamingStore};
 pub use crate::delimited_store::{DelimitedTextSelector, DelimitedValueSelector};
 use crate::source_store::{AnyItemSource, SharedStore};
+use crate::structured_store::{
+    StructuredSchema, StructuredStreamingSnapshot, StructuredStreamingStore,
+};
 use nfm_search_core::store::{
     FlatSnapshot, ItemsSource, StreamingItemSnapshot, StreamingItemStore,
 };
@@ -10,7 +13,10 @@ use std::thread;
 
 use crate::action::PickerState;
 #[cfg(windows)]
+use crate::list_processes::ProcessInfo;
+#[cfg(windows)]
 use crate::list_windows::{WindowListItem, WindowPayload};
+use crate::selection::SelectedItem;
 #[cfg(windows)]
 use nfm_file_system::walker::{start_scan, PublishedSnapshot, ScanOptions};
 #[cfg(windows)]
@@ -117,7 +123,48 @@ impl PickerRequest for WindowListPickerRequest {
     }
 
     fn picker_state(&self) -> PickerState {
-        PickerState::Windows
+        PickerState::Stdin
+    }
+}
+
+#[cfg(windows)]
+pub struct ProcessListPickerRequest {
+    pub items: Vec<ProcessInfo>,
+}
+
+#[cfg(windows)]
+impl PickerRequest for ProcessListPickerRequest {
+    type Source = StructuredStreamingSnapshot;
+
+    fn search_string(&self) -> Option<&str> {
+        None
+    }
+
+    fn run(&self) -> Arc<SharedStore> {
+        let schema = StructuredSchema::new(vec![
+            "Name".into(),
+            "PID".into(),
+            "WorkingSet".into(),
+            "PrivateBytes".into(),
+            "CPU".into(),
+        ])
+        .expect("process schema is valid");
+        let mut store = StructuredStreamingStore::new(schema);
+        for process in &self.items {
+            store.add_record(&csv::StringRecord::from(vec![
+                process.name.clone(),
+                process.pid.to_string(),
+                process.working_set_kb.to_string(),
+                process.private_bytes_kb.to_string(),
+                process.cpu_seconds.to_string(),
+            ])).expect("process record matches schema");
+        }
+        let source = Arc::new(AnyItemSource::Structured(store.snapshot()));
+        Arc::new(SharedStore::completed(source))
+    }
+
+    fn picker_state(&self) -> PickerState {
+        PickerState::StructuredStdin
     }
 }
 
@@ -141,6 +188,119 @@ pub struct DelimitedStdinRequest {
     search_string: Option<String>,
     shared_store: Arc<SharedStore>,
     reader: Mutex<Option<Box<dyn Read + Send>>>,
+}
+
+#[derive(Clone, Debug)]
+pub enum CsvHeaderMode {
+    FirstRecord,
+    Explicit(Vec<String>),
+}
+
+#[derive(Clone, Debug)]
+pub struct StructuredCsvOptions {
+    pub headers: CsvHeaderMode,
+    pub delimiter: u8,
+}
+
+pub struct StructuredCsvStdinRequest {
+    options: StructuredCsvOptions,
+    search_string: Option<String>,
+    shared_store: Arc<SharedStore>,
+    reader: Mutex<Option<Box<dyn Read + Send>>>,
+}
+
+impl StructuredCsvStdinRequest {
+    pub fn new(options: StructuredCsvOptions, search_string: Option<String>) -> Self {
+        Self {
+            options,
+            search_string,
+            shared_store: Arc::new(SharedStore::new()),
+            reader: Mutex::new(None),
+        }
+    }
+
+    #[cfg(test)]
+    fn with_reader(options: StructuredCsvOptions, reader: impl Read + Send + 'static) -> Self {
+        Self {
+            options,
+            search_string: None,
+            shared_store: Arc::new(SharedStore::new()),
+            reader: Mutex::new(Some(Box::new(reader))),
+        }
+    }
+
+    fn spawn_reader(&self) {
+        let options = self.options.clone();
+        let shared = Arc::clone(&self.shared_store);
+        let reader = self
+            .reader
+            .lock()
+            .expect("stdin reader poisoned")
+            .take()
+            .unwrap_or_else(|| Box::new(std::io::stdin()));
+        thread::spawn(move || {
+            let mut csv = csv::ReaderBuilder::new()
+                .has_headers(false)
+                .flexible(true)
+                .delimiter(options.delimiter)
+                .from_reader(reader);
+            let mut records = csv.records();
+            let schema = match options.headers {
+                CsvHeaderMode::FirstRecord => match records.next() {
+                    Some(Ok(record)) => {
+                        StructuredSchema::new(record.iter().map(str::to_owned).collect())
+                    }
+                    Some(Err(error)) => Err(format!("failed to read CSV header: {error}")),
+                    None => Err("CSV input did not contain a header record".into()),
+                },
+                CsvHeaderMode::Explicit(columns) => StructuredSchema::new(columns),
+            };
+            let schema = match schema {
+                Ok(schema) => schema,
+                Err(error) => {
+                    eprintln!("{error}");
+                    shared.complete();
+                    return;
+                }
+            };
+            let mut store = StructuredStreamingStore::new(schema);
+            shared.publish(Arc::new(AnyItemSource::Structured(store.snapshot())));
+            for record in records {
+                let record = match record {
+                    Ok(record) => {record},
+                    Err(error) => {
+                        eprintln!("failed to read csv record: {error}");
+                        break;
+                    }
+                };
+
+                if let Err(error) = store.add_record(&record) {
+                    eprintln!("ignoring CSV record: {error}");
+                    continue;
+                }
+
+                if store.len().is_multiple_of(1_000) {
+                    shared.publish(Arc::new(AnyItemSource::Structured(store.snapshot())));
+                }
+            }
+            shared.publish(Arc::new(AnyItemSource::Structured(store.snapshot())));
+            shared.complete();
+        });
+    }
+}
+
+impl PickerRequest for StructuredCsvStdinRequest {
+    type Source = StructuredStreamingSnapshot;
+    fn search_string(&self) -> Option<&str> {
+        self.search_string.as_deref()
+    }
+    fn run(&self) -> Arc<SharedStore> {
+        self.spawn_reader();
+        Arc::clone(&self.shared_store)
+    }
+    fn picker_state(&self) -> PickerState {
+        PickerState::StructuredStdin
+    }
 }
 
 impl DelimitedStdinRequest {
@@ -301,24 +461,14 @@ impl PickerRequest for StdinRequest {
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum PickerResponse {
-    Selected(PickerSelection),
+    Selected(SelectedItem),
     Cancelled,
     Error(String),
 }
 
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub enum PickerSelection {
-    Text(String),
-    NativeWindow { text: String, hwnd: isize },
-}
-
 impl PickerResponse {
-    pub fn selected(path: String) -> Self {
-        Self::Selected(PickerSelection::Text(path))
-    }
-
-    pub fn selected_window(path: String, hwnd: isize) -> Self {
-        Self::Selected(PickerSelection::NativeWindow { text: path, hwnd })
+    pub fn selected(item: SelectedItem) -> Self {
+        Self::Selected(item)
     }
 
     pub fn cancelled() -> Self {
@@ -356,6 +506,38 @@ mod tests {
         }
         let snapshot = store.snapshot().expect("snapshot");
         assert_eq!(snapshot.len(), 2);
+    }
+
+    #[test]
+    fn structured_csv_streams_headers_quotes_and_multiline_records() {
+        let request = StructuredCsvStdinRequest::with_reader(
+            StructuredCsvOptions {
+                headers: CsvHeaderMode::FirstRecord,
+                delimiter: b',',
+            },
+            b"Name,Description\nalpha,plain\n\"beta\",\"two\nlines\"\n".as_slice(),
+        );
+        let store = request.run();
+        for _ in 0..100 {
+            if store.is_done() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        let snapshot = store.snapshot().expect("snapshot");
+        let expected = vec!["Name".to_string(), "Description".to_string()];
+        assert_eq!(snapshot.structured_columns(), Some(expected.as_slice()));
+        assert_eq!(snapshot.len(), 2);
+        let mut stack = [0; 128];
+        let mut heap = Vec::new();
+        assert_eq!(
+            snapshot.get_string(1, &mut stack, &mut heap),
+            b"beta,two\\nlines"
+        );
+        assert_eq!(
+            snapshot.structured_value(1).as_deref(),
+            Some("beta,\"two\nlines\"")
+        );
     }
 
     #[test]
@@ -517,5 +699,29 @@ mod tests {
             snapshot.get_string(0, &mut stack, &mut heap),
             b"00001234      100 app.exe Window title"
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn process_list_request_retains_pid_and_structured_columns() {
+        let request = ProcessListPickerRequest {
+            items: vec![ProcessInfo {
+                name: "example.exe".into(),
+                pid: 1234,
+                working_set_kb: 2048,
+                private_bytes_kb: 4096,
+                cpu_seconds: 1,
+            }],
+        };
+        assert_eq!(request.search_string(), None);
+        let store = request.run();
+        let snapshot = store.snapshot().expect("snapshot");
+        assert_eq!(
+            snapshot.structured_columns().expect("columns"),
+            ["Name", "PID", "WorkingSet", "PrivateBytes", "CPU"]
+        );
+        let fields = snapshot.item_fields(0);
+        assert_eq!(fields.get("Name").map(String::as_str), Some("example.exe"));
+        assert_eq!(fields.get("PID").map(String::as_str), Some("1234"));
     }
 }
