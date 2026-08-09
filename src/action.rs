@@ -41,7 +41,7 @@ pub struct ActionState {
     pub query: String,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "lowercase")]
 pub enum PickerState {
     Filewalker { roots: Vec<String> },
@@ -54,7 +54,7 @@ pub enum PickerState {
 pub enum ActionResolution {
     None,
     Complete,
-    FileWalker { roots: Vec<String> },
+    Picker(PickerState),
 }
 
 #[derive(Clone, Debug)]
@@ -233,7 +233,7 @@ fn run_resolver(
         } if roots.is_empty() => Err("filewalker picker requires at least one root".into()),
         ResolverResponse::Picker {
             picker: PickerResponse::Filewalker { roots },
-        } => Ok(ActionResolution::FileWalker {
+        } => Ok(ActionResolution::Picker(PickerState::Filewalker {
             roots: roots
                 .into_iter()
                 .map(|root| {
@@ -248,7 +248,7 @@ fn run_resolver(
                     }
                 })
                 .collect(),
-        }),
+        })),
     }
 }
 

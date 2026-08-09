@@ -20,7 +20,9 @@ use crate::request::{
 };
 use crate::selection::SelectedItem;
 use crate::skia_ui as picker_ui;
-use crate::view_model::{PickerActionOutcome, PickerInteractions, ViewModel};
+use crate::view_model::{
+    PickerActionOutcome, PickerInteractions, SourceResolver, SourceTransition, ViewModel,
+};
 use std::sync::Arc;
 use std::thread;
 
@@ -428,13 +430,14 @@ fn ensure_initialized() -> Arc<ViewModel> {
             },
             "ffi-parent".into(),
         );
-        let view_model = ViewModel::new_with_services_and_bindings(
+        let view_model = ViewModel::new_with_services_bindings_and_source_resolver(
             PreviewService::new(PreviewConfig::CommandOrNativeWindow(
                 PreviewResolver::Function(resolve_native_file_preview),
             )),
             ActionService::new(ActionConfig { resolvers }),
             bindings,
             false,
+            file_picker_source_resolver(),
         );
         let ui_view_model = Arc::clone(&view_model);
         std::thread::spawn(move || {
@@ -613,9 +616,9 @@ fn resolve_file_system_accept(state: &ActionState) -> Result<ActionResolution, S
         return Ok(ActionResolution::Complete);
     }
     if std::path::Path::new(&selection.item).is_dir() {
-        Ok(ActionResolution::FileWalker {
+        Ok(ActionResolution::Picker(PickerState::Filewalker {
             roots: vec![selection.item.clone()],
-        })
+        }))
     } else {
         Ok(ActionResolution::Complete)
     }
@@ -629,7 +632,28 @@ fn resolve_file_system_parent(state: &ActionState) -> Result<ActionResolution, S
     if roots.is_empty() {
         return Ok(ActionResolution::None);
     }
-    Ok(ActionResolution::FileWalker { roots })
+    Ok(ActionResolution::Picker(PickerState::Filewalker { roots }))
+}
+
+fn file_picker_source_resolver() -> SourceResolver {
+    Arc::new(|picker| match picker {
+        PickerState::Filewalker { roots } => {
+            let request = FileSystemPickerRequest {
+                root_directories: roots,
+                max_depth: i32::MAX,
+                directories_only: false,
+                files_only: false,
+                search_string: None,
+            };
+            Ok(SourceTransition {
+                store: request.run(),
+                picker_state: request.picker_state(),
+                interactions: PickerInteractions::default(),
+                clear_query: true,
+            })
+        }
+        _ => Err("unsupported picker source transition".into()),
+    })
 }
 
 fn file_system_parent_roots(roots: &[String], drive_roots: Vec<String>) -> Vec<String> {

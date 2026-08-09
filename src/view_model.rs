@@ -13,8 +13,6 @@ use crate::key_binding::{KeyChord, KeyName};
 use crate::preview::{
     NativeWindowId, PreviewCoordinator, PreviewEvent, PreviewService, PreviewUpdate,
 };
-#[cfg(windows)]
-use crate::request::FileSystemPickerRequest;
 use crate::request::{PickerRequest, PickerResponse};
 use crate::selection::SelectedItem;
 use crate::source_store::{AnyItemSource, SharedStore};
@@ -79,6 +77,7 @@ pub struct ViewModel {
     preview: PreviewCoordinator,
     actions: ActionController,
     bindings: HashMap<KeyChord, String>,
+    source_resolver: SourceResolver,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -94,6 +93,16 @@ pub type PickerAction =
 pub type PickerRefresh = Arc<dyn Fn() -> Result<Arc<SharedStore>, String> + Send + Sync>;
 pub type PickerPreviewFormatter =
     Arc<dyn Fn(&SelectedItem) -> Result<String, String> + Send + Sync>;
+
+pub struct SourceTransition {
+    pub store: Arc<SharedStore>,
+    pub picker_state: PickerState,
+    pub interactions: PickerInteractions,
+    pub clear_query: bool,
+}
+
+pub type SourceResolver =
+    Arc<dyn Fn(PickerState) -> Result<SourceTransition, String> + Send + Sync>;
 
 #[derive(Clone)]
 pub struct PickerInteractions {
@@ -246,6 +255,22 @@ impl ViewModel {
         bindings: HashMap<KeyChord, String>,
         preview_visible: bool,
     ) -> Arc<Self> {
+        Self::new_with_services_bindings_and_source_resolver(
+            preview_service,
+            action_service,
+            bindings,
+            preview_visible,
+            Arc::new(|_| Err("no picker source resolver is configured".into())),
+        )
+    }
+
+    pub fn new_with_services_bindings_and_source_resolver(
+        preview_service: PreviewService,
+        action_service: ActionService,
+        bindings: HashMap<KeyChord, String>,
+        preview_visible: bool,
+        source_resolver: SourceResolver,
+    ) -> Arc<Self> {
         let (events_tx, events_rx) = unbounded();
         let (internal_events_tx, internal_events_rx) = unbounded();
         let (search_update_tx, search_update_rx) = unbounded();
@@ -282,6 +307,7 @@ impl ViewModel {
             preview,
             actions,
             bindings,
+            source_resolver,
         });
 
         this.spawn_event_thread(internal_events_rx);
@@ -333,7 +359,10 @@ impl ViewModel {
                 Some(selection) => self.complete(PickerResponse::selected(selection)),
                 None => eprintln!("action resolver cannot complete without a selection"),
             },
-            Ok(ActionResolution::FileWalker { roots }) => self.transition_to_filewalker(roots),
+            Ok(ActionResolution::Picker(picker)) => match (self.source_resolver)(picker) {
+                Ok(transition) => self.replace_active_source(transition),
+                Err(message) => eprintln!("picker source resolver error: {message}"),
+            },
             Err(message) => eprintln!("action resolver error: {message}"),
         }
     }
@@ -1082,7 +1111,7 @@ impl ViewModel {
         };
 
         match refresh() {
-            Ok(store) => self.replace_active_source(store),
+            Ok(store) => self.replace_active_store(store),
             Err(error) => self.show_toast(error),
         }
     }
@@ -1129,62 +1158,23 @@ impl ViewModel {
         self.complete_cancelled();
     }
 
-    #[cfg(windows)]
-    fn transition_to_filewalker(&self, roots: Vec<String>) {
-        let request = FileSystemPickerRequest {
-            root_directories: roots,
-            max_depth: i32::MAX,
-            directories_only: false,
-            files_only: false,
-            search_string: None,
-        };
-        let store = request.run();
+    fn replace_active_source(&self, transition: SourceTransition) {
+        let SourceTransition {
+            store,
+            picker_state,
+            interactions,
+            clear_query,
+        } = transition;
         let request_id = self.request_generation.fetch_add(1, Ordering::AcqRel) + 1;
-        let session = FuzzySearchSession::new(
-            request_id,
-            Arc::clone(&store),
-            String::new(),
-            self.search_update_tx.clone(),
-        );
-        let old_session = {
-            let mut state = self.state.lock().expect("view model poisoned");
-            let Some(active) = state.active.take() else {
-                return;
-            };
-            let old_session = active.search_session;
-            state.search_text.clear();
-            state.result_query.clear();
-            state.results.clear();
-            state.counters = UiCounters::default();
-            state.selected = 0;
-            state.viewport_start = 0;
-            state.cursor_position = 0;
-            state.cursor_selection_anchor = None;
-            state.active = Some(ActiveRequest {
-                id: request_id,
-                response_tx: active.response_tx,
-                search_session: session.clone(),
-                store,
-                picker_state: PickerState::Filewalker {
-                    roots: request.root_directories,
-                },
-                interactions: PickerInteractions::default(),
-            });
-            old_session
+        let query = if clear_query {
+            String::new()
+        } else {
+            self.state
+                .lock()
+                .expect("view model poisoned")
+                .search_text
+                .clone()
         };
-        old_session.stop();
-        self.clear_preview_selection();
-        session.start();
-    }
-
-    fn replace_active_source(&self, store: Arc<SharedStore>) {
-        let request_id = self.request_generation.fetch_add(1, Ordering::AcqRel) + 1;
-        let query = self
-            .state
-            .lock()
-            .expect("view model poisoned")
-            .search_text
-            .clone();
         let session = FuzzySearchSession::new(
             request_id,
             Arc::clone(&store),
@@ -1197,8 +1187,11 @@ impl ViewModel {
                 return;
             };
             let old_session = active.search_session;
-            let picker_state = active.picker_state;
-            let interactions = active.interactions;
+            if clear_query {
+                state.search_text.clear();
+                state.cursor_position = 0;
+                state.cursor_selection_anchor = None;
+            }
             state.result_query = query;
             state.results.clear();
             state.counters = UiCounters::default();
@@ -1221,9 +1214,20 @@ impl ViewModel {
         session.start();
     }
 
-    #[cfg(not(windows))]
-    fn transition_to_filewalker(&self, _roots: Vec<String>) {
-        eprintln!("action requested filewalker, which is only available on Windows");
+    fn replace_active_store(&self, store: Arc<SharedStore>) {
+        let transition = {
+            let state = self.state.lock().expect("view model poisoned");
+            let Some(active) = state.active.as_ref() else {
+                return;
+            };
+            SourceTransition {
+                store,
+                picker_state: active.picker_state.clone(),
+                interactions: active.interactions.clone(),
+                clear_query: false,
+            }
+        };
+        self.replace_active_source(transition);
     }
 
     #[allow(dead_code)]

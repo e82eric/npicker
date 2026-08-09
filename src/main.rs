@@ -4,7 +4,9 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use crossbeam_channel::bounded;
-use rust_nfm::action::{ActionConfig, ActionDefinition, ActionResolverDefinition, ActionService};
+use rust_nfm::action::{
+    ActionConfig, ActionDefinition, ActionResolverDefinition, ActionService, PickerState,
+};
 use rust_nfm::key_binding::{parse_key_chord, KeyChord, KeyModifiers, KeyName};
 use rust_nfm::preview::{
     PreviewConfig, PreviewOutputType, PreviewProfile, PreviewResolver, PreviewService,
@@ -20,7 +22,9 @@ use rust_nfm::request::{
 };
 use rust_nfm::selection::SelectedItem;
 use rust_nfm::skia_ui as picker_ui;
-use rust_nfm::view_model::{PickerActionOutcome, PickerInteractions, ViewModel};
+use rust_nfm::view_model::{
+    PickerActionOutcome, PickerInteractions, SourceResolver, SourceTransition, ViewModel,
+};
 
 fn output_timing(line: &str) {
     #[cfg(windows)]
@@ -35,6 +39,33 @@ fn output_timing(line: &str) {
     }
     #[cfg(not(windows))]
     eprintln!("{line}");
+}
+
+#[cfg(windows)]
+fn picker_source_resolver() -> SourceResolver {
+    Arc::new(|picker| match picker {
+        PickerState::Filewalker { roots } => {
+            let request = FileSystemPickerRequest {
+                root_directories: roots,
+                max_depth: i32::MAX,
+                directories_only: false,
+                files_only: false,
+                search_string: None,
+            };
+            Ok(SourceTransition {
+                store: request.run(),
+                picker_state: request.picker_state(),
+                interactions: PickerInteractions::default(),
+                clear_query: true,
+            })
+        }
+        _ => Err("unsupported picker source transition".into()),
+    })
+}
+
+#[cfg(not(windows))]
+fn picker_source_resolver() -> SourceResolver {
+    Arc::new(|_| Err("picker source transitions are unavailable on this platform".into()))
 }
 
 fn main() -> Result<()> {
@@ -107,11 +138,12 @@ fn main() -> Result<()> {
             .collect(),
     };
     let bindings = options.bindings;
-    let view_model = ViewModel::new_with_services_and_bindings(
+    let view_model = ViewModel::new_with_services_bindings_and_source_resolver(
         PreviewService::new(preview_config),
         ActionService::new(action_config),
         bindings,
         preview_visible,
+        picker_source_resolver(),
     );
     let (completion_tx, completion_rx) = bounded(1);
     match options.input {
