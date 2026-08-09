@@ -706,11 +706,23 @@ impl SearchPlan for StructuredSearchPlan<'_> {
     }
 
     fn compare(&self, left: usize, right: usize) -> Ordering {
+        let mut left_stack = [0; 4096];
+        let mut right_stack = [0; 4096];
+        let mut left_heap = Vec::new();
+        let mut right_heap = Vec::new();
+
         for sort in &self.sorts {
-            let ordering = compare_values(
-                &self.snapshot.cell_string(left, sort.column),
-                &self.snapshot.cell_string(right, sort.column),
-            );
+            let left = self
+                .snapshot
+                .cell_bytes(left, sort.column, &mut left_stack, &mut left_heap)
+                .and_then(|bytes| std::str::from_utf8(bytes).ok())
+                .unwrap_or_default();
+            let right = self
+                .snapshot
+                .cell_bytes(right, sort.column, &mut right_stack, &mut right_heap)
+                .and_then(|bytes| std::str::from_utf8(bytes).ok())
+                .unwrap_or_default();
+            let ordering = compare_values(left, right);
             let ordering = if sort.descending {
                 ordering.reverse()
             } else {
@@ -744,7 +756,13 @@ fn compare_values(left: &str, right: &str) -> Ordering {
     if let (Some(left), Some(right)) = (parse_duration(left), parse_duration(right)) {
         return left.cmp(&right);
     }
-    left.to_lowercase().cmp(&right.to_lowercase())
+    compare_case_insensitive(left, right)
+}
+
+fn compare_case_insensitive(left: &str, right: &str) -> Ordering {
+    left.chars()
+        .flat_map(char::to_lowercase)
+        .cmp(right.chars().flat_map(char::to_lowercase))
 }
 
 fn parse_datetime(value: &str) -> Option<i64> {
@@ -1088,5 +1106,12 @@ mod tests {
     fn quoted_filter_values_may_contain_commas() {
         let parsed = parse_structured_query("/:Name==\"alpha,beta\",gamma");
         assert_eq!(parsed.filters[0].values, ["alpha,beta", "gamma"]);
+    }
+
+    #[test]
+    fn text_comparison_is_case_insensitive_without_normalizing_strings() {
+        assert_eq!(compare_case_insensitive("Alpha", "alpha"), Ordering::Equal);
+        assert_eq!(compare_case_insensitive("alpha", "BETA"), Ordering::Less);
+        assert_eq!(compare_case_insensitive("GAMMA", "beta"), Ordering::Greater);
     }
 }
