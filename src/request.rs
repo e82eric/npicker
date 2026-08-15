@@ -101,6 +101,36 @@ pub struct FlatItemsPickerRequest {
     pub search_string: Option<String>,
 }
 
+pub struct StructuredItemsPickerRequest {
+    pub columns: Vec<String>,
+    pub rows: Vec<Vec<String>>,
+    pub search_string: Option<String>,
+}
+
+impl PickerRequest for StructuredItemsPickerRequest {
+    type Source = StructuredStreamingSnapshot;
+
+    fn search_string(&self) -> Option<&str> {
+        self.search_string.as_deref()
+    }
+
+    fn run(&self) -> Arc<dyn SearchSource<Item = <Self::Source as ItemsSource>::Item>> {
+        let schema = StructuredSchema::new(self.columns.clone())
+            .expect("StructuredItemsPickerRequest must have a valid schema");
+        let mut store = StructuredStreamingStore::new(schema);
+        for row in &self.rows {
+            store
+                .add_record(&csv::StringRecord::from(row.clone()))
+                .expect("StructuredItemsPickerRequest rows must match the schema");
+        }
+        completed_picker_source(store.snapshot())
+    }
+
+    fn picker_state(&self) -> PickerState {
+        PickerState::StructuredStdin
+    }
+}
+
 impl PickerRequest for FlatItemsPickerRequest {
     type Source = StreamingItemSnapshot;
 

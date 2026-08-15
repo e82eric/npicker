@@ -49,13 +49,13 @@ fn output_debug_string(line: &str) {
     }
 }
 
-fn ffi_preview_factory() -> Arc<PreviewFactory> {
+pub(crate) fn ffi_preview_factory() -> Arc<PreviewFactory> {
     Arc::new(PreviewFactory::new(PreviewConfig::CommandOrNativeWindow(
         PreviewResolver::Function(resolve_native_file_preview),
     )))
 }
 
-fn command_interactions<I, F>(target: F) -> PickerInteractions<I>
+pub(crate) fn command_interactions<I, F>(target: F) -> PickerInteractions<I>
 where
     I: crate::PickerItem,
     F: Fn(&I) -> String + Send + Sync + 'static,
@@ -79,7 +79,7 @@ where
     }
 }
 
-fn file_system_interactions() -> PickerInteractions<String> {
+pub(crate) fn file_system_interactions() -> PickerInteractions<String> {
     let mut interactions = command_interactions(|item: &String| item.clone());
     interactions.actions.insert(
         "ffi-accept".into(),
@@ -145,7 +145,7 @@ pub extern "C" fn RustNfmShowProgramsList(
     }));
 }
 
-fn process_interactions() -> PickerInteractions<ProcessPickerItem> {
+pub(crate) fn process_interactions() -> PickerInteractions<ProcessPickerItem> {
     let refresh = Arc::new(|| {
         let items =
             list_processes().map_err(|error| format!("Failed to refresh processes: {error}"))?;
@@ -354,7 +354,7 @@ pub extern "C" fn RustNfmShowProcesses(
     .unwrap_or(0)
 }
 
-fn logical_drive_roots() -> Vec<String> {
+pub(crate) fn logical_drive_roots() -> Vec<String> {
     use windows::Win32::Storage::FileSystem::GetLogicalDrives;
     let mask = unsafe { GetLogicalDrives() };
     (0..26)
