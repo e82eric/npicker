@@ -20,6 +20,8 @@ pub use command::{
 mod formatted;
 use formatted::FormattedPreviewBackend;
 pub use formatted::PickerPreviewFormatter;
+#[cfg(windows)]
+pub(crate) mod native_file;
 mod native_window;
 pub use native_window::NativeWindowId;
 use native_window::NativeWindowPreviewBackend;

@@ -6,20 +6,17 @@ use anyhow::{anyhow, Result};
 use crossbeam_channel::{bounded, Receiver, TryRecvError};
 use nfm_search_core::store::ItemsSource;
 
-use crate::action::{ActionDefinition, ActionResolution};
-use crate::ffi::{
-    command_interactions, file_system_interactions, logical_drive_roots, process_interactions,
-};
+use crate::embedded_interactions;
+use crate::file_picker;
 use crate::key_binding::{KeyChord, KeyModifiers, KeyName};
-use crate::list_processes::list_processes;
-use crate::list_windows::list_windows;
-use crate::preview::{CommandPreviewTarget, PreviewRoutes};
+use crate::process_picker;
 use crate::request::{
     FileSystemPickerRequest, FlatItemsPickerRequest, PickerRequest, PickerResponse,
-    ProcessListPickerRequest, StructuredItemsPickerRequest, WindowListPickerRequest,
+    StructuredItemsPickerRequest,
 };
 use crate::skia_ui::{self, ViewHandle};
 use crate::view_model::{PickerInteractions, ViewModel};
+use crate::window_picker;
 use crate::{ProcessPickerItem, StructuredPickerItem, WindowPickerItem};
 
 /// Owns a running picker UI and starts typed picker requests against it.
@@ -128,7 +125,10 @@ impl PickerRuntime {
             items,
             search_string,
         };
-        self.spawn_request(request, command_interactions(|item: &String| item.clone()))
+        self.spawn_request(
+            request,
+            embedded_interactions::command(|item: &String| item.clone()),
+        )
     }
 
     pub fn show_programs(&self, directories: Vec<String>) -> Result<PickerTask<String>> {
@@ -140,7 +140,7 @@ impl PickerRuntime {
             files_only: true,
             search_string: None,
         };
-        self.spawn_request(request, file_system_interactions())
+        self.spawn_request(request, file_picker::interactions())
     }
 
     pub fn show_file_system(
@@ -149,7 +149,7 @@ impl PickerRuntime {
     ) -> Result<PickerTask<String>> {
         self.view_model.set_preview_visible(options.preview_visible);
         if options.roots.is_empty() {
-            options.roots = logical_drive_roots();
+            options.roots = file_picker::logical_drive_roots();
         }
         if options.roots.is_empty() {
             return Err(anyhow!("no file-system roots are available"));
@@ -161,43 +161,23 @@ impl PickerRuntime {
             files_only: options.files_only,
             search_string: options.search_string,
         };
-        self.spawn_request(request, file_system_interactions())
+        self.spawn_request(request, file_picker::interactions())
     }
 
     pub fn show_windows(&self) -> Result<PickerTask<WindowPickerItem>> {
         self.view_model.set_preview_visible(true);
-        let request = WindowListPickerRequest {
-            items: list_windows().map_err(|error| anyhow!(error))?,
-        };
-        let interactions = PickerInteractions {
-            actions: HashMap::from([(
-                "ffi-accept".into(),
-                ActionDefinition::Native(Arc::new(|_| Ok(ActionResolution::Complete))),
-            )]),
-            preview_factory: crate::ffi::ffi_preview_factory(),
-            preview_routes: PreviewRoutes {
-                command_target: Some(Arc::new(|item: &WindowPickerItem| {
-                    Some(CommandPreviewTarget {
-                        item: item.title.clone(),
-                        center_line: None,
-                    })
-                })),
-                native_window: Some(Arc::new(|item: &WindowPickerItem| {
-                    Some(crate::preview::NativeWindowId(item.native_window))
-                })),
-                formatted: None,
-            },
-            ..PickerInteractions::default()
-        };
-        self.spawn_request(request, interactions)
+        self.spawn_request(
+            window_picker::request().map_err(anyhow::Error::msg)?,
+            window_picker::interactions(),
+        )
     }
 
     pub fn show_processes(&self) -> Result<PickerTask<ProcessPickerItem>> {
         self.view_model.set_preview_visible(false);
-        let request = ProcessListPickerRequest {
-            items: list_processes().map_err(|error| anyhow!(error))?,
-        };
-        self.spawn_request(request, process_interactions())
+        self.spawn_request(
+            process_picker::request().map_err(anyhow::Error::msg)?,
+            process_picker::interactions(),
+        )
     }
 
     pub fn show_structured(
@@ -226,7 +206,7 @@ impl PickerRuntime {
         };
         self.spawn_request(
             request,
-            command_interactions(|item: &StructuredPickerItem| item.value.clone()),
+            embedded_interactions::command(|item: &StructuredPickerItem| item.value.clone()),
         )
     }
 

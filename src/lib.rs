@@ -2,13 +2,21 @@ pub mod action;
 #[cfg(windows)]
 mod clipboard;
 #[cfg(windows)]
+pub(crate) mod embedded_interactions;
+#[cfg(windows)]
 pub mod ffi;
+#[cfg(windows)]
+pub(crate) mod file_picker;
 pub mod key_binding;
 #[cfg(windows)]
 pub mod list_processes;
 #[cfg(windows)]
 pub mod list_windows;
 mod picker_snapshot;
+#[cfg(windows)]
+pub(crate) mod process_picker;
+#[cfg(windows)]
+pub(crate) mod window_picker;
 pub use nfm_picker_sources::structured::StructuredPickerItem;
 #[cfg(windows)]
 pub use picker_snapshot::{ProcessPickerItem, WindowPickerItem};
