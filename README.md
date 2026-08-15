@@ -104,6 +104,15 @@ nfm-rust-win32host filesystem
 Pass one or more roots after `filesystem` to scan different directories. With no
 roots, the picker starts from the available logical drives.
 
+Limit traversal depth or filter the result type with filesystem-specific options:
+
+```powershell
+nfm-rust-win32host filesystem G:\src --max-depth 5 --files-only
+nfm-rust-win32host filesystem G:\src --max-depth 2 --directories-only
+```
+
+`--files-only` and `--directories-only` cannot be combined.
+
 An accept resolver can decide whether Enter completes NFM or transitions the
 same window to a new filesystem picker. The resolver is an executable followed
 by repeatable `--accept-resolver-arg` arguments. This is compatibility syntax

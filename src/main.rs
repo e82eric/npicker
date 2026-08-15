@@ -39,6 +39,13 @@ fn output_timing(line: &str) {
 }
 
 fn main() -> Result<()> {
+    if std::env::args()
+        .skip(1)
+        .any(|arg| matches!(arg.as_str(), "-h" | "--help"))
+    {
+        print_help();
+        return Ok(());
+    }
     let mut options = app_options();
     install_accept_action(&mut options)?;
     install_file_system_bindings(&mut options);
@@ -163,6 +170,67 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+fn print_help() {
+    println!(
+        "nfm-rust-win32host - native fuzzy picker\n\
+\n\
+USAGE:\n\
+    nfm-rust-win32host [COMMAND] [OPTIONS]\n\
+\n\
+COMMANDS:\n\
+    filesystem [ROOT ...]  Browse files and directories; defaults to logical drives\n\
+    windows                Pick a desktop window with native preview\n\
+    processes              Pick a process; Ctrl+K kills and Ctrl+R refreshes\n\
+\n\
+FILESYSTEM OPTIONS:\n\
+    --max-depth <N>         Limit recursive traversal depth\n\
+    --files-only            Exclude directories from results\n\
+    --directories-only      Exclude files from results\n\
+\n\
+With no command, candidates are read from stdin.\n\
+\n\
+INPUT OPTIONS:\n\
+    --stdin                         Read candidates from stdin (default)\n\
+    --delimiter <CHAR|\\t>          Parse delimited input\n\
+    --text-field <all|N>            Field used for display and search\n\
+    --value-field <all|N>           Field emitted on selection\n\
+    --input-format csv              Parse structured CSV input\n\
+    --csv-columns <A,B,...>         Use explicit CSV column names\n\
+    --csv-delimiter <CHAR|\\t>      Set the CSV delimiter\n\
+    --preview-file-field <N>        Field used as the preview file\n\
+    --preview-center-line-field <N> Field used as the preview center line\n\
+\n\
+PREVIEW OPTIONS:\n\
+    --preview <PROGRAM>             Run a preview command\n\
+    --preview-arg <ARG>             Append a preview argument (repeatable)\n\
+    --preview-type <text|image>     Select preview output type\n\
+    --preview-cwd <DIRECTORY>       Set preview working directory\n\
+    --preview-visible <true|false>  Set initial preview visibility\n\
+    --window-preview                Request native preview for windows\n\
+    --preview-resolver <PROGRAM>    Select a named preview profile dynamically\n\
+    --preview-resolver-arg <ARG>    Append a resolver argument (repeatable)\n\
+    --preview-command <NAME> <PROGRAM>\n\
+    --preview-command-arg <NAME> <ARG>\n\
+    --preview-command-type <NAME> <text|image>\n\
+    --preview-command-cwd <NAME> <DIRECTORY>\n\
+    --preview-default <NAME>        Set the default preview profile\n\
+\n\
+ACTION OPTIONS:\n\
+    --accept-resolver <PROGRAM>     Resolve Enter through a process\n\
+    --accept-resolver-arg <ARG>     Append an accept-resolver argument\n\
+    --action <NAME> action-resolver Declare a named action\n\
+    --action-program <NAME> <PROGRAM>\n\
+    --action-arg <NAME> <ARG>       Append a named-action argument\n\
+    --bind <CHORD> <ACTION>         Bind a key chord to an action\n\
+\n\
+OTHER OPTIONS:\n\
+    --debug-wait                    Pause briefly for debugger attachment\n\
+    -h, --help                      Print this help\n\
+\n\
+Preview arguments may use {{item}} and {{line}} placeholders."
+    );
+}
+
 const ACCEPT_ACTION_NAME: &str = "__nfm_accept";
 
 fn install_accept_action(options: &mut AppOptions) -> Result<()> {
@@ -214,6 +282,11 @@ fn install_file_system_bindings(options: &mut AppOptions) {
 }
 
 fn validate_action_options(options: &AppOptions) -> Result<()> {
+    if let InputMode::FileSystem(file_system) = &options.input {
+        if file_system.files_only && file_system.directories_only {
+            anyhow::bail!("--files-only and --directories-only cannot be used together");
+        }
+    }
     for (name, action) in &options.actions {
         if !action.declared {
             anyhow::bail!("action '{name}' is missing --action {name} action-resolver");
@@ -440,19 +513,19 @@ fn run_file_system_request(
     view_model: Arc<ViewModel>,
     preview_factory: Arc<PreviewFactory>,
     actions: Arc<HashMap<String, ActionResolverDefinition>>,
-    roots: Vec<String>,
+    options: FileSystemInputOptions,
 ) -> Result<()> {
-    let roots = if roots.is_empty() {
+    let roots = if options.roots.is_empty() {
         rust_nfm::file_picker::logical_drive_roots()
     } else {
-        roots
+        options.roots
     };
     std::thread::spawn(move || {
         let request = FileSystemPickerRequest {
             root_directories: roots,
-            max_depth: i32::MAX,
-            directories_only: false,
-            files_only: false,
+            max_depth: options.max_depth,
+            directories_only: options.directories_only,
+            files_only: options.files_only,
             search_string: None,
         };
         let interactions = file_system_interactions(preview_factory, actions);
@@ -468,7 +541,7 @@ fn run_file_system_request(
     _view_model: Arc<ViewModel>,
     _preview_factory: Arc<PreviewFactory>,
     _actions: Arc<HashMap<String, ActionResolverDefinition>>,
-    _roots: Vec<String>,
+    _options: FileSystemInputOptions,
 ) -> Result<()> {
     anyhow::bail!("the filesystem input mode is currently available only on Windows")
 }
@@ -498,9 +571,16 @@ fn response_exit_code<I: rust_nfm::PickerItem>(response: Result<PickerResponse<I
 enum InputMode {
     Stdin(Option<DelimitedInputOptions>),
     StructuredCsv(StructuredCsvOptions),
-    FileSystem(Vec<String>),
+    FileSystem(FileSystemInputOptions),
     Windows,
     Processes,
+}
+
+struct FileSystemInputOptions {
+    roots: Vec<String>,
+    max_depth: i32,
+    files_only: bool,
+    directories_only: bool,
 }
 
 struct AppOptions {
@@ -560,6 +640,9 @@ fn app_options() -> AppOptions {
     let mut windows = false;
     let mut processes = false;
     let mut roots = Vec::new();
+    let mut max_depth = i32::MAX;
+    let mut files_only = false;
+    let mut directories_only = false;
     let mut delimiter = None;
     let mut csv_input = false;
     let mut csv_columns = None;
@@ -572,6 +655,15 @@ fn app_options() -> AppOptions {
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "filesystem" if !filesystem => filesystem = true,
+            "--max-depth" if filesystem => match args.next() {
+                Some(value) => match value.parse::<i32>() {
+                    Ok(value) if value >= 0 => max_depth = value,
+                    _ => eprintln!("--max-depth requires a non-negative integer"),
+                },
+                None => eprintln!("--max-depth requires a value"),
+            },
+            "--files-only" if filesystem => files_only = true,
+            "--directories-only" if filesystem => directories_only = true,
             "windows" if !filesystem => windows = true,
             "processes" if !filesystem => processes = true,
             "--stdin" if !filesystem => {}
@@ -792,7 +884,12 @@ fn app_options() -> AppOptions {
     } else if processes {
         options.input = InputMode::Processes;
     } else if filesystem {
-        options.input = InputMode::FileSystem(roots);
+        options.input = InputMode::FileSystem(FileSystemInputOptions {
+            roots,
+            max_depth,
+            files_only,
+            directories_only,
+        });
     } else if csv_input {
         options.input = InputMode::StructuredCsv(StructuredCsvOptions {
             headers: csv_columns.map_or(CsvHeaderMode::FirstRecord, CsvHeaderMode::Explicit),
