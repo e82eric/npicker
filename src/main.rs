@@ -5,25 +5,21 @@ use std::sync::Arc;
 use anyhow::Result;
 use nfm_picker_sources::delimited::DelimitedPickerItem;
 use nfm_picker_sources::structured::StructuredPickerItem;
-use rust_nfm::action::{ActionDefinition, ActionResolverDefinition, PickerState};
+use rust_nfm::action::{ActionDefinition, ActionResolverDefinition};
 use rust_nfm::key_binding::{parse_key_chord, KeyChord, KeyModifiers, KeyName};
 use rust_nfm::preview::{
     CommandPreviewTarget, NativeWindowId, PreviewConfig, PreviewFactory, PreviewOutputType,
     PreviewProfile, PreviewResolver, PreviewRoutes,
 };
+#[cfg(windows)]
+use rust_nfm::request::FileSystemPickerRequest;
 use rust_nfm::request::{
     CsvHeaderMode, DelimitedInputOptions, DelimitedStdinRequest, DelimitedTextSelector,
-    DelimitedValueSelector, PickerRequest, PickerResponse, StdinRequest, StructuredCsvOptions,
+    DelimitedValueSelector, PickerResponse, StdinRequest, StructuredCsvOptions,
     StructuredCsvStdinRequest,
 };
-#[cfg(windows)]
-use rust_nfm::request::{
-    FileSystemPickerRequest, ProcessListPickerRequest, WindowListPickerRequest,
-};
 use rust_nfm::skia_ui as picker_ui;
-use rust_nfm::view_model::{
-    PickerActionOutcome, PickerInteractions, SourceResolver, SourceTransition, ViewModel,
-};
+use rust_nfm::view_model::{PickerInteractions, ViewModel};
 #[cfg(windows)]
 use rust_nfm::{ProcessPickerItem, WindowPickerItem};
 
@@ -42,47 +38,28 @@ fn output_timing(line: &str) {
     eprintln!("{line}");
 }
 
-#[cfg(windows)]
-fn picker_source_resolver(
-    preview_factory: Arc<PreviewFactory>,
-    actions: Arc<HashMap<String, ActionResolverDefinition>>,
-) -> SourceResolver<String> {
-    Arc::new(move |picker| match picker {
-        PickerState::Filewalker { roots } => {
-            let request = FileSystemPickerRequest {
-                root_directories: roots,
-                max_depth: i32::MAX,
-                directories_only: false,
-                files_only: false,
-                search_string: None,
-            };
-            Ok(SourceTransition::new(
-                request.run(),
-                request.picker_state(),
-                filewalker_interactions(Arc::clone(&preview_factory), Arc::clone(&actions)),
-                true,
-            ))
-        }
-        _ => Err("unsupported picker source transition".into()),
-    })
-}
-
 fn main() -> Result<()> {
     let mut options = app_options();
     install_accept_action(&mut options)?;
+    install_file_system_bindings(&mut options);
     validate_action_options(&options)?;
     if options.debug_wait {
         debug_wait();
     }
 
     nfm_search_core::timing::set_sink(output_timing);
-    let is_window_list = matches!(&options.input, InputMode::ListWindows);
-    let is_process_list = matches!(&options.input, InputMode::ListProcesses);
+    let is_window_list = matches!(&options.input, InputMode::Windows);
+    let is_process_list = matches!(&options.input, InputMode::Processes);
+    let is_file_system = matches!(&options.input, InputMode::FileSystem(_));
     let command_preview =
         options.preview_program.is_some() || options.preview_resolver_program.is_some();
-    let native_window_preview =
-        resolve_native_window_preview(is_window_list, options.window_preview, command_preview)?;
-    let preview_enabled = command_preview || native_window_preview || is_process_list;
+    let native_window_preview = resolve_native_window_preview(
+        is_window_list,
+        options.window_preview || is_window_list,
+        command_preview,
+    )?;
+    let preview_enabled =
+        command_preview || native_window_preview || is_process_list || is_file_system;
     let preview_config = match options.preview_resolver_program {
         Some(program) => PreviewConfig::Command(PreviewResolver::Process {
             program: program.into(),
@@ -137,7 +114,11 @@ fn main() -> Result<()> {
             .collect(),
     );
     let bindings = options.bindings;
-    let preview_factory = Arc::new(PreviewFactory::new(preview_config.clone()));
+    let preview_factory = if is_file_system && !command_preview {
+        rust_nfm::file_picker::default_preview_factory()
+    } else {
+        Arc::new(PreviewFactory::new(preview_config.clone()))
+    };
     let view = Arc::new(picker_ui::ViewHandle::new());
     let view_model = ViewModel::new_with_bindings(bindings, preview_visible, view.clone());
     match options.input {
@@ -158,18 +139,18 @@ fn main() -> Result<()> {
             Arc::clone(&actions),
             options,
         ),
-        InputMode::FileWalker(roots) => run_filewalker_request(
+        InputMode::FileSystem(roots) => run_file_system_request(
             Arc::clone(&view_model),
             Arc::clone(&preview_factory),
             Arc::clone(&actions),
             roots,
         )?,
-        InputMode::ListWindows => run_list_windows_request(
+        InputMode::Windows => run_windows_request(
             Arc::clone(&view_model),
             Arc::clone(&preview_factory),
             Arc::clone(&actions),
         )?,
-        InputMode::ListProcesses => run_list_processes_request(
+        InputMode::Processes => run_processes_request(
             Arc::clone(&view_model),
             Arc::clone(&preview_factory),
             Arc::clone(&actions),
@@ -209,6 +190,29 @@ fn install_accept_action(options: &mut AppOptions) -> Result<()> {
     Ok(())
 }
 
+fn install_file_system_bindings(options: &mut AppOptions) {
+    if !matches!(options.input, InputMode::FileSystem(_)) {
+        return;
+    }
+    options
+        .bindings
+        .entry(KeyChord {
+            key: KeyName::Enter,
+            modifiers: KeyModifiers::default(),
+        })
+        .or_insert_with(|| rust_nfm::file_picker::ACCEPT_ACTION.into());
+    options
+        .bindings
+        .entry(KeyChord {
+            key: KeyName::Character('u'),
+            modifiers: KeyModifiers {
+                ctrl: true,
+                ..KeyModifiers::default()
+            },
+        })
+        .or_insert_with(|| rust_nfm::file_picker::PARENT_ACTION.into());
+}
+
 fn validate_action_options(options: &AppOptions) -> Result<()> {
     for (name, action) in &options.actions {
         if !action.declared {
@@ -219,7 +223,12 @@ fn validate_action_options(options: &AppOptions) -> Result<()> {
         }
     }
     for action in options.bindings.values() {
-        if !options.actions.contains_key(action) {
+        let file_system_builtin = matches!(options.input, InputMode::FileSystem(_))
+            && matches!(
+                action.as_str(),
+                rust_nfm::file_picker::ACCEPT_ACTION | rust_nfm::file_picker::PARENT_ACTION
+            );
+        if !options.actions.contains_key(action) && !file_system_builtin {
             anyhow::bail!("key binding references undefined action: {action}");
         }
     }
@@ -232,7 +241,7 @@ fn resolve_native_window_preview(
     has_command_preview: bool,
 ) -> Result<bool> {
     if requested && !is_window_list {
-        anyhow::bail!("--window-preview is only valid with listwindows");
+        anyhow::bail!("--window-preview is only valid with windows");
     }
     Ok(requested && !has_command_preview)
 }
@@ -272,17 +281,16 @@ fn typed_actions<I>(
 }
 
 #[cfg(windows)]
-fn filewalker_interactions(
+fn file_system_interactions(
     preview_factory: Arc<PreviewFactory>,
     actions: Arc<HashMap<String, ActionResolverDefinition>>,
 ) -> PickerInteractions<String> {
-    let mut interactions = command_interactions(
+    let interactions = command_interactions(
         Arc::clone(&preview_factory),
         Arc::clone(&actions),
         |item: &String| item.clone(),
     );
-    interactions.source_resolver = Some(picker_source_resolver(preview_factory, actions));
-    interactions
+    rust_nfm::file_picker::interactions_with(interactions)
 }
 
 fn run_delimited_request(
@@ -356,15 +364,14 @@ fn run_stdin_request(
 }
 
 #[cfg(windows)]
-fn run_list_windows_request(
+fn run_windows_request(
     view_model: Arc<ViewModel>,
     preview_factory: Arc<PreviewFactory>,
     actions: Arc<HashMap<String, ActionResolverDefinition>>,
 ) -> Result<()> {
-    let items = rust_nfm::list_windows::list_windows()?;
+    let request = rust_nfm::window_picker::request().map_err(anyhow::Error::msg)?;
     std::thread::spawn(move || {
-        let request = WindowListPickerRequest { items };
-        let interactions = PickerInteractions {
+        let interactions = rust_nfm::window_picker::interactions_with(PickerInteractions {
             actions: typed_actions(&actions),
             preview_factory,
             preview_routes: PreviewRoutes {
@@ -380,7 +387,7 @@ fn run_list_windows_request(
                 formatted: None,
             },
             ..PickerInteractions::default()
-        };
+        });
         let code =
             response_exit_code(view_model.run_request_with_interactions(&request, interactions));
         view_model.exit(code);
@@ -389,17 +396,20 @@ fn run_list_windows_request(
 }
 
 #[cfg(windows)]
-fn run_list_processes_request(
+fn run_processes_request(
     view_model: Arc<ViewModel>,
     preview_factory: Arc<PreviewFactory>,
     actions: Arc<HashMap<String, ActionResolverDefinition>>,
 ) -> Result<()> {
-    let items = rust_nfm::list_processes::list_processes()?;
+    let request = rust_nfm::process_picker::request().map_err(anyhow::Error::msg)?;
     std::thread::spawn(move || {
-        let request = ProcessListPickerRequest { items };
+        let interactions =
+            command_interactions(preview_factory, actions, |item: &ProcessPickerItem| {
+                item.value.clone()
+            });
         let code = response_exit_code(view_model.run_request_with_interactions(
             &request,
-            process_interactions(preview_factory, actions),
+            rust_nfm::process_picker::interactions_with(interactions),
         ));
         view_model.exit(code);
     });
@@ -407,93 +417,33 @@ fn run_list_processes_request(
 }
 
 #[cfg(windows)]
-fn process_interactions(
-    preview_factory: Arc<PreviewFactory>,
-    actions: Arc<HashMap<String, ActionResolverDefinition>>,
-) -> PickerInteractions<ProcessPickerItem> {
-    let refresh = Arc::new(|| {
-        let items = rust_nfm::list_processes::list_processes()
-            .map_err(|error| format!("Failed to refresh processes: {error}"))?;
-        Ok(ProcessListPickerRequest { items }.run())
-    });
-    let kill = Arc::new(|selected: Option<&ProcessPickerItem>| {
-        let pid = selected
-            .map(|item| item.pid)
-            .ok_or_else(|| "No process selected".to_owned())?;
-        rust_nfm::list_processes::terminate_process(pid)
-            .map_err(|error| format!("Failed to terminate process {pid}: {error}"))?;
-        Ok(PickerActionOutcome::RefreshWithToast(format!(
-            "Terminated process {pid}"
-        )))
-    });
-    let refresh_action = Arc::new(|_: Option<&ProcessPickerItem>| Ok(PickerActionOutcome::Refresh));
-    let preview = Arc::new(|item: &ProcessPickerItem| {
-        Ok(format!(
-            "Name: {}\nPID: {}\nWorkingSet: {}\nPrivateBytes: {}\nCPU: {}",
-            item.name, item.pid, item.working_set_kb, item.private_bytes_kb, item.cpu_seconds,
-        ))
-    });
-    PickerInteractions {
-        actions: typed_actions(&actions),
-        source_resolver: None,
-        bindings: HashMap::from([
-            (
-                KeyChord {
-                    key: KeyName::Character('k'),
-                    modifiers: KeyModifiers {
-                        ctrl: true,
-                        ..KeyModifiers::default()
-                    },
-                },
-                kill as _,
-            ),
-            (
-                KeyChord {
-                    key: KeyName::Character('r'),
-                    modifiers: KeyModifiers {
-                        ctrl: true,
-                        ..KeyModifiers::default()
-                    },
-                },
-                refresh_action as _,
-            ),
-        ]),
-        refresh: Some(refresh),
-        preview_factory,
-        preview_routes: PreviewRoutes {
-            formatted: Some(preview),
-            ..PreviewRoutes::default()
-        },
-    }
-}
-
 #[cfg(not(windows))]
-fn run_list_processes_request(
+fn run_processes_request(
     _view_model: Arc<ViewModel>,
     _preview_factory: Arc<PreviewFactory>,
     _actions: Arc<HashMap<String, ActionResolverDefinition>>,
 ) -> Result<()> {
-    anyhow::bail!("the listprocesses command is currently available only on Windows")
+    anyhow::bail!("the processes command is currently available only on Windows")
 }
 
 #[cfg(not(windows))]
-fn run_list_windows_request(
+fn run_windows_request(
     _view_model: Arc<ViewModel>,
     _preview_factory: Arc<PreviewFactory>,
     _actions: Arc<HashMap<String, ActionResolverDefinition>>,
 ) -> Result<()> {
-    anyhow::bail!("the listwindows command is currently available only on Windows")
+    anyhow::bail!("the windows command is currently available only on Windows")
 }
 
 #[cfg(windows)]
-fn run_filewalker_request(
+fn run_file_system_request(
     view_model: Arc<ViewModel>,
     preview_factory: Arc<PreviewFactory>,
     actions: Arc<HashMap<String, ActionResolverDefinition>>,
     roots: Vec<String>,
 ) -> Result<()> {
     let roots = if roots.is_empty() {
-        vec![default_home_directory()?]
+        rust_nfm::file_picker::logical_drive_roots()
     } else {
         roots
     };
@@ -505,7 +455,7 @@ fn run_filewalker_request(
             files_only: false,
             search_string: None,
         };
-        let interactions = filewalker_interactions(preview_factory, actions);
+        let interactions = file_system_interactions(preview_factory, actions);
         let code =
             response_exit_code(view_model.run_request_with_interactions(&request, interactions));
         view_model.exit(code);
@@ -514,27 +464,13 @@ fn run_filewalker_request(
 }
 
 #[cfg(not(windows))]
-fn run_filewalker_request(
+fn run_file_system_request(
     _view_model: Arc<ViewModel>,
     _preview_factory: Arc<PreviewFactory>,
     _actions: Arc<HashMap<String, ActionResolverDefinition>>,
     _roots: Vec<String>,
 ) -> Result<()> {
-    anyhow::bail!("the filewalker input mode is currently available only on Windows")
-}
-
-#[cfg(windows)]
-fn default_home_directory() -> Result<String> {
-    if let Some(profile) = std::env::var_os("USERPROFILE").filter(|value| !value.is_empty()) {
-        return Ok(profile.to_string_lossy().into_owned());
-    }
-    if let (Some(drive), Some(path)) = (std::env::var_os("HOMEDRIVE"), std::env::var_os("HOMEPATH"))
-    {
-        let mut home = std::path::PathBuf::from(drive);
-        home.push(path);
-        return Ok(home.to_string_lossy().into_owned());
-    }
-    Ok(std::env::current_dir()?.to_string_lossy().into_owned())
+    anyhow::bail!("the filesystem input mode is currently available only on Windows")
 }
 
 fn response_exit_code<I: rust_nfm::PickerItem>(response: Result<PickerResponse<I>>) -> i32 {
@@ -562,9 +498,9 @@ fn response_exit_code<I: rust_nfm::PickerItem>(response: Result<PickerResponse<I
 enum InputMode {
     Stdin(Option<DelimitedInputOptions>),
     StructuredCsv(StructuredCsvOptions),
-    FileWalker(Vec<String>),
-    ListWindows,
-    ListProcesses,
+    FileSystem(Vec<String>),
+    Windows,
+    Processes,
 }
 
 struct AppOptions {
@@ -620,9 +556,9 @@ fn app_options() -> AppOptions {
         actions: HashMap::new(),
         bindings: HashMap::new(),
     };
-    let mut filewalker = false;
-    let mut list_windows = false;
-    let mut list_processes = false;
+    let mut filesystem = false;
+    let mut windows = false;
+    let mut processes = false;
     let mut roots = Vec::new();
     let mut delimiter = None;
     let mut csv_input = false;
@@ -635,16 +571,16 @@ fn app_options() -> AppOptions {
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
-            "filewalker" if !filewalker => filewalker = true,
-            "listwindows" | "ListWindows" if !filewalker => list_windows = true,
-            "listprocesses" | "ListProcesses" if !filewalker => list_processes = true,
-            "--stdin" if !filewalker => {}
-            "--input-format" if !filewalker => match args.next().as_deref() {
+            "filesystem" if !filesystem => filesystem = true,
+            "windows" if !filesystem => windows = true,
+            "processes" if !filesystem => processes = true,
+            "--stdin" if !filesystem => {}
+            "--input-format" if !filesystem => match args.next().as_deref() {
                 Some("csv") => csv_input = true,
                 Some(value) => eprintln!("unsupported input format: {value}"),
                 None => eprintln!("--input-format requires a value"),
             },
-            "--csv-columns" if !filewalker => {
+            "--csv-columns" if !filesystem => {
                 csv_columns = args
                     .next()
                     .map(|value| value.split(',').map(str::to_owned).collect());
@@ -652,7 +588,7 @@ fn app_options() -> AppOptions {
                     eprintln!("--csv-columns requires comma-separated names");
                 }
             }
-            "--csv-delimiter" if !filewalker => {
+            "--csv-delimiter" if !filesystem => {
                 match args
                     .next()
                     .as_deref()
@@ -821,7 +757,7 @@ fn app_options() -> AppOptions {
                     eprintln!("--bind requires a key chord and action name");
                 }
             }
-            "--delimiter" if !filewalker => {
+            "--delimiter" if !filesystem => {
                 if let Some(value) = args.next() {
                     delimiter = parse_delimiter(&value);
                     if delimiter.is_none() {
@@ -831,32 +767,32 @@ fn app_options() -> AppOptions {
                     eprintln!("--delimiter requires a value");
                 }
             }
-            "--text-field" if !filewalker => {
+            "--text-field" if !filesystem => {
                 if let Some(selector) = parse_text_selector(args.next()) {
                     text = selector;
                 }
             }
-            "--value-field" if !filewalker => {
+            "--value-field" if !filesystem => {
                 if let Some(selector) = parse_value_selector(args.next()) {
                     value = selector;
                 }
             }
-            "--preview-file-field" if !filewalker => {
+            "--preview-file-field" if !filesystem => {
                 preview_file_field = parse_field(args.next(), "--preview-file-field");
             }
-            "--preview-center-line-field" if !filewalker => {
+            "--preview-center-line-field" if !filesystem => {
                 preview_center_line_field = parse_field(args.next(), "--preview-center-line-field");
             }
-            _ if filewalker => roots.push(arg),
+            _ if filesystem => roots.push(arg),
             _ => eprintln!("ignoring unsupported argument: {arg}"),
         }
     }
-    if list_windows {
-        options.input = InputMode::ListWindows;
-    } else if list_processes {
-        options.input = InputMode::ListProcesses;
-    } else if filewalker {
-        options.input = InputMode::FileWalker(roots);
+    if windows {
+        options.input = InputMode::Windows;
+    } else if processes {
+        options.input = InputMode::Processes;
+    } else if filesystem {
+        options.input = InputMode::FileSystem(roots);
     } else if csv_input {
         options.input = InputMode::StructuredCsv(StructuredCsvOptions {
             headers: csv_columns.map_or(CsvHeaderMode::FirstRecord, CsvHeaderMode::Explicit),

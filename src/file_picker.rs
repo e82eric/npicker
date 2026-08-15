@@ -1,27 +1,21 @@
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::action::{ActionDefinition, ActionResolution, ActionState, PickerState};
 use crate::preview::native_file::preview_factory;
-use crate::preview::{CommandPreviewTarget, PreviewRoutes};
+use crate::preview::{CommandPreviewTarget, PreviewFactory, PreviewRoutes};
 use crate::request::{FileSystemPickerRequest, PickerRequest};
 use crate::view_model::{PickerInteractions, SourceResolver, SourceTransition};
 
+pub const ACCEPT_ACTION: &str = "ffi-accept";
+pub const PARENT_ACTION: &str = "ffi-parent";
+
+pub fn default_preview_factory() -> Arc<PreviewFactory> {
+    preview_factory()
+}
+
 pub(crate) fn interactions() -> PickerInteractions<String> {
-    let preview_factory = preview_factory();
-    PickerInteractions {
-        actions: HashMap::from([
-            (
-                "ffi-accept".into(),
-                ActionDefinition::Native(Arc::new(resolve_accept)),
-            ),
-            (
-                "ffi-parent".into(),
-                ActionDefinition::Native(Arc::new(resolve_parent)),
-            ),
-        ]),
-        source_resolver: Some(source_resolver()),
-        preview_factory,
+    interactions_with(PickerInteractions {
+        preview_factory: default_preview_factory(),
         preview_routes: PreviewRoutes {
             command_target: Some(Arc::new(|item: &String| {
                 Some(CommandPreviewTarget {
@@ -32,10 +26,26 @@ pub(crate) fn interactions() -> PickerInteractions<String> {
             ..PreviewRoutes::default()
         },
         ..PickerInteractions::default()
-    }
+    })
 }
 
-pub(crate) fn logical_drive_roots() -> Vec<String> {
+pub fn interactions_with(
+    mut interactions: PickerInteractions<String>,
+) -> PickerInteractions<String> {
+    interactions.actions.insert(
+        ACCEPT_ACTION.into(),
+        ActionDefinition::Native(Arc::new(resolve_accept)),
+    );
+    interactions.actions.insert(
+        PARENT_ACTION.into(),
+        ActionDefinition::Native(Arc::new(resolve_parent)),
+    );
+    let transition_interactions = interactions.clone();
+    interactions.source_resolver = Some(source_resolver(transition_interactions));
+    interactions
+}
+
+pub fn logical_drive_roots() -> Vec<String> {
     use windows::Win32::Storage::FileSystem::GetLogicalDrives;
     let mask = unsafe { GetLogicalDrives() };
     (0..26)
@@ -68,7 +78,7 @@ fn resolve_parent(state: &ActionState<String>) -> Result<ActionResolution, Strin
     Ok(ActionResolution::Picker(PickerState::Filewalker { roots }))
 }
 
-fn source_resolver() -> SourceResolver<String> {
+fn source_resolver(transition_interactions: PickerInteractions<String>) -> SourceResolver<String> {
     Arc::new(move |picker| match picker {
         PickerState::Filewalker { roots } => {
             let request = FileSystemPickerRequest {
@@ -81,7 +91,7 @@ fn source_resolver() -> SourceResolver<String> {
             Ok(SourceTransition::new(
                 request.run(),
                 request.picker_state(),
-                interactions(),
+                interactions_with(transition_interactions.clone()),
                 true,
             ))
         }

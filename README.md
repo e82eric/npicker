@@ -95,22 +95,23 @@ autocomplete; it suggests actions, column names, operators, sort directions,
 and up to 1,000 distinct values observed in the selected column. Use the arrow
 keys and Enter to select a suggestion, or Escape to dismiss it.
 
-On Windows, scan the current user's home directory without stdin:
+On Windows, open the filesystem picker without stdin:
 
 ```text
-nfm-rust-win32host filewalker
+nfm-rust-win32host filesystem
 ```
 
-Pass one or more roots after `filewalker` to scan different directories.
+Pass one or more roots after `filesystem` to scan different directories. With no
+roots, the picker starts from the available logical drives.
 
 An accept resolver can decide whether Enter completes NFM or transitions the
-same window to a new filewalker picker. The resolver is an executable followed
+same window to a new filesystem picker. The resolver is an executable followed
 by repeatable `--accept-resolver-arg` arguments. This is compatibility syntax
 for a generated action resolver bound to Enter, and it receives the same
 `NFM_ACTION_STATE` JSON document as other actions:
 
 ```powershell
-nfm-rust-win32host filewalker `
+nfm-rust-win32host filesystem `
     --accept-resolver pwsh `
     --accept-resolver-arg '-NoProfile' `
     --accept-resolver-arg '-Command' `
@@ -130,16 +131,16 @@ or:
 ```
 
 For now, NFM expands a root only when its entire value is exactly `{item}`.
-Literal roots are also supported. A filewalker transition keeps the original
+Literal roots are also supported. A filesystem transition keeps the original
 output request open, and Escape cancels the whole NFM session.
 
 Named action resolvers can be assigned to key chords. Each invocation receives
 one JSON document in `NFM_ACTION_STATE`, containing the current selection,
 picker context, and query. This example binds Alt+Up to the parent of the
-current filewalker root:
+current filesystem root:
 
 ```powershell
-nfm-rust-win32host filewalker G:\src `
+nfm-rust-win32host filesystem G:\src `
     --action parent action-resolver `
     --action-program parent pwsh `
     --action-arg parent '-NoProfile' `
@@ -192,7 +193,7 @@ modifiers. User bindings override built-in handling for the same chord.
 On Windows, list the visible Alt-Tab application windows:
 
 ```text
-nfm-rust-win32host listwindows
+nfm-rust-win32host windows
 ```
 
 Rows contain the window handle, process ID, executable name, and title. The
@@ -200,7 +201,7 @@ selected row is written to stdout. Add a live, client-area DWM thumbnail of the
 selected window with:
 
 ```text
-nfm-rust-win32host listwindows --window-preview
+nfm-rust-win32host windows
 ```
 
 An explicitly supplied `--preview` command takes precedence over the native
@@ -209,7 +210,7 @@ window thumbnail.
 On Windows, list running processes in a structured picker:
 
 ```text
-nfm-rust-win32host listprocesses
+nfm-rust-win32host processes
 ```
 
 The picker displays Name, PID, working set, private bytes, and CPU time. It
@@ -232,7 +233,7 @@ NFM does not implicitly invoke a shell. Invoke one explicitly when the preview
 uses shell expressions or pipelines:
 
 ```powershell
-nfm-rust-win32host filewalker `
+nfm-rust-win32host filesystem `
     --preview pwsh `
     --preview-arg -NoProfile `
     --preview-arg -Command `
@@ -242,7 +243,7 @@ nfm-rust-win32host filewalker `
 To preview file contents:
 
 ```powershell
-nfm-rust-win32host filewalker `
+nfm-rust-win32host filesystem `
     --preview pwsh `
     --preview-arg -NoProfile `
     --preview-arg -Command `
@@ -254,7 +255,7 @@ is captured through a pipe rather than a terminal, commands must be told to
 emit colors. For example, use `bat` with color forced and paging disabled:
 
 ```powershell
-nfm-rust-win32host filewalker `
+nfm-rust-win32host filesystem `
     --preview pwsh `
     --preview-arg -NoProfile `
     --preview-arg -Command `
@@ -271,7 +272,7 @@ selected preview item and center line as individual process arguments, so a
 shell is not required. To render the first video frame as an image:
 
 ```powershell
-nfm-rust-win32host filewalker `
+nfm-rust-win32host filesystem `
     --preview ffmpeg `
     --preview-type image `
     --preview-arg '-loglevel' `
@@ -296,7 +297,7 @@ item by returning one configured profile name on stdout. Profiles are trusted
 commands configured with `--preview-command` and related options:
 
 ```powershell
-nfm-rust-win32host filewalker `
+nfm-rust-win32host filesystem `
     --preview-resolver classify-preview.exe `
     --preview-resolver-arg '{item}' `
     --preview-command text bat `
