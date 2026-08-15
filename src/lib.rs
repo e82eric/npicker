@@ -1,7 +1,6 @@
 pub mod action;
 #[cfg(windows)]
 mod clipboard;
-mod delimited_store;
 #[cfg(windows)]
 pub mod ffi;
 pub mod key_binding;
@@ -9,11 +8,34 @@ pub mod key_binding;
 pub mod list_processes;
 #[cfg(windows)]
 pub mod list_windows;
+mod picker_snapshot;
+#[cfg(windows)]
+pub use picker_snapshot::{ProcessPickerItem, WindowPickerItem};
 pub mod preview;
-mod preview_document;
 pub mod request;
-pub mod selection;
 pub mod skia_ui;
-pub mod source_store;
-mod structured_store;
 pub mod view_model;
+
+use serde::Serialize;
+
+pub trait PickerItem: Clone + Serialize + Send + Sync + 'static {
+    fn value(&self) -> &str;
+}
+
+impl PickerItem for String {
+    fn value(&self) -> &str {
+        self
+    }
+}
+
+impl PickerItem for nfm_picker_sources::structured::StructuredPickerItem {
+    fn value(&self) -> &str {
+        &self.value
+    }
+}
+
+impl PickerItem for nfm_picker_sources::delimited::DelimitedPickerItem {
+    fn value(&self) -> &str {
+        &self.value
+    }
+}

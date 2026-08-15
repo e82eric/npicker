@@ -128,6 +128,8 @@ pub struct PublishedSnapshot {
 }
 
 impl ItemsSource for PublishedSnapshot {
+    type Item = String;
+
     fn version(&self) -> u64 {
         self.version
     }
@@ -153,6 +155,10 @@ impl ItemsSource for PublishedSnapshot {
     fn get_string_lossy(&self, node_index: usize, out: &mut Vec<u8>) -> String {
         self.path_utf8(node_index, out);
         String::from_utf8_lossy(out).into_owned()
+    }
+
+    fn item(&self, node_index: usize) -> Option<Self::Item> {
+        (node_index < self.node_count).then(|| self.get_string_lossy(node_index, &mut Vec::new()))
     }
 }
 

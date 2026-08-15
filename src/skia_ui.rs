@@ -1,23 +1,23 @@
 #![allow(unsafe_op_in_unsafe_fn, unused_unsafe)]
 
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::ops::Range;
+use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
-use crossbeam_channel::Receiver;
 use skia_safe::{
-    surfaces, Canvas, Color, Data, Font, FontMgr, FontStyle, Image, Paint, PaintStyle, RRect,
-    Rect as SkRect, Surface,
+    surfaces, BlurStyle, Canvas, Color, Data, Font, FontMgr, FontStyle, Image, MaskFilter, Paint,
+    PaintStyle, RRect, Rect as SkRect, Surface,
 };
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, SIZE, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, CreateCompatibleDC, CreateDIBSection, CreateSolidBrush, DeleteDC, DeleteObject,
     EndPaint, GetMonitorInfoW, InvalidateRect, MonitorFromPoint, MonitorFromWindow, SelectObject,
-    UpdateWindow, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, HBITMAP, HDC, HGDIOBJ,
-    MONITORINFO, MONITOR_DEFAULTTONEAREST, PAINTSTRUCT,
+    UpdateWindow, AC_SRC_ALPHA, AC_SRC_OVER, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, BLENDFUNCTION,
+    DIB_RGB_COLORS, HBITMAP, HDC, HGDIOBJ, MONITORINFO, MONITOR_DEFAULTTONEAREST, PAINTSTRUCT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
@@ -30,16 +30,16 @@ use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DispatchMessageW, GetCaretBlinkTime, GetForegroundWindow,
     GetMessageW, GetWindowLongPtrW, KillTimer, LoadCursorW, PostMessageW, PostQuitMessage,
     RegisterClassW, SetForegroundWindow, SetTimer, SetWindowLongPtrW, ShowWindow, TranslateMessage,
-    UpdateLayeredWindow, CREATESTRUCTW, GWLP_USERDATA, IDC_ARROW, MSG, SW_HIDE, SW_SHOW,
-    ULW_OPAQUE, WM_APP, WM_CHAR, WM_DESTROY, WM_DPICHANGED, WM_ERASEBKGND, WM_KEYDOWN, WM_NCCREATE,
-    WM_PAINT, WM_TIMER, WNDCLASSW, WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    UpdateLayeredWindow, CREATESTRUCTW, GWLP_USERDATA, IDC_ARROW, MSG, SW_HIDE, SW_SHOW, ULW_ALPHA,
+    WM_APP, WM_CHAR, WM_DESTROY, WM_DPICHANGED, WM_ERASEBKGND, WM_KEYDOWN, WM_NCCREATE, WM_PAINT,
+    WM_TIMER, WNDCLASSW, WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 
 use crate::key_binding::{KeyChord, KeyName};
+use crate::preview::document::PreviewStyle;
 use crate::preview::{NativeWindowId, PreviewLine, PreviewUpdate};
-use crate::preview_document::PreviewStyle;
 use crate::view_model::{
-    DisplaySearchResult, KeyModifiers, PreviewView, UiCounters, UiEvent, ViewModel,
+    DisplaySearchResult, KeyModifiers, PreviewView, UiCounters, UiEvent, UiEventSink, ViewModel,
 };
 
 const DEFAULT_WIDTH: i32 = 1600;
@@ -50,6 +50,11 @@ const MONITOR_VERTICAL_MARGIN: i32 = 160;
 const DISPLAY_ROWS: i32 = 7;
 const PREVIEW_ROWS: i32 = 20;
 const PADDING: f32 = 8.0;
+const WINDOW_CORNER_RADIUS: f32 = 12.0;
+const WINDOW_PANEL_INSET: f32 = 6.0;
+const WINDOW_SHADOW_OFFSET: f32 = 1.5;
+const WINDOW_AMBIENT_SHADOW_BLUR: f32 = 6.0;
+const WINDOW_CONTACT_SHADOW_BLUR: f32 = 2.5;
 const PANEL_BORDER: f32 = 2.0;
 const PANEL_HORIZONTAL_PADDING: f32 = 16.0;
 const PANEL_VERTICAL_PADDING: f32 = 10.0;
@@ -68,7 +73,6 @@ const WM_UI_UPDATE: u32 = WM_APP + 1;
 const WM_UI_BRING_TO_FOREGROUND: u32 = WM_APP + 2;
 const WM_CURSOR_BLINK: u32 = WM_APP + 3;
 const WM_SHOW_ROOT: u32 = WM_APP + 4;
-const WM_EXIT: u32 = WM_APP + 5;
 const WM_PREVIEW_LOADING: u32 = WM_APP + 6;
 const WM_INDEXING_SPINNER: u32 = WM_APP + 7;
 const WM_TOAST: u32 = WM_APP + 8;
@@ -78,8 +82,10 @@ const INDEXING_SPINNER_FRAME_COUNT: usize = 8;
 const DEFAULT_HEIGHT: i32 = 320;
 const FONT_FAMILY: &str = "Hack Nerd Font";
 const FONT_SIZE: f32 = 15.0;
-const COLOR_BACKGROUND: u32 = 0x282828;
-const COLOR_TEXT: u32 = 0xebdbb2;
+const COLOR_BACKGROUND: u32 = 0x2d2d2d;
+const COLOR_DIVIDER: u32 = 0x665f56;
+const COLOR_PANEL_EDGE: u32 = 0x77716a;
+const COLOR_TEXT: u32 = 0xf2e5c4;
 const COLOR_BORDER: u32 = 0x928374;
 const COLOR_MATCH: u32 = 0xfb4934;
 const COLOR_SELECTED: u32 = 0x3c3836;
@@ -101,7 +107,7 @@ pub fn set_preferred_center(x: i32, y: i32) {
 
 pub fn run(
     view_model: Arc<ViewModel>,
-    completion: Option<Receiver<i32>>,
+    view: Arc<ViewHandle>,
     preview_available: bool,
     preview_visible: bool,
 ) -> Result<i32> {
@@ -124,10 +130,9 @@ pub fn run(
         }
 
         let screen_location = calculate_window_location();
-        let shared = Arc::new(Mutex::new(SharedUiState::default()));
         let state = Box::new(WindowState::new(
             Arc::clone(&view_model),
-            Arc::clone(&shared),
+            Arc::clone(&view),
             screen_location.x as f32,
             screen_location.y as f32,
             screen_location.width as f32,
@@ -153,32 +158,7 @@ pub fn run(
         )
         .context("CreateWindowExW failed")?;
 
-        let events = view_model.subscribe();
-        let raw_hwnd = hwnd.0 as usize;
-        std::thread::spawn(move || {
-            while let Ok(event) = events.recv() {
-                let hwnd = HWND(raw_hwnd as *mut c_void);
-                shared
-                    .lock()
-                    .expect("shared UI state poisoned")
-                    .events
-                    .push(event);
-                unsafe {
-                    let _ = PostMessageW(Some(hwnd), WM_UI_UPDATE, WPARAM(0), LPARAM(0));
-                }
-            }
-        });
-
-        if let Some(completion) = completion {
-            std::thread::spawn(move || {
-                if let Ok(code) = completion.recv() {
-                    let hwnd = HWND(raw_hwnd as *mut c_void);
-                    unsafe {
-                        let _ = PostMessageW(Some(hwnd), WM_EXIT, WPARAM(code as usize), LPARAM(0));
-                    }
-                }
-            });
-        }
+        view.attach(hwnd);
 
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
@@ -258,6 +238,12 @@ impl GdiBackBuffer {
                 row_bytes,
             );
         }
+        let blend = BLENDFUNCTION {
+            BlendOp: AC_SRC_OVER as u8,
+            BlendFlags: 0,
+            SourceConstantAlpha: u8::MAX,
+            AlphaFormat: AC_SRC_ALPHA as u8,
+        };
         UpdateLayeredWindow(
             hwnd,
             None,
@@ -272,8 +258,8 @@ impl GdiBackBuffer {
             Some(self.dc),
             Some(&POINT { x: 0, y: 0 }),
             COLORREF(0),
-            None,
-            ULW_OPAQUE,
+            Some(&blend),
+            ULW_ALPHA,
         )
         .context("UpdateLayeredWindow failed")
     }
@@ -291,7 +277,7 @@ impl Drop for GdiBackBuffer {
 
 struct WindowState {
     view_model: Arc<ViewModel>,
-    shared: Arc<Mutex<SharedUiState>>,
+    view: Arc<ViewHandle>,
     surface: Option<Surface>,
     back_buffer: Option<GdiBackBuffer>,
     font: Font,
@@ -309,12 +295,12 @@ struct WindowState {
     results_header: Option<String>,
     counters: UiCounters,
     selected_row: usize,
-    indexing_spinner_frame: usize,
     visible: bool,
     window_shown: bool,
     last_window_location: Option<ScreenLocation>,
     logged_first_items_paint: bool,
     cursor_visible: bool,
+    indexing_spinner_frame: usize,
     preview_available: bool,
     preview_enabled: bool,
     preview_generation: u64,
@@ -366,9 +352,49 @@ struct Layout {
     text_height: f32,
 }
 
-#[derive(Default)]
-struct SharedUiState {
-    events: Vec<UiEvent>,
+pub struct ViewHandle {
+    hwnd: AtomicUsize,
+    events: Mutex<Vec<UiEvent>>,
+}
+
+impl ViewHandle {
+    pub fn new() -> Self {
+        Self {
+            hwnd: AtomicUsize::new(0),
+            events: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn attach(&self, hwnd: HWND) {
+        self.hwnd.store(hwnd.0 as usize, Ordering::Release);
+        if !self
+            .events
+            .lock()
+            .expect("view event queue poisoned")
+            .is_empty()
+        {
+            self.post_update(hwnd);
+        }
+    }
+
+    fn post_update(&self, hwnd: HWND) {
+        unsafe {
+            let _ = PostMessageW(Some(hwnd), WM_UI_UPDATE, WPARAM(0), LPARAM(0));
+        }
+    }
+}
+
+impl UiEventSink for ViewHandle {
+    fn publish(&self, event: UiEvent) {
+        self.events
+            .lock()
+            .expect("view event queue poisoned")
+            .push(event);
+        let hwnd = self.hwnd.load(Ordering::Acquire);
+        if hwnd != 0 {
+            self.post_update(HWND(hwnd as *mut c_void));
+        }
+    }
 }
 
 struct DwmThumbnailPreview {
@@ -529,7 +555,7 @@ fn calculate_layout(
     let list_border_width = (window.width - (padding * 2.0)).max(0.0);
     let row_size = Size {
         height: text_height + (RESULT_VERTICAL_PADDING * 2.0) + RESULT_GAP,
-        width: (list_border_width - ((PANEL_BORDER + PANEL_HORIZONTAL_PADDING) * 2.0)).max(0.0),
+        width: (list_border_width - PANEL_HORIZONTAL_PADDING * 2.0).max(0.0),
     };
     let list_border = Rect {
         x: padding,
@@ -537,25 +563,24 @@ fn calculate_layout(
         width: (window.width - (padding * 2.0)).max(0.0),
         height: (number_of_items as f32 * (text_height + RESULT_VERTICAL_PADDING * 2.0))
             + ((number_of_items - 1).max(0) as f32 * RESULT_GAP)
-            + (PANEL_VERTICAL_PADDING * 2.0)
-            + (PANEL_BORDER * 2.0),
+            + (PANEL_VERTICAL_PADDING * 2.0),
     };
     let list_box = Rect {
-        x: list_border.x + PANEL_BORDER + PANEL_HORIZONTAL_PADDING,
-        y: list_border.y + PANEL_BORDER + PANEL_VERTICAL_PADDING,
+        x: list_border.x + PANEL_HORIZONTAL_PADDING,
+        y: list_border.y + PANEL_VERTICAL_PADDING,
         width: row_size.width,
         height: (list_border.height - ((PANEL_BORDER + PANEL_VERTICAL_PADDING) * 2.0)).max(0.0),
     };
     let search_border = Rect {
         x: padding,
-        y: list_border.y + list_border.height + PANEL_GAP,
+        y: list_border.y + list_border.height,
         width: (window.width - (padding * 2.0)).max(0.0),
-        height: text_height + (QUERY_VERTICAL_PADDING * 2.0) + (PANEL_BORDER * 2.0),
+        height: text_height + (QUERY_VERTICAL_PADDING * 2.0),
     };
     let search_box = Rect {
-        x: search_border.x + PANEL_BORDER + PANEL_HORIZONTAL_PADDING,
-        y: search_border.y + PANEL_BORDER + QUERY_VERTICAL_PADDING,
-        width: (search_border.width - ((PANEL_BORDER + PANEL_HORIZONTAL_PADDING) * 2.0)).max(0.0),
+        x: search_border.x + PANEL_HORIZONTAL_PADDING,
+        y: search_border.y + QUERY_VERTICAL_PADDING,
+        width: (search_border.width - PANEL_HORIZONTAL_PADDING * 2.0).max(0.0),
         height: text_height,
     };
     Layout {
@@ -578,12 +603,11 @@ fn desired_window_height(
     number_of_items: i32,
     preview_enabled: bool,
 ) -> i32 {
-    let search_border_height = text_height + (QUERY_VERTICAL_PADDING * 2.0) + (PANEL_BORDER * 2.0);
+    let search_border_height = text_height + (QUERY_VERTICAL_PADDING * 2.0);
     let list_border_height = (number_of_items as f32
         * (text_height + RESULT_VERTICAL_PADDING * 2.0))
         + ((number_of_items - 1).max(0) as f32 * RESULT_GAP)
-        + (PANEL_VERTICAL_PADDING * 2.0)
-        + (PANEL_BORDER * 2.0);
+        + (PANEL_VERTICAL_PADDING * 2.0);
     let preview_height = if preview_enabled {
         PREVIEW_ROWS as f32 * text_height
             + PANEL_VERTICAL_PADDING * 2.0
@@ -592,14 +616,13 @@ fn desired_window_height(
     } else {
         0.0
     };
-    (padding + preview_height + list_border_height + PANEL_GAP + search_border_height + padding)
-        .ceil() as i32
+    (padding + preview_height + list_border_height + search_border_height + padding).ceil() as i32
 }
 
 impl WindowState {
     fn new(
         view_model: Arc<ViewModel>,
-        shared: Arc<Mutex<SharedUiState>>,
+        view: Arc<ViewHandle>,
         _left: f32,
         _top: f32,
         width: f32,
@@ -640,10 +663,12 @@ impl WindowState {
 
         let app_layout =
             calculate_layout(window, PADDING, DISPLAY_ROWS, text_height, preview_visible);
+        let mut muted_paint = fill_paint(COLOR_TEXT);
+        muted_paint.set_alpha(150);
 
         Ok(Self {
             view_model,
-            shared,
+            view,
             surface: None,
             back_buffer: None,
             font,
@@ -652,7 +677,7 @@ impl WindowState {
             bold_italic_font,
             counter_font,
             text_paint: fill_paint(COLOR_TEXT),
-            muted_paint: fill_paint(COLOR_TEXT),
+            muted_paint,
             highlight_paint: fill_paint(COLOR_MATCH),
             selected_paint: fill_paint(COLOR_SELECTED),
             selected_accent_paint: fill_paint(COLOR_SELECTED_ACCENT),
@@ -661,12 +686,12 @@ impl WindowState {
             results_header: None,
             counters: UiCounters::default(),
             selected_row: 0,
-            indexing_spinner_frame: 0,
             visible: false,
             window_shown: false,
             last_window_location: None,
             logged_first_items_paint: false,
             cursor_visible: false,
+            indexing_spinner_frame: 0,
             preview_available,
             preview_enabled: preview_visible,
             preview_generation: 0,
@@ -688,8 +713,8 @@ impl WindowState {
 
     fn apply_pending(&mut self, hwnd: HWND) {
         let events = {
-            let mut pending = self.shared.lock().expect("shared UI state poisoned");
-            std::mem::take(&mut pending.events)
+            let mut pending = self.view.events.lock().expect("view event queue poisoned");
+            std::mem::take(&mut *pending)
         };
         for event in events {
             match event {
@@ -841,6 +866,9 @@ impl WindowState {
                     self.toast = None;
                     self.logged_first_items_paint = false;
                 },
+                UiEvent::Exit(code) => unsafe {
+                    PostQuitMessage(code);
+                },
             }
         }
         unsafe {
@@ -959,13 +987,66 @@ impl WindowState {
             return Ok(());
         };
         let canvas = surface.canvas();
-        canvas.clear(skia_color(COLOR_BACKGROUND));
+        canvas.clear(Color::TRANSPARENT);
         let frame_save_count = canvas.save();
         canvas.reset_matrix();
         canvas.scale((scale, scale));
+        let location = self
+            .last_window_location
+            .context("window location not initialized")?;
+        let panel = Rect {
+            x: WINDOW_PANEL_INSET,
+            y: WINDOW_PANEL_INSET,
+            width: (location.width as f32 / scale - WINDOW_PANEL_INSET * 2.0).max(0.0),
+            height: (location.height as f32 / scale - WINDOW_PANEL_INSET * 2.0).max(0.0),
+        };
+        let mut ambient_shadow = fill_paint(0x000000);
+        ambient_shadow.set_alpha(95);
+        ambient_shadow.set_mask_filter(MaskFilter::blur(
+            BlurStyle::Normal,
+            WINDOW_AMBIENT_SHADOW_BLUR,
+            false,
+        ));
+        draw_skia_round_rect(canvas, &ambient_shadow, panel, WINDOW_CORNER_RADIUS);
+        let mut contact_shadow = fill_paint(0x000000);
+        contact_shadow.set_alpha(145);
+        contact_shadow.set_mask_filter(MaskFilter::blur(
+            BlurStyle::Normal,
+            WINDOW_CONTACT_SHADOW_BLUR,
+            false,
+        ));
+        draw_skia_round_rect(
+            canvas,
+            &contact_shadow,
+            Rect {
+                y: panel.y + WINDOW_SHADOW_OFFSET,
+                ..panel
+            },
+            WINDOW_CORNER_RADIUS,
+        );
+        draw_skia_round_rect(
+            canvas,
+            &fill_paint(COLOR_BACKGROUND),
+            panel,
+            WINDOW_CORNER_RADIUS,
+        );
+        draw_skia_round_rect(
+            canvas,
+            &stroke_paint(COLOR_PANEL_EDGE, 1.0),
+            panel,
+            WINDOW_CORNER_RADIUS,
+        );
 
         if let (Some(border), Some(area)) = (self.layout.preview_border, self.layout.preview_box) {
-            draw_skia_round_rect(canvas, &self.stroke_paint, border, 8.0);
+            let divider_y = border.y + border.height + PANEL_GAP / 2.0;
+            canvas.draw_line(
+                (border.x + PANEL_HORIZONTAL_PADDING, divider_y),
+                (
+                    border.x + border.width - PANEL_HORIZONTAL_PADDING,
+                    divider_y,
+                ),
+                &stroke_paint(COLOR_DIVIDER, 1.0),
+            );
             if let Some(image) = &self.preview_image {
                 let scale =
                     (area.width / image.width() as f32).min(area.height / image.height() as f32);
@@ -1049,7 +1130,19 @@ impl WindowState {
         let search = self.view_model.current_search_text();
         let prompt = "> ";
         let prompt_width = skia_text_width(&self.font, &self.text_paint, prompt);
-        draw_skia_round_rect(canvas, &self.stroke_paint, self.layout.search_border, 8.0);
+        let divider_y = self.layout.search_border.y;
+        canvas.draw_line(
+            (
+                self.layout.search_border.x + PANEL_HORIZONTAL_PADDING,
+                divider_y,
+            ),
+            (
+                self.layout.search_border.x + self.layout.search_border.width
+                    - PANEL_HORIZONTAL_PADDING,
+                divider_y,
+            ),
+            &stroke_paint(COLOR_DIVIDER, 1.0),
+        );
         if let Some(selection) = search.selection {
             let prefix_width = skia_text_width(
                 &self.font,
@@ -1083,7 +1176,7 @@ impl WindowState {
             draw_skia_text(
                 canvas,
                 &self.font,
-                &self.text_paint,
+                &self.selected_accent_paint,
                 prompt,
                 self.layout.search_box,
                 TextAlign::Left,
@@ -1135,7 +1228,6 @@ impl WindowState {
             TextAlign::Right,
         );
 
-        draw_skia_round_rect(canvas, &self.stroke_paint, self.layout.list_border, 8.0);
         if let Some(header) = &self.results_header {
             let header_rect = Rect {
                 x: self.layout.list_box.x,
@@ -1200,18 +1292,11 @@ impl WindowState {
                 width: (self.layout.list_box.width - RESULT_HORIZONTAL_PADDING * 2.0).max(0.0),
                 height: self.layout.text_height,
             };
-            draw_skia_text(
-                canvas,
-                &self.font,
-                &self.text_paint,
-                &result.result.path,
-                text_rect,
-                TextAlign::Left,
-            );
             draw_skia_highlights(
                 canvas,
                 &self.font,
                 &self.bold_font,
+                &self.text_paint,
                 &self.highlight_paint,
                 &result.result.path,
                 &result.positions,
@@ -1268,18 +1353,11 @@ impl WindowState {
                 if index == autocomplete.selected {
                     draw_skia_round_rect(canvas, &self.selected_paint, row, 6.0);
                 }
-                draw_skia_text(
-                    canvas,
-                    &self.font,
-                    &self.text_paint,
-                    &suggestion.text,
-                    row,
-                    TextAlign::Left,
-                );
                 draw_skia_highlights(
                     canvas,
                     &self.font,
                     &self.bold_font,
+                    &self.text_paint,
                     &self.highlight_paint,
                     &suggestion.text,
                     &suggestion.positions,
@@ -1527,10 +1605,6 @@ unsafe extern "system" fn wnd_proc(
             }
             LRESULT(0)
         }
-        WM_EXIT => {
-            PostQuitMessage(wparam.0 as i32);
-            LRESULT(0)
-        }
         WM_DESTROY => {
             let state = window_state(hwnd);
             if !state.is_null() {
@@ -1775,37 +1849,65 @@ fn draw_skia_highlights(
     canvas: &Canvas,
     normal_font: &Font,
     highlight_font: &Font,
-    paint: &Paint,
+    normal_paint: &Paint,
+    highlight_paint: &Paint,
     text: &str,
     positions: &[usize],
     rect: Rect,
 ) {
-    for &position in positions {
-        if !text.is_char_boundary(position) {
-            continue;
-        }
-        let Some(character) = text[position..].chars().next() else {
-            continue;
+    let save = canvas.save();
+    canvas.clip_rect(
+        SkRect::from_xywh(rect.x, rect.y, rect.width, rect.height),
+        None,
+        Some(false),
+    );
+    let mut x = rect.x;
+    for (range, highlighted) in highlight_ranges(text, positions) {
+        let (font, paint) = if highlighted {
+            (highlight_font, highlight_paint)
+        } else {
+            (normal_font, normal_paint)
         };
-        let prefix = &text[..position];
-        let x = rect.x + skia_text_width(normal_font, paint, prefix);
-        if x >= rect.x + rect.width {
-            break;
-        }
+        let span = &text[range];
+        let width = skia_text_width(font, paint, span);
         draw_skia_text(
             canvas,
-            highlight_font,
+            font,
             paint,
-            &character.to_string(),
+            span,
             Rect {
                 x,
-                y: rect.y,
                 width: rect.x + rect.width - x,
-                height: rect.height,
+                ..rect
             },
             TextAlign::Left,
         );
+        x += width;
+        if x >= rect.x + rect.width {
+            break;
+        }
     }
+    canvas.restore_to_count(save);
+}
+
+fn highlight_ranges(text: &str, positions: &[usize]) -> Vec<(Range<usize>, bool)> {
+    let mut ranges = Vec::new();
+    let mut start = 0;
+    let mut highlighted = false;
+    for (position, _) in text.char_indices() {
+        let next_highlighted = positions.binary_search(&position).is_ok();
+        if next_highlighted != highlighted {
+            if start < position {
+                ranges.push((start..position, highlighted));
+            }
+            start = position;
+            highlighted = next_highlighted;
+        }
+    }
+    if start < text.len() {
+        ranges.push((start..text.len(), highlighted));
+    }
+    ranges
 }
 
 fn draw_skia_preview_line(
@@ -1885,7 +1987,7 @@ fn resolved_preview_colors(style: &PreviewStyle) -> (u32, Option<u32>) {
     )
 }
 
-fn ansi_color_value(color: crate::preview_document::AnsiColor) -> u32 {
+fn ansi_color_value(color: crate::preview::document::AnsiColor) -> u32 {
     let (red, green, blue) = color.rgb();
     ((red as u32) << 16) | ((green as u32) << 8) | blue as u32
 }
@@ -1904,7 +2006,8 @@ fn wide_null(value: &str) -> Vec<u16> {
 #[cfg(test)]
 mod tests {
     use super::{
-        active_token_start, calculate_layout, fit_thumbnail_rect, Rect, DISPLAY_ROWS, PADDING,
+        active_token_start, calculate_layout, fit_thumbnail_rect, highlight_ranges, Rect,
+        DISPLAY_ROWS, PADDING,
     };
     use windows::Win32::Foundation::{RECT, SIZE};
 
@@ -1966,5 +2069,13 @@ mod tests {
         assert_eq!(active_token_start(text, text.len()), 21);
         assert_eq!(active_token_start("/:Name", 6), 0);
         assert_eq!(active_token_start("needle ", 7), 7);
+    }
+
+    #[test]
+    fn highlight_ranges_include_a_match_at_the_end_of_the_text() {
+        assert_eq!(
+            highlight_ranges("Chrome", &[0, 1, 2, 3, 4, 5]),
+            vec![(0..6, true)]
+        );
     }
 }

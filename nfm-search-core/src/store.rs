@@ -1,6 +1,7 @@
 use crate::fuzzy_search_session::SearchSnapshotProvider;
 use crate::snapshot_store::SnapshotStore;
 use std::cmp::Ordering as CmpOrdering;
+use std::ops::Range;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -42,7 +43,17 @@ const ITEM_CHUNK_SIZE: usize = 64 * 1024;
 const BYTE_CHUNK_SIZE: usize = 1024 * 1024;
 const PUBLISH_ITEM_INTERVAL: usize = 1_000;
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SearchCompletion {
+    pub text: String,
+    pub positions: Vec<usize>,
+    pub replacement: String,
+    pub replace: Range<usize>,
+}
+
 pub trait ItemsSource {
+    type Item: Clone;
+
     fn version(&self) -> u64;
     fn len(&self) -> usize;
     fn is_empty(&self) -> bool;
@@ -55,10 +66,28 @@ pub trait ItemsSource {
 
     fn get_string_lossy(&self, node_index: usize, out: &mut Vec<u8>) -> String;
 
+    fn item(&self, node_index: usize) -> Option<Self::Item>;
+
     fn create_search_plan(&self, query: &str) -> Box<dyn SearchPlan + '_> {
         Box::new(PlainSearchPlan {
             query: query.to_owned(),
         })
+    }
+
+    fn header(&self, _query: &str) -> Option<String> {
+        None
+    }
+
+    fn display_text(&self, _node_index: usize, _query: &str) -> Option<String> {
+        None
+    }
+
+    fn completions(&self, _input: &str, _cursor: usize) -> Vec<SearchCompletion> {
+        Vec::new()
+    }
+
+    fn effective_query(&self, input: &str) -> String {
+        input.to_owned()
     }
 }
 
@@ -195,6 +224,8 @@ impl StreamingItemSnapshot {
 }
 
 impl ItemsSource for StreamingItemSnapshot {
+    type Item = String;
+
     fn version(&self) -> u64 {
         self.version
     }
@@ -223,10 +254,16 @@ impl ItemsSource for StreamingItemSnapshot {
         let mut stack_buffer = [0u8; 4096];
         let result = self.get_string(node_index, &mut stack_buffer, out);
         String::from_utf8_lossy(result).into_owned()
+    }
+
+    fn item(&self, node_index: usize) -> Option<Self::Item> {
+        (node_index < self.len()).then(|| self.get_string_lossy(node_index, &mut Vec::new()))
     }
 }
 
 impl<T: Copy> ItemsSource for StreamingItemSnapshotWithPayload<T> {
+    type Item = T;
+
     fn version(&self) -> u64 {
         self.version
     }
@@ -255,6 +292,10 @@ impl<T: Copy> ItemsSource for StreamingItemSnapshotWithPayload<T> {
         let mut stack_buffer = [0u8; 4096];
         let result = self.get_string(node_index, &mut stack_buffer, out);
         String::from_utf8_lossy(result).into_owned()
+    }
+
+    fn item(&self, node_index: usize) -> Option<Self::Item> {
+        (node_index < self.len()).then(|| *self.payload(node_index))
     }
 }
 
@@ -410,7 +451,9 @@ impl<T: Copy + Default + Send + Sync + 'static>
     }
 }
 
-impl<T> ItemsSource for FlatSnapshot<T> {
+impl<T: Clone> ItemsSource for FlatSnapshot<T> {
+    type Item = T;
+
     fn version(&self) -> u64 {
         self.version
     }
@@ -434,6 +477,10 @@ impl<T> ItemsSource for FlatSnapshot<T> {
 
     fn get_string_lossy(&self, node_index: usize, _out: &mut Vec<u8>) -> String {
         String::from_utf8_lossy(self.item_bytes(node_index)).into_owned()
+    }
+
+    fn item(&self, node_index: usize) -> Option<Self::Item> {
+        self.payloads.get(node_index).cloned()
     }
 }
 

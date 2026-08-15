@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::io::Read;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -9,8 +8,7 @@ use std::time::{Duration, Instant};
 use crossbeam_channel::{bounded, RecvTimeoutError, Sender};
 use serde::{Deserialize, Serialize};
 
-use crate::selection::SelectedItem;
-use crate::view_model::ViewModelEvent;
+use crate::PickerItem;
 
 const OUTPUT_LIMIT: usize = 64 * 1024;
 const TIMEOUT: Duration = Duration::from_secs(2);
@@ -21,22 +19,26 @@ pub struct ActionResolverDefinition {
     pub arguments: Vec<String>,
 }
 
-pub type NativeActionResolver = fn(&ActionState) -> Result<ActionResolution, String>;
+pub type NativeActionResolver<I> =
+    Arc<dyn Fn(&ActionState<I>) -> Result<ActionResolution, String> + Send + Sync>;
 
-#[derive(Clone, Debug)]
-pub enum ActionDefinition {
+pub enum ActionDefinition<I> {
     Process(ActionResolverDefinition),
-    Native(NativeActionResolver),
+    Native(NativeActionResolver<I>),
 }
 
-#[derive(Clone, Debug, Default)]
-pub struct ActionConfig {
-    pub resolvers: HashMap<String, ActionDefinition>,
+impl<I> Clone for ActionDefinition<I> {
+    fn clone(&self) -> Self {
+        match self {
+            Self::Process(definition) => Self::Process(definition.clone()),
+            Self::Native(resolve) => Self::Native(Arc::clone(resolve)),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]
-pub struct ActionState {
-    pub selection: Option<SelectedItem>,
+pub struct ActionState<I> {
+    pub selection: Option<I>,
     pub picker: PickerState,
     pub query: String,
 }
@@ -58,74 +60,78 @@ pub enum ActionResolution {
 }
 
 #[derive(Clone, Debug)]
-pub struct ActionEvent {
+pub struct ActionEvent<I> {
     pub generation: u64,
-    pub state: ActionState,
+    pub state: ActionState<I>,
     pub result: Result<ActionResolution, String>,
 }
 
-pub struct ActionService {
-    config: ActionConfig,
+pub struct ActionController {
+    generation: Arc<AtomicU64>,
 }
 
-impl ActionService {
-    pub fn new(config: ActionConfig) -> Self {
-        Self { config }
+pub struct PreparedAction {
+    run: Box<dyn FnOnce(u64, Arc<AtomicU64>) + Send>,
+}
+
+impl PreparedAction {
+    pub fn new<I, F>(definition: ActionDefinition<I>, state: ActionState<I>, completed: F) -> Self
+    where
+        I: PickerItem,
+        F: FnOnce(ActionEvent<I>) + Send + 'static,
+    {
+        Self {
+            run: Box::new(move |generation, current_generation| {
+                std::thread::spawn(move || {
+                    let result = match definition {
+                        ActionDefinition::Process(definition) => {
+                            run_resolver(&definition, &state, generation, &current_generation)
+                        }
+                        ActionDefinition::Native(resolve) => resolve(&state),
+                    };
+                    if current_generation.load(Ordering::Acquire) == generation {
+                        completed(ActionEvent {
+                            generation,
+                            state,
+                            result,
+                        });
+                    }
+                });
+            }),
+        }
     }
 
-    pub(crate) fn into_controller(self, events: Sender<ViewModelEvent>) -> ActionController {
-        ActionController {
-            definitions: Arc::new(self.config.resolvers),
-            generation: Arc::new(AtomicU64::new(0)),
-            events,
+    pub fn from_task<T, F, C>(task: F, completed: C) -> Self
+    where
+        T: Send + 'static,
+        F: FnOnce() -> Result<T, String> + Send + 'static,
+        C: FnOnce(u64, Result<T, String>) + Send + 'static,
+    {
+        Self {
+            run: Box::new(move |generation, current_generation| {
+                std::thread::spawn(move || {
+                    let result = task();
+                    if current_generation.load(Ordering::Acquire) == generation {
+                        completed(generation, result);
+                    }
+                });
+            }),
         }
     }
 }
 
-impl Default for ActionService {
-    fn default() -> Self {
-        Self::new(ActionConfig::default())
-    }
-}
-
-pub struct ActionController {
-    definitions: Arc<HashMap<String, ActionDefinition>>,
-    generation: Arc<AtomicU64>,
-    events: Sender<ViewModelEvent>,
-}
-
 impl ActionController {
-    pub fn contains(&self, name: &str) -> bool {
-        self.definitions.contains_key(name)
+    pub(crate) fn new() -> Self {
+        ActionController {
+            generation: Arc::new(AtomicU64::new(0)),
+        }
     }
 
-    pub fn reserve(&self, name: &str) -> Option<u64> {
-        self.definitions
-            .contains_key(name)
-            .then(|| self.generation.fetch_add(1, Ordering::AcqRel) + 1)
-    }
-
-    pub fn request(&self, name: &str, generation: u64, state: ActionState) {
-        let Some(definition) = self.definitions.get(name).cloned() else {
-            return;
-        };
+    pub fn request(&self, action: PreparedAction) -> u64 {
+        let generation = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
         let current_generation = Arc::clone(&self.generation);
-        let events = self.events.clone();
-        std::thread::spawn(move || {
-            let result = match definition {
-                ActionDefinition::Process(definition) => {
-                    run_resolver(&definition, &state, generation, &current_generation)
-                }
-                ActionDefinition::Native(resolve) => resolve(&state),
-            };
-            if current_generation.load(Ordering::Acquire) == generation {
-                let _ = events.send(ViewModelEvent::Action(ActionEvent {
-                    generation,
-                    state,
-                    result,
-                }));
-            }
-        });
+        (action.run)(generation, current_generation);
+        generation
     }
 
     pub fn cancel(&self) {
@@ -147,9 +153,9 @@ enum PickerResponse {
     Filewalker { roots: Vec<String> },
 }
 
-fn run_resolver(
+fn run_resolver<I: PickerItem>(
     definition: &ActionResolverDefinition,
-    state: &ActionState,
+    state: &ActionState<I>,
     generation: u64,
     current_generation: &Arc<AtomicU64>,
 ) -> Result<ActionResolution, String> {
@@ -241,7 +247,7 @@ fn run_resolver(
                         state
                             .selection
                             .as_ref()
-                            .map(|selection| selection.item.clone())
+                            .map(|item| item.value().to_owned())
                             .unwrap_or(root)
                     } else {
                         root
@@ -306,12 +312,11 @@ mod tests {
     #[test]
     fn action_state_serializes_as_one_json_document() {
         let state = ActionState {
-            selection: Some(SelectedItem {
-                item: r"G:\src\file.rs".into(),
-                value: "value".into(),
-                line: Some(42),
-                fields: HashMap::new(),
-            }),
+            selection: Some(serde_json::json!({
+                "item": r"G:\src\file.rs",
+                "value": "value",
+                "line": 42,
+            })),
             picker: PickerState::Filewalker {
                 roots: vec![r"G:\src".into()],
             },

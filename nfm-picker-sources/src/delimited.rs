@@ -2,6 +2,13 @@ use std::sync::Arc;
 
 use nfm_search_core::store::{ChunkedSnapshot, ChunkedStorage, ItemsSource};
 
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+pub struct DelimitedPickerItem {
+    pub value: String,
+    pub preview_item: Option<String>,
+    pub preview_center_line: Option<usize>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DelimitedTextSelector {
     FullLine,
@@ -168,6 +175,8 @@ impl DelimitedStreamingSnapshot {
 }
 
 impl ItemsSource for DelimitedStreamingSnapshot {
+    type Item = DelimitedPickerItem;
+
     fn version(&self) -> u64 {
         self.version
     }
@@ -200,5 +209,17 @@ impl ItemsSource for DelimitedStreamingSnapshot {
     fn get_string_lossy(&self, index: usize, out: &mut Vec<u8>) -> String {
         let mut stack = [0; 4096];
         String::from_utf8_lossy(self.get_string(index, &mut stack, out)).into_owned()
+    }
+
+    fn item(&self, node_index: usize) -> Option<Self::Item> {
+        if node_index >= self.items_count {
+            return None;
+        }
+        let metadata = self.metadata(node_index);
+        Some(DelimitedPickerItem {
+            value: metadata.value,
+            preview_item: metadata.preview_item,
+            preview_center_line: metadata.preview_center_line,
+        })
     }
 }

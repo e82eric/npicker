@@ -10,6 +10,6 @@ impl ScanEventSink for FileSystemSearchStore {
     }
 
     fn complete(&self, _status: ScanStatus) {
-        self.complete();
+        SnapshotStore::complete(self);
     }
 }

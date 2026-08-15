@@ -1,32 +1,55 @@
-use crate::delimited_store::{DelimitedStreamingSnapshot, DelimitedStreamingStore};
-pub use crate::delimited_store::{DelimitedTextSelector, DelimitedValueSelector};
-use crate::source_store::{AnyItemSource, SharedStore};
-use crate::structured_store::{
+#[cfg(windows)]
+use crate::picker_snapshot::{ProcessPickerSnapshot, WindowPickerItem};
+use crate::PickerItem;
+use nfm_picker_sources::delimited::{DelimitedStreamingSnapshot, DelimitedStreamingStore};
+pub use nfm_picker_sources::delimited::{DelimitedTextSelector, DelimitedValueSelector};
+use nfm_picker_sources::structured::{
     StructuredSchema, StructuredStreamingSnapshot, StructuredStreamingStore,
 };
-use nfm_search_core::store::{
-    FlatSnapshot, ItemsSource, StreamingItemSnapshot, StreamingItemStore,
-};
+use nfm_search_core::snapshot_store::SnapshotStore;
+use nfm_search_core::source::{SearchSource, TypedSearchSource};
+use nfm_search_core::store::StreamingItemStore;
+use nfm_search_core::store::{FlatSnapshot, ItemsSource, StreamingItemSnapshot};
 use std::io::{BufRead, BufReader, Read};
 use std::sync::{Arc, Mutex};
 use std::thread;
+
+fn picker_source<S>(store: Arc<SnapshotStore<S>>) -> Arc<dyn SearchSource<Item = S::Item>>
+where
+    S: ItemsSource + Send + Sync + 'static,
+    S::Item: PickerItem,
+{
+    Arc::new(TypedSearchSource::new(store))
+}
+
+fn completed_picker_source<S>(snapshot: Arc<S>) -> Arc<dyn SearchSource<Item = S::Item>>
+where
+    S: ItemsSource + Send + Sync + 'static,
+    S::Item: PickerItem,
+{
+    let store = Arc::new(SnapshotStore::new());
+    store.publish(snapshot);
+    store.complete();
+    picker_source(store)
+}
 
 use crate::action::PickerState;
 #[cfg(windows)]
 use crate::list_processes::ProcessInfo;
 #[cfg(windows)]
-use crate::list_windows::{WindowListItem, WindowPayload};
-use crate::selection::SelectedItem;
+use crate::list_windows::WindowListItem;
 #[cfg(windows)]
 use nfm_file_system::walker::{start_scan, PublishedSnapshot, ScanOptions};
+#[cfg(windows)]
+use nfm_file_system::walker_search_store::FileSystemSearchStore;
 #[cfg(windows)]
 use std::path::PathBuf;
 
 pub trait PickerRequest {
-    type Source: ItemsSource;
+    type Source: ItemsSource<Item: PickerItem> + Send + Sync + 'static;
 
     fn search_string(&self) -> Option<&str>;
-    fn run(&self) -> Arc<SharedStore>;
+    fn run(&self) -> Arc<dyn SearchSource<Item = <Self::Source as ItemsSource>::Item>>;
     fn picker_state(&self) -> PickerState;
 }
 
@@ -47,13 +70,13 @@ impl PickerRequest for FileSystemPickerRequest {
         self.search_string.as_deref()
     }
 
-    fn run(&self) -> Arc<SharedStore> {
+    fn run(&self) -> Arc<dyn SearchSource<Item = <Self::Source as ItemsSource>::Item>> {
         let roots = if self.root_directories.is_empty() {
             vec![std::env::current_dir().expect("cannot get current directory")]
         } else {
             self.root_directories.iter().map(PathBuf::from).collect()
         };
-        let shared = Arc::new(SharedStore::new());
+        let shared = Arc::new(FileSystemSearchStore::new());
         start_scan(
             ScanOptions {
                 roots,
@@ -63,7 +86,7 @@ impl PickerRequest for FileSystemPickerRequest {
             },
             Arc::clone(&shared),
         );
-        shared
+        picker_source(shared)
     }
 
     fn picker_state(&self) -> PickerState {
@@ -79,19 +102,19 @@ pub struct FlatItemsPickerRequest {
 }
 
 impl PickerRequest for FlatItemsPickerRequest {
-    type Source = FlatSnapshot<()>;
+    type Source = StreamingItemSnapshot;
 
     fn search_string(&self) -> Option<&str> {
         self.search_string.as_deref()
     }
 
-    fn run(&self) -> Arc<SharedStore> {
-        let snapshot = Arc::new(FlatSnapshot::from_items(
-            self.items.iter().map(|item| (item, ())),
-        ));
-        Arc::new(SharedStore::completed(Arc::new(AnyItemSource::Flat(
-            snapshot,
-        ))))
+    fn run(&self) -> Arc<dyn SearchSource<Item = <Self::Source as ItemsSource>::Item>> {
+        let mut store = StreamingItemStore::new();
+        for item in &self.items {
+            store.add_item(item.as_bytes());
+        }
+        store.complete_adding();
+        completed_picker_source(store.snapshot())
     }
 
     fn picker_state(&self) -> PickerState {
@@ -106,20 +129,23 @@ pub struct WindowListPickerRequest {
 
 #[cfg(windows)]
 impl PickerRequest for WindowListPickerRequest {
-    type Source = FlatSnapshot<WindowPayload>;
+    type Source = FlatSnapshot<WindowPickerItem>;
 
     fn search_string(&self) -> Option<&str> {
         None
     }
 
-    fn run(&self) -> Arc<SharedStore> {
-        let snapshot =
-            Arc::new(FlatSnapshot::from_items(self.items.iter().map(|item| {
-                (item.text.as_str(), WindowPayload { hwnd: item.hwnd })
-            })));
-        Arc::new(SharedStore::completed(Arc::new(AnyItemSource::Windows(
-            snapshot,
-        ))))
+    fn run(&self) -> Arc<dyn SearchSource<Item = <Self::Source as ItemsSource>::Item>> {
+        let snapshot = Arc::new(FlatSnapshot::from_items(self.items.iter().map(|item| {
+            (
+                item.text.as_str(),
+                WindowPickerItem {
+                    title: item.text.clone(),
+                    native_window: item.hwnd,
+                },
+            )
+        })));
+        completed_picker_source(snapshot)
     }
 
     fn picker_state(&self) -> PickerState {
@@ -134,33 +160,14 @@ pub struct ProcessListPickerRequest {
 
 #[cfg(windows)]
 impl PickerRequest for ProcessListPickerRequest {
-    type Source = StructuredStreamingSnapshot;
+    type Source = ProcessPickerSnapshot;
 
     fn search_string(&self) -> Option<&str> {
         None
     }
 
-    fn run(&self) -> Arc<SharedStore> {
-        let schema = StructuredSchema::new(vec![
-            "Name".into(),
-            "PID".into(),
-            "WorkingSet".into(),
-            "PrivateBytes".into(),
-            "CPU".into(),
-        ])
-        .expect("process schema is valid");
-        let mut store = StructuredStreamingStore::new(schema);
-        for process in &self.items {
-            store.add_record(&csv::StringRecord::from(vec![
-                process.name.clone(),
-                process.pid.to_string(),
-                process.working_set_kb.to_string(),
-                process.private_bytes_kb.to_string(),
-                process.cpu_seconds.to_string(),
-            ])).expect("process record matches schema");
-        }
-        let source = Arc::new(AnyItemSource::Structured(store.snapshot()));
-        Arc::new(SharedStore::completed(source))
+    fn run(&self) -> Arc<dyn SearchSource<Item = <Self::Source as ItemsSource>::Item>> {
+        completed_picker_source(Arc::new(ProcessPickerSnapshot::from_items(&self.items)))
     }
 
     fn picker_state(&self) -> PickerState {
@@ -170,7 +177,7 @@ impl PickerRequest for ProcessListPickerRequest {
 
 pub struct StdinRequest {
     search_string: Option<String>,
-    shared_store: Arc<SharedStore>,
+    shared_store: Arc<SnapshotStore<StreamingItemSnapshot>>,
     reader: Mutex<Option<Box<dyn Read + Send>>>,
 }
 
@@ -186,7 +193,7 @@ pub struct DelimitedInputOptions {
 pub struct DelimitedStdinRequest {
     options: DelimitedInputOptions,
     search_string: Option<String>,
-    shared_store: Arc<SharedStore>,
+    shared_store: Arc<SnapshotStore<DelimitedStreamingSnapshot>>,
     reader: Mutex<Option<Box<dyn Read + Send>>>,
 }
 
@@ -205,7 +212,7 @@ pub struct StructuredCsvOptions {
 pub struct StructuredCsvStdinRequest {
     options: StructuredCsvOptions,
     search_string: Option<String>,
-    shared_store: Arc<SharedStore>,
+    shared_store: Arc<SnapshotStore<StructuredStreamingSnapshot>>,
     reader: Mutex<Option<Box<dyn Read + Send>>>,
 }
 
@@ -214,7 +221,7 @@ impl StructuredCsvStdinRequest {
         Self {
             options,
             search_string,
-            shared_store: Arc::new(SharedStore::new()),
+            shared_store: Arc::new(SnapshotStore::new()),
             reader: Mutex::new(None),
         }
     }
@@ -224,7 +231,7 @@ impl StructuredCsvStdinRequest {
         Self {
             options,
             search_string: None,
-            shared_store: Arc::new(SharedStore::new()),
+            shared_store: Arc::new(SnapshotStore::new()),
             reader: Mutex::new(Some(Box::new(reader))),
         }
     }
@@ -264,10 +271,10 @@ impl StructuredCsvStdinRequest {
                 }
             };
             let mut store = StructuredStreamingStore::new(schema);
-            shared.publish(Arc::new(AnyItemSource::Structured(store.snapshot())));
+            shared.publish(store.snapshot());
             for record in records {
                 let record = match record {
-                    Ok(record) => {record},
+                    Ok(record) => record,
                     Err(error) => {
                         eprintln!("failed to read csv record: {error}");
                         break;
@@ -280,10 +287,10 @@ impl StructuredCsvStdinRequest {
                 }
 
                 if store.len().is_multiple_of(1_000) {
-                    shared.publish(Arc::new(AnyItemSource::Structured(store.snapshot())));
+                    shared.publish(store.snapshot());
                 }
             }
-            shared.publish(Arc::new(AnyItemSource::Structured(store.snapshot())));
+            shared.publish(store.snapshot());
             shared.complete();
         });
     }
@@ -294,9 +301,9 @@ impl PickerRequest for StructuredCsvStdinRequest {
     fn search_string(&self) -> Option<&str> {
         self.search_string.as_deref()
     }
-    fn run(&self) -> Arc<SharedStore> {
+    fn run(&self) -> Arc<dyn SearchSource<Item = <Self::Source as ItemsSource>::Item>> {
         self.spawn_reader();
-        Arc::clone(&self.shared_store)
+        picker_source(Arc::clone(&self.shared_store))
     }
     fn picker_state(&self) -> PickerState {
         PickerState::StructuredStdin
@@ -308,7 +315,7 @@ impl DelimitedStdinRequest {
         Self {
             options,
             search_string,
-            shared_store: Arc::new(SharedStore::new()),
+            shared_store: Arc::new(SnapshotStore::new()),
             reader: Mutex::new(None),
         }
     }
@@ -322,7 +329,7 @@ impl DelimitedStdinRequest {
         Self {
             options,
             search_string,
-            shared_store: Arc::new(SharedStore::new()),
+            shared_store: Arc::new(SnapshotStore::new()),
             reader: Mutex::new(Some(Box::new(reader))),
         }
     }
@@ -368,10 +375,10 @@ impl DelimitedStdinRequest {
                 let search_offset = text.as_ptr() as usize - line.as_ptr() as usize;
                 store.add_item(line.as_bytes(), search_offset, text.len());
                 if store.len().is_multiple_of(1_000) {
-                    shared_store.publish(Arc::new(AnyItemSource::Delimited(store.snapshot())));
+                    shared_store.publish(store.snapshot());
                 }
             }
-            shared_store.publish(Arc::new(AnyItemSource::Delimited(store.snapshot())));
+            shared_store.publish(store.snapshot());
             shared_store.complete();
         });
     }
@@ -384,9 +391,9 @@ impl PickerRequest for DelimitedStdinRequest {
         self.search_string.as_deref()
     }
 
-    fn run(&self) -> Arc<SharedStore> {
+    fn run(&self) -> Arc<dyn SearchSource<Item = <Self::Source as ItemsSource>::Item>> {
         self.spawn_reader();
-        Arc::clone(&self.shared_store)
+        picker_source(Arc::clone(&self.shared_store))
     }
 
     fn picker_state(&self) -> PickerState {
@@ -397,7 +404,7 @@ impl PickerRequest for DelimitedStdinRequest {
 impl StdinRequest {
     pub fn new(search_string: Option<String>) -> Self {
         Self {
-            shared_store: Arc::new(SharedStore::new()),
+            shared_store: Arc::new(SnapshotStore::new()),
             search_string,
             reader: Mutex::new(None),
         }
@@ -406,7 +413,7 @@ impl StdinRequest {
     #[cfg(test)]
     fn with_reader(search_string: Option<String>, reader: impl Read + Send + 'static) -> Self {
         Self {
-            shared_store: Arc::new(SharedStore::new()),
+            shared_store: Arc::new(SnapshotStore::new()),
             search_string,
             reader: Mutex::new(Some(Box::new(reader))),
         }
@@ -432,11 +439,11 @@ impl StdinRequest {
                 }
                 let node_index = store.add_item(line.as_bytes());
                 if (node_index + 1).is_multiple_of(1_000) {
-                    shared_store.publish(Arc::new(AnyItemSource::Streaming(store.snapshot())));
+                    shared_store.publish(store.snapshot());
                 }
             }
             store.complete_adding();
-            shared_store.publish(Arc::new(AnyItemSource::Streaming(store.snapshot())));
+            shared_store.publish(store.snapshot());
             shared_store.complete();
         });
     }
@@ -449,9 +456,9 @@ impl PickerRequest for StdinRequest {
         self.search_string.as_deref()
     }
 
-    fn run(&self) -> Arc<SharedStore> {
+    fn run(&self) -> Arc<dyn SearchSource<Item = <Self::Source as ItemsSource>::Item>> {
         self.spawn_reader();
-        Arc::clone(&self.shared_store)
+        picker_source(Arc::clone(&self.shared_store))
     }
 
     fn picker_state(&self) -> PickerState {
@@ -460,17 +467,13 @@ impl PickerRequest for StdinRequest {
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
-pub enum PickerResponse {
-    Selected(SelectedItem),
+pub enum PickerResponse<I> {
+    Selected(I),
     Cancelled,
     Error(String),
 }
 
-impl PickerResponse {
-    pub fn selected(item: SelectedItem) -> Self {
-        Self::Selected(item)
-    }
-
+impl<I> PickerResponse<I> {
     pub fn cancelled() -> Self {
         Self::Cancelled
     }
@@ -491,7 +494,6 @@ impl PickerResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::delimited_store::DelimitedItemMetadata;
     use std::time::Duration;
 
     #[test]
@@ -505,7 +507,8 @@ mod tests {
             thread::sleep(Duration::from_millis(1));
         }
         let snapshot = store.snapshot().expect("snapshot");
-        assert_eq!(snapshot.len(), 2);
+        assert_eq!(snapshot.item(0).expect("first item"), "one");
+        assert_eq!(snapshot.item(1).expect("second item"), "three");
     }
 
     #[test]
@@ -525,19 +528,9 @@ mod tests {
             thread::sleep(Duration::from_millis(1));
         }
         let snapshot = store.snapshot().expect("snapshot");
-        let expected = vec!["Name".to_string(), "Description".to_string()];
-        assert_eq!(snapshot.structured_columns(), Some(expected.as_slice()));
-        assert_eq!(snapshot.len(), 2);
-        let mut stack = [0; 128];
-        let mut heap = Vec::new();
-        assert_eq!(
-            snapshot.get_string(1, &mut stack, &mut heap),
-            b"beta,two\\nlines"
-        );
-        assert_eq!(
-            snapshot.structured_value(1).as_deref(),
-            Some("beta,\"two\nlines\"")
-        );
+        let item = snapshot.item(1).expect("item");
+        assert_eq!(item.value, "beta,\"two\nlines\"");
+        assert_eq!(item.fields.get("Name").map(String::as_str), Some("beta"));
     }
 
     #[test]
@@ -562,20 +555,10 @@ mod tests {
         }
 
         let snapshot = store.snapshot().expect("snapshot");
-        let mut stack = [0; 128];
-        let mut heap = Vec::new();
-        assert_eq!(
-            snapshot.get_string(0, &mut stack, &mut heap),
-            b"g:\\src\\project\\TODO"
-        );
-        assert_eq!(
-            snapshot.delimited_metadata(0),
-            Some(DelimitedItemMetadata {
-                value: "tmp\\result.txt".into(),
-                preview_item: Some("tmp\\result.txt".into()),
-                preview_center_line: Some(639),
-            })
-        );
+        let item = snapshot.item(0).expect("item");
+        assert_eq!(item.preview_item.as_deref(), Some("tmp\\result.txt"));
+        assert_eq!(item.value, "tmp\\result.txt");
+        assert_eq!(item.preview_center_line, Some(639));
     }
 
     #[test]
@@ -600,20 +583,9 @@ mod tests {
             thread::sleep(Duration::from_millis(1));
         }
         let snapshot = store.snapshot().expect("snapshot");
-        let mut stack = [0; 128];
-        let mut heap = Vec::new();
-        assert_eq!(
-            snapshot.get_string(0, &mut stack, &mut heap),
-            &input[..input.len() - 1]
-        );
-        assert_eq!(
-            snapshot.delimited_metadata(0),
-            Some(DelimitedItemMetadata {
-                value: "tmp\\result.txt".into(),
-                preview_item: Some("tmp\\result.txt".into()),
-                preview_center_line: Some(639),
-            })
-        );
+        let item = snapshot.item(0).expect("item");
+        assert_eq!(item.value, "tmp\\result.txt");
+        assert_eq!(item.preview_center_line, Some(639));
     }
 
     #[test]
@@ -641,8 +613,8 @@ mod tests {
             store
                 .snapshot()
                 .expect("snapshot")
-                .delimited_metadata(0)
-                .expect("metadata")
+                .item(0)
+                .expect("item")
                 .value,
             "file.txt:42:7:matching text"
         );
@@ -669,16 +641,7 @@ mod tests {
             thread::sleep(Duration::from_millis(1));
         }
         let snapshot = store.snapshot().expect("snapshot");
-        let mut stack = [0; 128];
-        let mut heap = Vec::new();
-        assert_eq!(
-            snapshot.get_string(0, &mut stack, &mut heap),
-            b"matching:text"
-        );
-        assert_eq!(
-            snapshot.delimited_metadata(0).expect("metadata").value,
-            "text"
-        );
+        assert_eq!(snapshot.item(0).expect("item").value, "text");
     }
 
     #[cfg(windows)]
@@ -692,18 +655,16 @@ mod tests {
         };
         let store = request.run();
         let snapshot = store.snapshot().expect("snapshot");
-        assert_eq!(snapshot.native_window(0), Some(0x1234));
-        let mut stack = [0; 64];
-        let mut heap = Vec::new();
+        assert_eq!(snapshot.item(0).expect("item").native_window, 4660);
         assert_eq!(
-            snapshot.get_string(0, &mut stack, &mut heap),
-            b"00001234      100 app.exe Window title"
+            snapshot.item(0).expect("item").title,
+            "00001234      100 app.exe Window title"
         );
     }
 
     #[cfg(windows)]
     #[test]
-    fn process_list_request_retains_pid_and_structured_columns() {
+    fn process_list_request_retains_structured_fields() {
         let request = ProcessListPickerRequest {
             items: vec![ProcessInfo {
                 name: "example.exe".into(),
@@ -716,12 +677,40 @@ mod tests {
         assert_eq!(request.search_string(), None);
         let store = request.run();
         let snapshot = store.snapshot().expect("snapshot");
-        assert_eq!(
-            snapshot.structured_columns().expect("columns"),
-            ["Name", "PID", "WorkingSet", "PrivateBytes", "CPU"]
-        );
-        let fields = snapshot.item_fields(0);
-        assert_eq!(fields.get("Name").map(String::as_str), Some("example.exe"));
-        assert_eq!(fields.get("PID").map(String::as_str), Some("1234"));
+        let item = snapshot.item(0).expect("item");
+        assert_eq!(item.name, "example.exe");
+        assert_eq!(item.pid, 1234);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn process_list_request_retains_structured_search_and_completions() {
+        let request = ProcessListPickerRequest {
+            items: vec![
+                ProcessInfo {
+                    name: "small.exe".into(),
+                    pid: 100,
+                    working_set_kb: 100,
+                    private_bytes_kb: 200,
+                    cpu_seconds: 1,
+                },
+                ProcessInfo {
+                    name: "large.exe".into(),
+                    pid: 2_000,
+                    working_set_kb: 300,
+                    private_bytes_kb: 400,
+                    cpu_seconds: 2,
+                },
+            ],
+        };
+        let store = request.run();
+        let snapshot = store.snapshot().expect("snapshot");
+        let plan = snapshot.create_search_plan("/:PID>1000");
+        assert!(!plan.includes(0));
+        assert!(plan.includes(1));
+        assert!(snapshot
+            .completions("/:PI", 4)
+            .iter()
+            .any(|completion| completion.replacement.starts_with("/:PID")));
     }
 }

@@ -6,23 +6,22 @@ use std::thread;
 use std::time::Duration;
 
 use crate::action::{
-    ActionController, ActionEvent, ActionResolution, ActionService, ActionState, PickerState,
+    ActionController, ActionDefinition, ActionResolution, ActionState, PickerState, PreparedAction,
 };
 pub use crate::key_binding::KeyModifiers;
 use crate::key_binding::{KeyChord, KeyName};
 use crate::preview::{
-    NativeWindowId, PreviewCoordinator, PreviewEvent, PreviewService, PreviewUpdate,
+    NativeWindowId, PreviewEvent, PreviewFactory, PreviewRoutes, PreviewUpdate, SelectionPreview,
 };
 use crate::request::{PickerRequest, PickerResponse};
-use crate::selection::SelectedItem;
-use crate::source_store::{AnyItemSource, SharedStore};
-use crate::structured_store::CompletionSuggestion;
+use crate::PickerItem;
 use anyhow::{bail, Result};
 use crossbeam_channel::{unbounded, Receiver, Sender};
-use nfm_search_core::fuzzy_search_session::{FuzzySearchSession, FuzzySearchUpdate};
+use nfm_search_core::fuzzy_search_session::FuzzySearchUpdate;
 use nfm_search_core::search::{resolve_match_positions, SearchResult};
+use nfm_search_core::source::SearchSource;
+use nfm_search_core::store::{ItemsSource, SearchCompletion};
 use nfm_search_core::timing;
-
 const PICKER_DISPLAY_LIMIT: usize = 7;
 
 #[derive(Clone, Debug)]
@@ -34,6 +33,21 @@ pub enum UiEvent {
     PreviewVisibilityChanged { visible: bool },
     ShowToast { text: String, duration: Duration },
     Hide,
+    Exit(i32),
+}
+
+pub trait UiEventSink: Send + Sync {
+    fn publish(&self, event: UiEvent);
+}
+
+#[cfg(test)]
+struct RecordingUiEventSink(Sender<UiEvent>);
+
+#[cfg(test)]
+impl UiEventSink for RecordingUiEventSink {
+    fn publish(&self, event: UiEvent) {
+        let _ = self.0.send(event);
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -67,18 +81,30 @@ pub struct DisplaySearchResult {
     pub positions: Vec<usize>,
 }
 
+pub(crate) struct PickerRender {
+    header: Option<String>,
+    row_count: usize,
+}
+
+pub(crate) struct PickerQueryUpdate {
+    effective_query: String,
+    completions: Vec<SearchCompletion>,
+}
+
 pub struct ViewModel {
     state: Mutex<State>,
     request_generation: AtomicU64,
     search_update_tx: Sender<FuzzySearchUpdate>,
-    search_update_rx: Receiver<FuzzySearchUpdate>,
-    events_tx: Sender<UiEvent>,
-    events_rx: Receiver<UiEvent>,
-    preview: PreviewCoordinator,
+    ui_events: Arc<dyn UiEventSink>,
+    internal_events: Sender<ViewModelEvent>,
     actions: ActionController,
     bindings: HashMap<KeyChord, String>,
-    source_resolver: SourceResolver,
 }
+
+pub type PickerAction<I> =
+    Arc<dyn Fn(Option<&I>) -> Result<PickerActionOutcome, String> + Send + Sync>;
+pub type PickerRefresh<I> =
+    Arc<dyn Fn() -> Result<Arc<dyn SearchSource<Item = I>>, String> + Send + Sync>;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PickerActionOutcome {
@@ -87,43 +113,110 @@ pub enum PickerActionOutcome {
     RefreshWithToast(String),
     Toast(String),
 }
-
-pub type PickerAction =
-    Arc<dyn Fn(Option<&SelectedItem>) -> Result<PickerActionOutcome, String> + Send + Sync>;
-pub type PickerRefresh = Arc<dyn Fn() -> Result<Arc<SharedStore>, String> + Send + Sync>;
-pub type PickerPreviewFormatter =
-    Arc<dyn Fn(&SelectedItem) -> Result<String, String> + Send + Sync>;
-
-pub struct SourceTransition {
-    pub store: Arc<SharedStore>,
+pub struct SourceTransition<I> {
+    pub source: Arc<dyn SearchSource<Item = I>>,
+    pub interactions: PickerInteractions<I>,
     pub picker_state: PickerState,
-    pub interactions: PickerInteractions,
     pub clear_query: bool,
 }
 
-pub type SourceResolver =
-    Arc<dyn Fn(PickerState) -> Result<SourceTransition, String> + Send + Sync>;
-
-#[derive(Clone)]
-pub struct PickerInteractions {
-    pub bindings: HashMap<KeyChord, PickerAction>,
-    pub refresh: Option<PickerRefresh>,
-    pub preview: Option<PickerPreviewFormatter>,
+impl<I: PickerItem> SourceTransition<I> {
+    pub fn new(
+        source: Arc<dyn SearchSource<Item = I>>,
+        picker_state: PickerState,
+        interactions: PickerInteractions<I>,
+        clear_query: bool,
+    ) -> SourceTransition<I> {
+        SourceTransition {
+            source,
+            interactions,
+            picker_state,
+            clear_query,
+        }
+    }
+}
+pub type SourceResolver<I> =
+    Arc<dyn Fn(PickerState) -> Result<SourceTransition<I>, String> + Send + Sync>;
+pub struct PickerInteractions<I> {
+    pub actions: HashMap<String, ActionDefinition<I>>,
+    pub source_resolver: Option<SourceResolver<I>>,
+    pub bindings: HashMap<KeyChord, PickerAction<I>>,
+    pub refresh: Option<PickerRefresh<I>>,
+    pub preview_factory: Arc<PreviewFactory>,
+    pub preview_routes: PreviewRoutes<I>,
 }
 
-impl Default for PickerInteractions {
+impl<I> Clone for PickerInteractions<I> {
+    fn clone(&self) -> Self {
+        Self {
+            actions: self.actions.clone(),
+            source_resolver: self.source_resolver.clone(),
+            bindings: self.bindings.clone(),
+            refresh: self.refresh.clone(),
+            preview_factory: Arc::clone(&self.preview_factory),
+            preview_routes: self.preview_routes.clone(),
+        }
+    }
+}
+
+impl<I> Default for PickerInteractions<I> {
     fn default() -> Self {
         Self {
+            actions: HashMap::new(),
+            source_resolver: None,
             bindings: HashMap::new(),
             refresh: None,
-            preview: None,
+            preview_factory: Arc::new(PreviewFactory::default()),
+            preview_routes: PreviewRoutes::default(),
         }
     }
 }
 
 pub(crate) enum ViewModelEvent {
     Preview(PreviewEvent),
-    Action(ActionEvent),
+    Action(SessionActionEvent),
+}
+
+pub(crate) struct SessionActionEvent {
+    generation: u64,
+    result: Result<SessionActionResolution, String>,
+}
+
+pub(crate) struct PreparedResponse {
+    send: Box<dyn FnOnce() -> Result<(), String> + Send>,
+}
+
+impl PreparedResponse {
+    fn new<I: Send + 'static>(
+        sender: Sender<PickerResponse<I>>,
+        response: PickerResponse<I>,
+    ) -> Self {
+        Self {
+            send: Box::new(move || {
+                sender
+                    .send(response)
+                    .map_err(|_| "picker response receiver disconnected".to_owned())
+            }),
+        }
+    }
+
+    fn send(self) -> Result<(), String> {
+        (self.send)()
+    }
+}
+
+pub(crate) enum SessionActionResolution {
+    None,
+    Complete(PreparedResponse),
+    Toast(String),
+    Refresh {
+        session: Arc<dyn PickerSession>,
+        toast: Option<String>,
+    },
+    Picker {
+        session: Arc<dyn PickerSession>,
+        clear_query: bool,
+    },
 }
 
 struct State {
@@ -144,7 +237,7 @@ struct State {
     preview_update: Option<PreviewUpdate>,
     preview_visible: bool,
     action_generation: Option<u64>,
-    suggestions: Vec<CompletionSuggestion>,
+    suggestions: Vec<SearchCompletion>,
     suggestion_selected: usize,
 }
 
@@ -217,65 +310,261 @@ fn command_suppresses_repeat(command: InputCommand) -> bool {
 
 struct ActiveRequest {
     id: u64,
-    response_tx: Sender<PickerResponse>,
-    search_session: FuzzySearchSession<AnyItemSource, SharedStore>,
-    store: Arc<SharedStore>,
+    picker: Arc<dyn PickerSession>,
+}
+
+pub(crate) trait PickerSession: Send + Sync {
+    fn start_search(&self, id: u64, query: String, updates: Sender<FuzzySearchUpdate>);
+    fn set_query(&self, query: String);
+    fn stop_search(&self);
+    fn prepare_selection(&self, index: usize) -> Option<PreparedResponse>;
+    fn prepare_cancelled(&self) -> PreparedResponse;
+    fn has_action(&self, name: &str) -> bool;
+    fn prepare_action(
+        &self,
+        name: &str,
+        index: Option<usize>,
+        query: String,
+    ) -> Option<PreparedAction>;
+    fn value(&self, index: usize) -> Option<String>;
+    fn header(&self, query: &str) -> Option<String>;
+    fn render(&self, query: &str, indices: &[usize], rows: &mut [Option<String>]) -> PickerRender;
+    fn query_update(&self, query: &str, input: &str, cursor: usize) -> PickerQueryUpdate;
+    fn has_picker_action(&self, chord: &KeyChord) -> bool;
+    fn prepare_picker_action(
+        &self,
+        chord: &KeyChord,
+        index: Option<usize>,
+    ) -> Option<PreparedAction>;
+    fn selection_changed(&self, index: Option<usize>);
+    fn clear_preview(&self);
+}
+
+pub(crate) struct TypedPickerSession<I: PickerItem> {
+    source: Arc<dyn SearchSource<Item = I>>,
+    interactions: PickerInteractions<I>,
     picker_state: PickerState,
-    interactions: PickerInteractions,
+    preview: Arc<dyn SelectionPreview<I>>,
+    preview_events: Sender<ViewModelEvent>,
+    response_tx: Sender<PickerResponse<I>>,
+}
+
+impl<I: PickerItem> TypedPickerSession<I> {
+    pub(crate) fn new(
+        source: Arc<dyn SearchSource<Item = I>>,
+        interactions: PickerInteractions<I>,
+        picker_state: PickerState,
+        events: Sender<ViewModelEvent>,
+        response_tx: Sender<PickerResponse<I>>,
+    ) -> Arc<Self> {
+        let preview = interactions
+            .preview_factory
+            .create(events.clone(), interactions.preview_routes.clone());
+        Arc::new(Self {
+            source,
+            interactions,
+            picker_state,
+            preview,
+            preview_events: events,
+            response_tx,
+        })
+    }
+}
+
+impl<I: PickerItem> PickerSession for TypedPickerSession<I> {
+    fn start_search(&self, id: u64, query: String, updates: Sender<FuzzySearchUpdate>) {
+        self.source.start_search(id, query, updates)
+    }
+    fn set_query(&self, query: String) {
+        self.source.set_query(query);
+    }
+    fn stop_search(&self) {
+        self.source.stop_search();
+    }
+    fn prepare_selection(&self, index: usize) -> Option<PreparedResponse> {
+        let item = self
+            .source
+            .snapshot()
+            .and_then(|source| source.item(index))?;
+        Some(PreparedResponse::new(
+            self.response_tx.clone(),
+            PickerResponse::Selected(item),
+        ))
+    }
+    fn prepare_cancelled(&self) -> PreparedResponse {
+        PreparedResponse::new(self.response_tx.clone(), PickerResponse::Cancelled)
+    }
+    fn has_action(&self, name: &str) -> bool {
+        self.interactions.actions.contains_key(name)
+    }
+    fn prepare_action(
+        &self,
+        name: &str,
+        index: Option<usize>,
+        query: String,
+    ) -> Option<PreparedAction> {
+        let definition = self.interactions.actions.get(name).cloned()?;
+        let item = index.and_then(|index| self.source.snapshot()?.item(index));
+        let response_tx = self.response_tx.clone();
+        let events = self.preview_events.clone();
+        let resolver = self.interactions.source_resolver.clone();
+        let preview_events = self.preview_events.clone();
+        let transition_response_tx = self.response_tx.clone();
+        Some(PreparedAction::new(
+            definition,
+            ActionState {
+                selection: item,
+                picker: self.picker_state.clone(),
+                query,
+            },
+            move |event| {
+                let result = match event.result {
+                    Ok(ActionResolution::None) => Ok(SessionActionResolution::None),
+                    Ok(ActionResolution::Complete) => match event.state.selection {
+                        Some(item) => Ok(SessionActionResolution::Complete(PreparedResponse::new(
+                            response_tx,
+                            PickerResponse::Selected(item),
+                        ))),
+                        None => Err("action resolver cannot complete without a selection".into()),
+                    },
+                    Ok(ActionResolution::Picker(picker)) => match resolver {
+                        Some(resolve) => resolve(picker).map(|transition| {
+                            let session = Self::new(
+                                transition.source,
+                                transition.interactions,
+                                transition.picker_state,
+                                preview_events,
+                                transition_response_tx,
+                            ) as Arc<dyn PickerSession>;
+                            SessionActionResolution::Picker {
+                                session,
+                                clear_query: transition.clear_query,
+                            }
+                        }),
+                        None => Err("no picker source resolver is configured".into()),
+                    },
+                    Err(message) => Err(message),
+                };
+                let _ = events.send(ViewModelEvent::Action(SessionActionEvent {
+                    generation: event.generation,
+                    result,
+                }));
+            },
+        ))
+    }
+    fn value(&self, index: usize) -> Option<String> {
+        Some(self.source.snapshot()?.item(index)?.value().to_owned())
+    }
+    fn header(&self, query: &str) -> Option<String> {
+        self.source.snapshot()?.header(query)
+    }
+    fn render(&self, query: &str, indices: &[usize], rows: &mut [Option<String>]) -> PickerRender {
+        let Some(snapshot) = self.source.snapshot() else {
+            return PickerRender {
+                header: None,
+                row_count: indices.len().min(rows.len()),
+            };
+        };
+        let header = snapshot.header(query);
+        let row_count = indices
+            .len()
+            .min(rows.len())
+            .min(PICKER_DISPLAY_LIMIT - usize::from(header.is_some()));
+        for (row, &index) in rows[..row_count].iter_mut().zip(indices) {
+            *row = snapshot.display_text(index, query);
+        }
+        PickerRender { header, row_count }
+    }
+    fn query_update(&self, query: &str, input: &str, cursor: usize) -> PickerQueryUpdate {
+        let Some(snapshot) = self.source.snapshot() else {
+            return PickerQueryUpdate {
+                effective_query: query.to_owned(),
+                completions: Vec::new(),
+            };
+        };
+        PickerQueryUpdate {
+            effective_query: snapshot.effective_query(query),
+            completions: snapshot.completions(input, cursor),
+        }
+    }
+    fn has_picker_action(&self, chord: &KeyChord) -> bool {
+        self.interactions.bindings.contains_key(chord)
+    }
+    fn prepare_picker_action(
+        &self,
+        chord: &KeyChord,
+        index: Option<usize>,
+    ) -> Option<PreparedAction> {
+        let action = Arc::clone(self.interactions.bindings.get(chord)?);
+        let item = index.and_then(|i| self.source.snapshot()?.item(i));
+        let refresh = self.interactions.refresh.clone();
+        let interactions = self.interactions.clone();
+        let picker_state = self.picker_state.clone();
+        let preview_events = self.preview_events.clone();
+        let response_tx = self.response_tx.clone();
+        let events = self.preview_events.clone();
+        Some(PreparedAction::from_task(
+            move || {
+                let outcome = action(item.as_ref())?;
+                match outcome {
+                    PickerActionOutcome::None => Ok(SessionActionResolution::None),
+                    PickerActionOutcome::Toast(text) => Ok(SessionActionResolution::Toast(text)),
+                    PickerActionOutcome::Refresh | PickerActionOutcome::RefreshWithToast(_) => {
+                        let source = refresh.as_ref().ok_or_else(|| {
+                            "picker action requested refresh without a refresh handler".to_owned()
+                        })?()?;
+                        let toast = match outcome {
+                            PickerActionOutcome::RefreshWithToast(text) => Some(text),
+                            _ => None,
+                        };
+                        let session = Self::new(
+                            source,
+                            interactions,
+                            picker_state,
+                            preview_events,
+                            response_tx,
+                        ) as Arc<dyn PickerSession>;
+                        Ok(SessionActionResolution::Refresh { session, toast })
+                    }
+                }
+            },
+            move |generation, result| {
+                let _ = events.send(ViewModelEvent::Action(SessionActionEvent {
+                    generation,
+                    result,
+                }));
+            },
+        ))
+    }
+    fn selection_changed(&self, index: Option<usize>) {
+        let item = index.and_then(|i| self.source.snapshot()?.item(i));
+        self.preview.selection_changed(item.as_ref());
+    }
+    fn clear_preview(&self) {
+        self.preview.clear();
+    }
 }
 
 impl ViewModel {
-    pub fn new(preview_service: PreviewService) -> Arc<Self> {
-        Self::new_with_services(preview_service, ActionService::default(), true)
+    pub fn new(ui_events: Arc<dyn UiEventSink>) -> Arc<Self> {
+        Self::new_with_bindings(HashMap::new(), true, ui_events)
     }
 
     pub fn new_with_preview_visibility(
-        preview_service: PreviewService,
         preview_visible: bool,
+        ui_events: Arc<dyn UiEventSink>,
     ) -> Arc<Self> {
-        Self::new_with_services(preview_service, ActionService::default(), preview_visible)
+        Self::new_with_bindings(HashMap::new(), preview_visible, ui_events)
     }
 
-    pub fn new_with_services(
-        preview_service: PreviewService,
-        action_service: ActionService,
-        preview_visible: bool,
-    ) -> Arc<Self> {
-        Self::new_with_services_and_bindings(
-            preview_service,
-            action_service,
-            HashMap::new(),
-            preview_visible,
-        )
-    }
-
-    pub fn new_with_services_and_bindings(
-        preview_service: PreviewService,
-        action_service: ActionService,
+    pub fn new_with_bindings(
         bindings: HashMap<KeyChord, String>,
         preview_visible: bool,
+        ui_events: Arc<dyn UiEventSink>,
     ) -> Arc<Self> {
-        Self::new_with_services_bindings_and_source_resolver(
-            preview_service,
-            action_service,
-            bindings,
-            preview_visible,
-            Arc::new(|_| Err("no picker source resolver is configured".into())),
-        )
-    }
-
-    pub fn new_with_services_bindings_and_source_resolver(
-        preview_service: PreviewService,
-        action_service: ActionService,
-        bindings: HashMap<KeyChord, String>,
-        preview_visible: bool,
-        source_resolver: SourceResolver,
-    ) -> Arc<Self> {
-        let (events_tx, events_rx) = unbounded();
         let (internal_events_tx, internal_events_rx) = unbounded();
         let (search_update_tx, search_update_rx) = unbounded();
-        let preview = preview_service.into_coordinator(internal_events_tx.clone());
-        let actions = action_service.into_controller(internal_events_tx.clone());
+        let actions = ActionController::new();
 
         let this = Arc::new(Self {
             state: Mutex::new(State {
@@ -301,49 +590,42 @@ impl ViewModel {
             }),
             request_generation: AtomicU64::new(0),
             search_update_tx,
-            search_update_rx,
-            events_tx,
-            events_rx,
-            preview,
+            ui_events,
+            internal_events: internal_events_tx,
             actions,
             bindings,
-            source_resolver,
         });
 
-        this.spawn_event_thread(internal_events_rx);
-        this.spawn_search_update_thread();
+        this.spawn_event_thread(internal_events_rx, search_update_rx);
         this
     }
 
-    fn spawn_event_thread(self: &Arc<Self>, events: Receiver<ViewModelEvent>) {
+    fn spawn_event_thread(
+        self: &Arc<Self>,
+        events: Receiver<ViewModelEvent>,
+        search_updates: Receiver<FuzzySearchUpdate>,
+    ) {
         let weak = Arc::downgrade(self);
-        thread::spawn(move || {
-            while let Ok(event) = events.recv() {
-                let Some(view_model) = weak.upgrade() else {
-                    break;
-                };
-                match event {
-                    ViewModelEvent::Preview(event) => view_model.handle_preview_event(event),
-                    ViewModelEvent::Action(event) => view_model.handle_action_event(event),
+        thread::spawn(move || loop {
+            crossbeam_channel::select! {
+                recv(events) -> event => {
+                    let Ok(event) = event else { break };
+                    let Some(view_model) = weak.upgrade() else { break };
+                    match event {
+                        ViewModelEvent::Preview(event) => view_model.handle_preview_event(event),
+                        ViewModelEvent::Action(event) => view_model.handle_action_event(event),
+                    }
+                }
+                recv(search_updates) -> update => {
+                    let Ok(update) = update else { break };
+                    let Some(view_model) = weak.upgrade() else { break };
+                    view_model.apply_search_update(update);
                 }
             }
         });
     }
 
-    fn spawn_search_update_thread(self: &Arc<Self>) {
-        let weak = Arc::downgrade(self);
-        let updates = self.search_update_rx.clone();
-        thread::spawn(move || {
-            while let Ok(update) = updates.recv() {
-                let Some(view_model) = weak.upgrade() else {
-                    break;
-                };
-                view_model.apply_search_update(update);
-            }
-        });
-    }
-
-    fn handle_action_event(&self, event: ActionEvent) {
+    fn handle_action_event(&self, event: SessionActionEvent) {
         {
             let mut state = self.state.lock().expect("view model poisoned");
             if state.action_generation != Some(event.generation) {
@@ -354,16 +636,20 @@ impl ViewModel {
             state.suggestion_selected = 0;
         }
         match event.result {
-            Ok(ActionResolution::None) => {}
-            Ok(ActionResolution::Complete) => match event.state.selection {
-                Some(selection) => self.complete(PickerResponse::selected(selection)),
-                None => eprintln!("action resolver cannot complete without a selection"),
-            },
-            Ok(ActionResolution::Picker(picker)) => match (self.source_resolver)(picker) {
-                Ok(transition) => self.replace_active_source(transition),
-                Err(message) => eprintln!("picker source resolver error: {message}"),
-            },
-            Err(message) => eprintln!("action resolver error: {message}"),
+            Ok(SessionActionResolution::None) => {}
+            Ok(SessionActionResolution::Complete(response)) => self.finish_active(response),
+            Ok(SessionActionResolution::Toast(text)) => self.show_toast(text),
+            Ok(SessionActionResolution::Refresh { session, toast }) => {
+                if let Some(text) = toast {
+                    self.show_toast(text);
+                }
+                self.replace_active_session(session);
+            }
+            Ok(SessionActionResolution::Picker {
+                session,
+                clear_query,
+            }) => self.replace_active_source(session, clear_query),
+            Err(message) => self.show_toast(message),
         }
     }
 
@@ -375,15 +661,18 @@ impl ViewModel {
             PreviewEvent::NativeWindow(window) => Some(PreviewView::NativeWindow(window)),
         };
         if let Some(view) = view {
-            let _ = self.events_tx.send(UiEvent::Preview(view));
+            self.publish_ui_event(UiEvent::Preview(view));
         }
     }
 
-    pub fn subscribe(&self) -> Receiver<UiEvent> {
-        self.events_rx.clone()
+    fn publish_ui_event(&self, event: UiEvent) {
+        self.ui_events.publish(event);
     }
 
-    pub fn run_request<R>(self: &Arc<Self>, request: &R) -> Result<PickerResponse>
+    pub fn run_request<R>(
+        self: &Arc<Self>,
+        request: &R,
+    ) -> Result<PickerResponse<<R::Source as ItemsSource>::Item>>
     where
         R: PickerRequest,
     {
@@ -393,8 +682,8 @@ impl ViewModel {
     pub fn run_request_with_interactions<R>(
         self: &Arc<Self>,
         request: &R,
-        interactions: PickerInteractions,
-    ) -> Result<PickerResponse>
+        interactions: PickerInteractions<<<R as PickerRequest>::Source as ItemsSource>::Item>,
+    ) -> Result<PickerResponse<<R::Source as ItemsSource>::Item>>
     where
         R: PickerRequest,
     {
@@ -408,14 +697,15 @@ impl ViewModel {
         let request_id = self.request_generation.fetch_add(1, Ordering::AcqRel) + 1;
         let (response_tx, response_rx) = unbounded();
         let store = request.run();
+        let picker: Arc<dyn PickerSession> = TypedPickerSession::new(
+            store,
+            interactions,
+            request.picker_state(),
+            self.internal_events.clone(),
+            response_tx,
+        );
 
         let query = request.search_string().unwrap_or_default().to_owned();
-        let session = FuzzySearchSession::new(
-            request_id,
-            Arc::clone(&store),
-            query.clone(),
-            self.search_update_tx.clone(),
-        );
         let initial_update = {
             let mut state = self.state.lock().expect("view model poisoned");
             if state.active.is_some() {
@@ -423,7 +713,7 @@ impl ViewModel {
             }
 
             let cursor_position = query.len();
-            state.search_text = query;
+            state.search_text = query.clone();
             state.result_query = state.search_text.clone();
             state.results.clear();
             state.counters = UiCounters::default();
@@ -434,25 +724,19 @@ impl ViewModel {
             state.action_generation = None;
             state.active = Some(ActiveRequest {
                 id: request_id,
-                response_tx,
-                search_session: session.clone(),
-                store: Arc::clone(&store),
-                picker_state: request.picker_state(),
-                interactions,
+                picker: Arc::clone(&picker),
             });
             state.visible_update()
         };
-        self.clear_preview_selection();
+        picker.clear_preview();
 
         // A long-lived UI may still contain the previous picker's rows. Publish the cleared
         // state before showing the next request instead of waiting for its first search update.
-        let _ = self.events_tx.send(UiEvent::Results(initial_update));
-        let _ = self.events_tx.send(UiEvent::Show);
-        session.start();
+        self.publish_ui_event(UiEvent::Results(initial_update));
+        self.publish_ui_event(UiEvent::Show);
+        picker.start_search(request_id, query, self.search_update_tx.clone());
 
-        let response = response_rx
-            .recv()
-            .unwrap_or_else(|_| PickerResponse::cancelled());
+        let response = response_rx.recv().unwrap_or(PickerResponse::Cancelled);
         timing::write(format!("response status={}", response.status_label()));
         Ok(response)
     }
@@ -469,8 +753,16 @@ impl ViewModel {
                 let completions = state
                     .active
                     .as_ref()
-                    .and_then(|active| active.store.snapshot())
-                    .map(|source| source.completions(&state.search_text, state.cursor_position))
+                    .map(|active| {
+                        active
+                            .picker
+                            .query_update(
+                                &state.search_text,
+                                &state.search_text,
+                                state.cursor_position,
+                            )
+                            .completions
+                    })
                     .unwrap_or_default();
                 state.suggestions = completions;
                 state.suggestion_selected = 0;
@@ -478,14 +770,14 @@ impl ViewModel {
                 state
                     .active
                     .as_ref()
-                    .map(|active| (active.search_session.clone(), state.search_text.clone()))
+                    .map(|active| (Arc::clone(&active.picker), state.search_text.clone()))
             } else {
                 None
             }
         };
 
-        if let Some((search_session, search_text)) = search_update {
-            search_session.set_query(search_text);
+        if let Some((picker, search_text)) = search_update {
+            picker.set_query(search_text);
         }
     }
 
@@ -583,19 +875,33 @@ impl ViewModel {
             }
             return true;
         }
-        let picker_action = {
-            let state = self.state.lock().expect("view model poisoned");
-            state
-                .active
-                .as_ref()
-                .and_then(|active| active.interactions.bindings.get(&chord))
-                .cloned()
-        };
-        if let Some(action) = picker_action {
-            if !repeat {
-                self.invoke_picker_action(&action);
+        if repeat {
+            let handled = {
+                let state = self.state.lock().expect("view model poisoned");
+                let Some(active) = state.active.as_ref() else {
+                    return false;
+                };
+                active.picker.has_picker_action(&chord)
+            };
+            if handled {
+                return true;
             }
-            return true;
+        } else {
+            let picker_action = {
+                let state = self.state.lock().expect("view model poisoned");
+                let Some(active) = state.active.as_ref() else {
+                    return false;
+                };
+                let index = state
+                    .results
+                    .get(state.selected)
+                    .map(|result| result.node_index);
+                active.picker.prepare_picker_action(&chord, index)
+            };
+            if let Some(action) = picker_action {
+                self.request_action(action);
+                return true;
+            }
         }
         let Some(command) = default_command(chord) else {
             return false;
@@ -645,11 +951,7 @@ impl ViewModel {
     }
 
     pub fn invoke_action(&self, name: &str) {
-        if !self.actions.contains(name) {
-            eprintln!("unknown action: {name}");
-            return;
-        }
-        let (generation, action_state) = {
+        {
             let mut state = self.state.lock().expect("view model poisoned");
             if state.action_generation.is_some() {
                 return;
@@ -657,24 +959,31 @@ impl ViewModel {
             let Some(active) = state.active.as_ref() else {
                 return;
             };
-            let selection = Self::selected_item(&state);
-            let picker = active.picker_state.clone();
+            if !active.picker.has_action(name) {
+                eprintln!("unknown action: {name}");
+                return;
+            }
+            let active_picker = Arc::clone(&active.picker);
+            let index = state
+                .results
+                .get(state.selected)
+                .map(|result| result.node_index);
             let query = state.search_text.clone();
-            let generation = self
-                .actions
-                .reserve(name)
-                .expect("action was checked before locking state");
+            let Some(action) = active_picker.prepare_action(name, index, query) else {
+                return;
+            };
+            let generation = self.actions.request(action);
             state.action_generation = Some(generation);
-            (
-                generation,
-                ActionState {
-                    selection,
-                    picker,
-                    query,
-                },
-            )
-        };
-        self.actions.request(name, generation, action_state);
+        }
+    }
+
+    fn request_action(&self, action: PreparedAction) {
+        let mut state = self.state.lock().expect("view model poisoned");
+        if state.action_generation.is_some() {
+            return;
+        }
+        let generation = self.actions.request(action);
+        state.action_generation = Some(generation);
     }
 
     fn toggle_preview(&self) {
@@ -683,9 +992,7 @@ impl ViewModel {
             state.preview_visible = !state.preview_visible;
             state.preview_visible
         };
-        let _ = self
-            .events_tx
-            .send(UiEvent::PreviewVisibilityChanged { visible });
+        self.publish_ui_event(UiEvent::PreviewVisibilityChanged { visible });
     }
 
     pub fn set_preview_visible(&self, visible: bool) {
@@ -699,9 +1006,7 @@ impl ViewModel {
             }
         };
         if changed {
-            let _ = self
-                .events_tx
-                .send(UiEvent::PreviewVisibilityChanged { visible });
+            self.publish_ui_event(UiEvent::PreviewVisibilityChanged { visible });
         }
     }
 
@@ -716,7 +1021,7 @@ impl ViewModel {
             state.preview_view()
         };
         if let Some(view) = view {
-            let _ = self.events_tx.send(UiEvent::Preview(view));
+            self.publish_ui_event(UiEvent::Preview(view));
         }
     }
 
@@ -735,7 +1040,7 @@ impl ViewModel {
             state.preview_view()
         };
         if let Some(view) = view {
-            let _ = self.events_tx.send(UiEvent::Preview(view));
+            self.publish_ui_event(UiEvent::Preview(view));
         }
     }
 
@@ -1027,45 +1332,29 @@ impl ViewModel {
     pub fn select_current(&self) {
         let selection = {
             let state = self.state.lock().expect("view model poisoned");
-            Self::selected_item(&state)
+            state.active.as_ref().and_then(|active| {
+                state
+                    .results
+                    .get(state.selected)
+                    .map(|result| (Arc::clone(&active.picker), result.node_index))
+            })
         };
-        match selection {
-            Some(selection) => self.complete(PickerResponse::selected(selection)),
+        let response = selection.and_then(|(picker, index)| picker.prepare_selection(index));
+        match response {
+            Some(response) => self.finish_active(response),
             None => self.complete_cancelled(),
         }
-    }
-
-    fn selected_item(state: &State) -> Option<SelectedItem> {
-        let active = state.active.as_ref()?;
-        let result = state.results.get(state.selected)?;
-        let source = active.store.snapshot()?;
-        let metadata = source.delimited_metadata(result.node_index);
-        let structured_value = source.structured_value(result.node_index);
-        let (item, value, line) = match metadata {
-            Some(metadata) => (
-                metadata
-                    .preview_item
-                    .unwrap_or_else(|| metadata.value.clone()),
-                metadata.value,
-                metadata.preview_center_line,
-            ),
-            None => {
-                let value = structured_value.unwrap_or_else(|| result.path.clone());
-                (value.clone(), value, None)
-            }
-        };
-        Some(SelectedItem {
-            item,
-            value,
-            line,
-            fields: source.item_fields(result.node_index),
-        })
     }
 
     fn copy_selection(&self) {
         let value = {
             let state = self.state.lock().expect("view model poisoned");
-            Self::selected_item(&state).map(|item| item.value)
+            state.active.as_ref().and_then(|active| {
+                state
+                    .results
+                    .get(state.selected)
+                    .and_then(|result| active.picker.value(result.node_index))
+            })
         };
         let Some(value) = value else {
             return;
@@ -1074,83 +1363,63 @@ impl ViewModel {
             Ok(()) => format!("Copied '{value}' to clipboard"),
             Err(error) => format!("Copy failed: {error}"),
         };
-        let _ = self.events_tx.send(UiEvent::ShowToast {
+        self.publish_ui_event(UiEvent::ShowToast {
             text,
             duration: Duration::from_secs(3),
         });
     }
 
-    fn invoke_picker_action(&self, action: &PickerAction) {
-        let item = {
-            let state = self.state.lock().expect("view model poisoned");
-            Self::selected_item(&state)
-        };
-
-        match action(item.as_ref()) {
-            Ok(PickerActionOutcome::None) => {}
-            Ok(PickerActionOutcome::Refresh) => self.refresh_active_source(),
-            Ok(PickerActionOutcome::RefreshWithToast(text)) => {
-                self.show_toast(text);
-                self.refresh_active_source();
-            }
-            Ok(PickerActionOutcome::Toast(text)) => self.show_toast(text),
-            Err(error) => self.show_toast(error),
-        }
-    }
-
-    fn refresh_active_source(&self) {
-        let refresh = {
-            let state = self.state.lock().expect("view model poisoned");
-            let Some(active) = state.active.as_ref() else {
-                return;
-            };
-            let Some(refresh) = active.interactions.refresh.clone() else {
-                return;
-            };
-            refresh
-        };
-
-        match refresh() {
-            Ok(store) => self.replace_active_store(store),
-            Err(error) => self.show_toast(error),
-        }
-    }
-
     fn show_toast(&self, text: String) {
-        let _ = self.events_tx.send(UiEvent::ShowToast {
+        self.publish_ui_event(UiEvent::ShowToast {
             text,
             duration: Duration::from_secs(3),
         });
     }
 
     fn complete_cancelled(&self) {
-        self.complete(PickerResponse::cancelled());
+        let response = {
+            let state = self.state.lock().expect("view model poisoned");
+            state
+                .active
+                .as_ref()
+                .map(|active| active.picker.prepare_cancelled())
+        };
+        if let Some(response) = response {
+            self.finish_active(response);
+        } else {
+            self.hide();
+        }
     }
 
-    fn complete(&self, response: PickerResponse) {
+    fn finish_active(&self, response: PreparedResponse) {
         let active = {
             let mut state = self.state.lock().expect("view model poisoned");
             state.active.take()
         };
         let Some(active) = active else {
-            self.hide();
             return;
         };
-        active.search_session.stop();
-        self.clear_preview_selection();
+        active.picker.stop_search();
+        active.picker.clear_preview();
         // Queue the UI hide before releasing the waiting FFI thread. This
         // preserves lifecycle ordering without making the model manipulate a
         // native window directly.
         self.hide();
-        let _ = active.response_tx.send(response);
+        if let Err(message) = response.send() {
+            eprintln!("{message}");
+        }
     }
 
     pub fn hide(&self) {
-        let _ = self.events_tx.send(UiEvent::Hide);
+        self.publish_ui_event(UiEvent::Hide);
     }
 
     pub fn focus(&self) {
-        let _ = self.events_tx.send(UiEvent::Focus);
+        self.publish_ui_event(UiEvent::Focus);
+    }
+
+    pub fn exit(&self, code: i32) {
+        self.publish_ui_event(UiEvent::Exit(code));
     }
 
     pub fn cancel(&self) {
@@ -1158,13 +1427,7 @@ impl ViewModel {
         self.complete_cancelled();
     }
 
-    fn replace_active_source(&self, transition: SourceTransition) {
-        let SourceTransition {
-            store,
-            picker_state,
-            interactions,
-            clear_query,
-        } = transition;
+    fn replace_active_source(&self, picker: Arc<dyn PickerSession>, clear_query: bool) {
         let request_id = self.request_generation.fetch_add(1, Ordering::AcqRel) + 1;
         let query = if clear_query {
             String::new()
@@ -1175,24 +1438,17 @@ impl ViewModel {
                 .search_text
                 .clone()
         };
-        let session = FuzzySearchSession::new(
-            request_id,
-            Arc::clone(&store),
-            query.clone(),
-            self.search_update_tx.clone(),
-        );
-        let old_session = {
+        let (old_picker, initial_update) = {
             let mut state = self.state.lock().expect("view model poisoned");
             let Some(active) = state.active.take() else {
                 return;
             };
-            let old_session = active.search_session;
             if clear_query {
-                state.search_text.clear();
                 state.cursor_position = 0;
                 state.cursor_selection_anchor = None;
             }
-            state.result_query = query;
+            state.search_text = query.clone();
+            state.result_query = query.clone();
             state.results.clear();
             state.counters = UiCounters::default();
             state.selected = 0;
@@ -1201,33 +1457,18 @@ impl ViewModel {
             state.suggestion_selected = 0;
             state.active = Some(ActiveRequest {
                 id: request_id,
-                response_tx: active.response_tx,
-                search_session: session.clone(),
-                store,
-                picker_state,
-                interactions,
+                picker: Arc::clone(&picker),
             });
-            old_session
+            (active.picker, state.visible_update())
         };
-        old_session.stop();
-        self.clear_preview_selection();
-        session.start();
+        old_picker.stop_search();
+        old_picker.clear_preview();
+        //self.publish_ui_event(UiEvent::Results(initial_update));
+        picker.start_search(request_id, query, self.search_update_tx.clone());
     }
 
-    fn replace_active_store(&self, store: Arc<SharedStore>) {
-        let transition = {
-            let state = self.state.lock().expect("view model poisoned");
-            let Some(active) = state.active.as_ref() else {
-                return;
-            };
-            SourceTransition {
-                store,
-                picker_state: active.picker_state.clone(),
-                interactions: active.interactions.clone(),
-                clear_query: false,
-            }
-        };
-        self.replace_active_source(transition);
+    fn replace_active_session(&self, picker: Arc<dyn PickerSession>) {
+        self.replace_active_source(picker, false);
     }
 
     #[allow(dead_code)]
@@ -1283,19 +1524,19 @@ impl ViewModel {
             if search_update.session_id != active.id {
                 return;
             }
-            let store = Arc::clone(&active.store);
 
+            let picker = Arc::clone(&active.picker);
+            let query_update = picker.query_update(
+                &search_update.query,
+                &state.search_text,
+                state.cursor_position,
+            );
             state.results = search_update.results;
-            state.result_query = store
-                .snapshot()
-                .map(|source| source.effective_fuzzy_query(&search_update.query))
-                .unwrap_or_else(|| search_update.query.clone());
-            if let Some(source) = store.snapshot() {
-                state.suggestions = source.completions(&state.search_text, state.cursor_position);
-                state.suggestion_selected = state
-                    .suggestion_selected
-                    .min(state.suggestions.len().saturating_sub(1));
-            }
+            state.result_query = query_update.effective_query;
+            state.suggestions = query_update.completions;
+            state.suggestion_selected = state
+                .suggestion_selected
+                .min(state.suggestions.len().saturating_sub(1));
             state.counters = UiCounters {
                 displayed: state.results.len(),
                 matched: search_update.matched,
@@ -1312,36 +1553,22 @@ impl ViewModel {
     }
 
     fn publish_results(&self, update: UiUpdate) {
-        let (source, item, formatter) = {
+        let selection = {
             let state = self.state.lock().expect("view model poisoned");
-            let source = state
-                .active
-                .as_ref()
-                .and_then(|active| active.store.snapshot());
-            let item = Self::selected_item(&state);
-            let formatter = state
-                .active
-                .as_ref()
-                .and_then(|active| active.interactions.preview.clone());
-            (source, item, formatter)
+            state.active.as_ref().map(|active| {
+                (
+                    Arc::clone(&active.picker),
+                    state
+                        .results
+                        .get(state.selected)
+                        .map(|result| result.node_index),
+                )
+            })
         };
-        if let Some(formatter) = formatter {
-            self.preview
-                .formatted_preview_changed(item.as_ref().map(|item| formatter(item)));
-        } else {
-            self.preview.selected_result_changed(
-                update
-                    .results
-                    .get(update.selected_row)
-                    .map(|display| &display.result),
-                source.as_deref(),
-            );
+        if let Some((picker, index)) = selection {
+            picker.selection_changed(index);
         }
-        let _ = self.events_tx.send(UiEvent::Results(update));
-    }
-
-    fn clear_preview_selection(&self) {
-        self.preview.clear();
+        self.publish_ui_event(UiEvent::Results(update));
     }
 }
 
@@ -1389,8 +1616,7 @@ impl State {
     fn structured_header(&self) -> Option<String> {
         self.active
             .as_ref()
-            .and_then(|active| active.store.snapshot())
-            .and_then(|source| source.structured_header(&self.search_text))
+            .and_then(|active| active.picker.header(&self.search_text))
     }
 
     fn result_display_limit(&self) -> usize {
@@ -1398,30 +1624,48 @@ impl State {
     }
 
     fn visible_update(&self) -> UiUpdate {
-        let source = self
+        let picker = self
             .active
             .as_ref()
-            .and_then(|active| active.store.snapshot());
-        let header = source
-            .as_ref()
-            .and_then(|source| source.structured_header(&self.search_text));
-        let display_limit = PICKER_DISPLAY_LIMIT - usize::from(header.is_some());
-        let visible_results: Vec<_> = self
+            .map(|active| Arc::clone(&active.picker));
+        let mut indices = [0; PICKER_DISPLAY_LIMIT];
+        let mut visible_results = Vec::with_capacity(PICKER_DISPLAY_LIMIT);
+        for (slot, result) in self
             .results
             .iter()
             .skip(self.viewport_start)
-            .take(display_limit)
-            .cloned()
-            .map(|mut result| {
-                if let Some(display) = source.as_ref().and_then(|source| {
-                    source.structured_display(result.node_index, &self.search_text)
-                }) {
-                    result.path = display;
-                }
-                let positions = resolve_match_positions(&self.result_query, &result.path);
-                DisplaySearchResult { result, positions }
-            })
-            .collect();
+            .take(PICKER_DISPLAY_LIMIT)
+            .enumerate()
+        {
+            indices[slot] = result.node_index;
+            visible_results.push(DisplaySearchResult {
+                result: result.clone(),
+                positions: Vec::new(),
+            });
+        }
+        let mut rows: [Option<String>; PICKER_DISPLAY_LIMIT] = std::array::from_fn(|_| None);
+        let render = picker.as_ref().map_or_else(
+            || PickerRender {
+                header: None,
+                row_count: visible_results.len(),
+            },
+            |picker| {
+                picker.render(
+                    &self.search_text,
+                    &indices[..visible_results.len()],
+                    &mut rows,
+                )
+            },
+        );
+        let header = render.header;
+        let display_limit = PICKER_DISPLAY_LIMIT - usize::from(header.is_some());
+        visible_results.truncate(render.row_count);
+        for (result, display) in visible_results.iter_mut().zip(rows) {
+            if let Some(display) = display {
+                result.result.path = display;
+            }
+            result.positions = resolve_match_positions(&self.result_query, &result.result.path);
+        }
         let selected_row = if visible_results.is_empty() {
             0
         } else {
@@ -1444,6 +1688,22 @@ impl State {
 mod tests {
     use super::*;
     use crate::preview::{NativeWindowId, PreviewLine};
+
+    fn test_view_model() -> Arc<ViewModel> {
+        let (sender, _receiver) = unbounded();
+        ViewModel::new(Arc::new(RecordingUiEventSink(sender)))
+    }
+
+    fn test_view_model_with_events(preview_visible: bool) -> (Arc<ViewModel>, Receiver<UiEvent>) {
+        let (sender, receiver) = unbounded();
+        (
+            ViewModel::new_with_preview_visibility(
+                preview_visible,
+                Arc::new(RecordingUiEventSink(sender)),
+            ),
+            receiver,
+        )
+    }
 
     fn modifiers(ctrl: bool, shift: bool) -> KeyModifiers {
         KeyModifiers {
@@ -1478,7 +1738,7 @@ mod tests {
 
     #[test]
     fn semantic_input_inserts_unicode_and_replaces_selection() {
-        let view_model = ViewModel::new(PreviewService::default());
+        let view_model = test_view_model();
         view_model.insert_text("ab");
         view_model.handle_command(InputCommand::MoveLeft, modifiers(false, true));
         view_model.insert_text("é");
@@ -1491,7 +1751,7 @@ mod tests {
 
     #[test]
     fn semantic_input_moves_and_deletes_by_word() {
-        let view_model = ViewModel::new(PreviewService::default());
+        let view_model = test_view_model();
         view_model.insert_text("one two");
         view_model.handle_command(InputCommand::Backspace, modifiers(true, false));
         assert_eq!(view_model.current_search_text().text, "one ");
@@ -1502,9 +1762,9 @@ mod tests {
 
     #[test]
     fn preview_paging_overlaps_one_row_and_clamps_to_document() {
-        let view_model = ViewModel::new(PreviewService::default());
+        let (view_model, events) = test_view_model_with_events(true);
         view_model.set_preview_visible_rows(20);
-        while view_model.events_rx.try_recv().is_ok() {}
+        while events.try_recv().is_ok() {}
         {
             let mut state = view_model.state.lock().unwrap();
             state.preview_line_count = 50;
@@ -1518,43 +1778,43 @@ mod tests {
 
         view_model.handle_command(InputCommand::PreviewPageDown, KeyModifiers::default());
         assert!(matches!(
-            view_model.events_rx.try_recv(),
+            events.try_recv(),
             Ok(UiEvent::Preview(PreviewView::Text { top_line: 19, .. }))
         ));
 
         view_model.handle_command(InputCommand::PreviewPageDown, KeyModifiers::default());
         assert!(matches!(
-            view_model.events_rx.try_recv(),
+            events.try_recv(),
             Ok(UiEvent::Preview(PreviewView::Text { top_line: 30, .. }))
         ));
 
         view_model.handle_command(InputCommand::PreviewPageUp, KeyModifiers::default());
         assert!(matches!(
-            view_model.events_rx.try_recv(),
+            events.try_recv(),
             Ok(UiEvent::Preview(PreviewView::Text { top_line: 11, .. }))
         ));
     }
 
     #[test]
     fn preview_visibility_toggle_publishes_the_new_state() {
-        let view_model = ViewModel::new_with_preview_visibility(PreviewService::default(), false);
+        let (view_model, events) = test_view_model_with_events(false);
 
         view_model.handle_command(InputCommand::TogglePreview, KeyModifiers::default());
         assert!(matches!(
-            view_model.events_rx.try_recv(),
+            events.try_recv(),
             Ok(UiEvent::PreviewVisibilityChanged { visible: true })
         ));
 
         view_model.handle_command(InputCommand::TogglePreview, KeyModifiers::default());
         assert!(matches!(
-            view_model.events_rx.try_recv(),
+            events.try_recv(),
             Ok(UiEvent::PreviewVisibilityChanged { visible: false })
         ));
     }
 
     #[test]
     fn completed_preview_centers_the_requested_line() {
-        let view_model = ViewModel::new(PreviewService::default());
+        let view_model = test_view_model();
         {
             let mut state = view_model.state.lock().unwrap();
             state.preview_generation = 7;
@@ -1576,21 +1836,34 @@ mod tests {
     #[test]
     fn window_list_selection_emits_native_preview_target() {
         use crate::list_windows::WindowListItem;
+        use crate::picker_snapshot::WindowPickerItem;
         use crate::request::WindowListPickerRequest;
         use std::time::Duration;
 
-        let view_model = ViewModel::new(PreviewService::new(
-            crate::preview::PreviewConfig::NativeWindow,
-        ));
-        let events = view_model.subscribe();
+        let (view_model, events) = test_view_model_with_events(true);
         let runner = Arc::clone(&view_model);
         let request_thread = thread::spawn(move || {
-            runner.run_request(&WindowListPickerRequest {
+            let request = WindowListPickerRequest {
                 items: vec![WindowListItem {
                     text: "00001234      100 app.exe Window title".into(),
                     hwnd: 0x1234,
                 }],
-            })
+            };
+            runner.run_request_with_interactions(
+                &request,
+                PickerInteractions {
+                    preview_factory: Arc::new(PreviewFactory::new(
+                        crate::preview::PreviewConfig::NativeWindow,
+                    )),
+                    preview_routes: PreviewRoutes {
+                        native_window: Some(Arc::new(|item: &WindowPickerItem| {
+                            Some(NativeWindowId(item.native_window))
+                        })),
+                        ..PreviewRoutes::default()
+                    },
+                    ..PickerInteractions::default()
+                },
+            )
         });
 
         let mut selected = None;
@@ -1607,11 +1880,9 @@ mod tests {
         let response = request_thread.join().unwrap().unwrap();
         assert_eq!(
             response,
-            PickerResponse::Selected(SelectedItem {
-                item: "00001234      100 app.exe Window title".into(),
-                value: "00001234      100 app.exe Window title".into(),
-                line: None,
-                fields: HashMap::from([("NativeWindow".into(), "4660".into())]),
+            PickerResponse::Selected(WindowPickerItem {
+                title: "00001234      100 app.exe Window title".into(),
+                native_window: 4660,
             })
         );
     }

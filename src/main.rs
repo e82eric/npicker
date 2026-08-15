@@ -3,13 +3,13 @@ use std::io::Write;
 use std::sync::Arc;
 
 use anyhow::Result;
-use crossbeam_channel::bounded;
-use rust_nfm::action::{
-    ActionConfig, ActionDefinition, ActionResolverDefinition, ActionService, PickerState,
-};
+use nfm_picker_sources::delimited::DelimitedPickerItem;
+use nfm_picker_sources::structured::StructuredPickerItem;
+use rust_nfm::action::{ActionDefinition, ActionResolverDefinition, PickerState};
 use rust_nfm::key_binding::{parse_key_chord, KeyChord, KeyModifiers, KeyName};
 use rust_nfm::preview::{
-    PreviewConfig, PreviewOutputType, PreviewProfile, PreviewResolver, PreviewService,
+    CommandPreviewTarget, NativeWindowId, PreviewConfig, PreviewFactory, PreviewOutputType,
+    PreviewProfile, PreviewResolver, PreviewRoutes,
 };
 use rust_nfm::request::{
     CsvHeaderMode, DelimitedInputOptions, DelimitedStdinRequest, DelimitedTextSelector,
@@ -20,11 +20,12 @@ use rust_nfm::request::{
 use rust_nfm::request::{
     FileSystemPickerRequest, ProcessListPickerRequest, WindowListPickerRequest,
 };
-use rust_nfm::selection::SelectedItem;
 use rust_nfm::skia_ui as picker_ui;
 use rust_nfm::view_model::{
     PickerActionOutcome, PickerInteractions, SourceResolver, SourceTransition, ViewModel,
 };
+#[cfg(windows)]
+use rust_nfm::{ProcessPickerItem, WindowPickerItem};
 
 fn output_timing(line: &str) {
     #[cfg(windows)]
@@ -42,8 +43,11 @@ fn output_timing(line: &str) {
 }
 
 #[cfg(windows)]
-fn picker_source_resolver() -> SourceResolver {
-    Arc::new(|picker| match picker {
+fn picker_source_resolver(
+    preview_factory: Arc<PreviewFactory>,
+    actions: Arc<HashMap<String, ActionResolverDefinition>>,
+) -> SourceResolver<String> {
+    Arc::new(move |picker| match picker {
         PickerState::Filewalker { roots } => {
             let request = FileSystemPickerRequest {
                 root_directories: roots,
@@ -52,20 +56,15 @@ fn picker_source_resolver() -> SourceResolver {
                 files_only: false,
                 search_string: None,
             };
-            Ok(SourceTransition {
-                store: request.run(),
-                picker_state: request.picker_state(),
-                interactions: PickerInteractions::default(),
-                clear_query: true,
-            })
+            Ok(SourceTransition::new(
+                request.run(),
+                request.picker_state(),
+                filewalker_interactions(Arc::clone(&preview_factory), Arc::clone(&actions)),
+                true,
+            ))
         }
         _ => Err("unsupported picker source transition".into()),
     })
-}
-
-#[cfg(not(windows))]
-fn picker_source_resolver() -> SourceResolver {
-    Arc::new(|_| Err("picker source transitions are unavailable on this platform".into()))
 }
 
 fn main() -> Result<()> {
@@ -120,54 +119,63 @@ fn main() -> Result<()> {
         },
     };
     let preview_visible = preview_enabled && options.preview_visible.unwrap_or(!is_process_list);
-    let action_config = ActionConfig {
-        resolvers: options
+    let actions = Arc::new(
+        options
             .actions
             .into_iter()
             .filter_map(|(name, action)| {
                 action.program.map(|program| {
                     (
                         name,
-                        ActionDefinition::Process(ActionResolverDefinition {
+                        ActionResolverDefinition {
                             program: program.into(),
                             arguments: action.arguments,
-                        }),
+                        },
                     )
                 })
             })
             .collect(),
-    };
-    let bindings = options.bindings;
-    let view_model = ViewModel::new_with_services_bindings_and_source_resolver(
-        PreviewService::new(preview_config),
-        ActionService::new(action_config),
-        bindings,
-        preview_visible,
-        picker_source_resolver(),
     );
-    let (completion_tx, completion_rx) = bounded(1);
+    let bindings = options.bindings;
+    let preview_factory = Arc::new(PreviewFactory::new(preview_config.clone()));
+    let view = Arc::new(picker_ui::ViewHandle::new());
+    let view_model = ViewModel::new_with_bindings(bindings, preview_visible, view.clone());
     match options.input {
-        InputMode::Stdin(None) => run_stdin_request(Arc::clone(&view_model), completion_tx),
-        InputMode::Stdin(Some(options)) => {
-            run_delimited_request(Arc::clone(&view_model), options, completion_tx)
-        }
-        InputMode::StructuredCsv(options) => {
-            run_structured_csv_request(Arc::clone(&view_model), options, completion_tx)
-        }
-        InputMode::FileWalker(roots) => {
-            run_filewalker_request(Arc::clone(&view_model), roots, completion_tx)?
-        }
-        InputMode::ListWindows => run_list_windows_request(Arc::clone(&view_model), completion_tx)?,
-        InputMode::ListProcesses => {
-            run_list_processes_request(Arc::clone(&view_model), completion_tx)?
-        }
+        InputMode::Stdin(None) => run_stdin_request(
+            Arc::clone(&view_model),
+            Arc::clone(&preview_factory),
+            Arc::clone(&actions),
+        ),
+        InputMode::Stdin(Some(options)) => run_delimited_request(
+            Arc::clone(&view_model),
+            Arc::clone(&preview_factory),
+            Arc::clone(&actions),
+            options,
+        ),
+        InputMode::StructuredCsv(options) => run_structured_csv_request(
+            Arc::clone(&view_model),
+            Arc::clone(&preview_factory),
+            Arc::clone(&actions),
+            options,
+        ),
+        InputMode::FileWalker(roots) => run_filewalker_request(
+            Arc::clone(&view_model),
+            Arc::clone(&preview_factory),
+            Arc::clone(&actions),
+            roots,
+        )?,
+        InputMode::ListWindows => run_list_windows_request(
+            Arc::clone(&view_model),
+            Arc::clone(&preview_factory),
+            Arc::clone(&actions),
+        )?,
+        InputMode::ListProcesses => run_list_processes_request(
+            Arc::clone(&view_model),
+            Arc::clone(&preview_factory),
+            Arc::clone(&actions),
+        )?,
     }
-    let code = picker_ui::run(
-        view_model,
-        Some(completion_rx),
-        preview_enabled,
-        preview_visible,
-    )?;
+    let code = picker_ui::run(view_model, view, preview_enabled, preview_visible)?;
     if code != 0 {
         std::process::exit(code);
     }
@@ -229,27 +237,100 @@ fn resolve_native_window_preview(
     Ok(requested && !has_command_preview)
 }
 
+fn command_interactions<I, F>(
+    preview_factory: Arc<PreviewFactory>,
+    actions: Arc<HashMap<String, ActionResolverDefinition>>,
+    target: F,
+) -> PickerInteractions<I>
+where
+    I: rust_nfm::PickerItem,
+    F: Fn(&I) -> String + Send + Sync + 'static,
+{
+    PickerInteractions {
+        actions: typed_actions(&actions),
+        preview_factory,
+        preview_routes: PreviewRoutes {
+            command_target: Some(Arc::new(move |item| {
+                Some(CommandPreviewTarget {
+                    item: target(item),
+                    center_line: None,
+                })
+            })),
+            ..PreviewRoutes::default()
+        },
+        ..PickerInteractions::default()
+    }
+}
+
+fn typed_actions<I>(
+    actions: &HashMap<String, ActionResolverDefinition>,
+) -> HashMap<String, ActionDefinition<I>> {
+    actions
+        .iter()
+        .map(|(name, definition)| (name.clone(), ActionDefinition::Process(definition.clone())))
+        .collect()
+}
+
+#[cfg(windows)]
+fn filewalker_interactions(
+    preview_factory: Arc<PreviewFactory>,
+    actions: Arc<HashMap<String, ActionResolverDefinition>>,
+) -> PickerInteractions<String> {
+    let mut interactions = command_interactions(
+        Arc::clone(&preview_factory),
+        Arc::clone(&actions),
+        |item: &String| item.clone(),
+    );
+    interactions.source_resolver = Some(picker_source_resolver(preview_factory, actions));
+    interactions
+}
+
 fn run_delimited_request(
     view_model: Arc<ViewModel>,
+    preview_factory: Arc<PreviewFactory>,
+    actions: Arc<HashMap<String, ActionResolverDefinition>>,
     options: DelimitedInputOptions,
-    completion: crossbeam_channel::Sender<i32>,
 ) {
     std::thread::spawn(move || {
         let request = DelimitedStdinRequest::new(options, None);
-        let code = response_exit_code(view_model.run_request(&request));
-        let _ = completion.send(code);
+        let interactions = PickerInteractions {
+            actions: typed_actions(&actions),
+            preview_factory,
+            preview_routes: PreviewRoutes {
+                command_target: Some(Arc::new(|item: &DelimitedPickerItem| {
+                    Some(CommandPreviewTarget {
+                        item: item
+                            .preview_item
+                            .clone()
+                            .unwrap_or_else(|| item.value.clone()),
+                        center_line: item.preview_center_line,
+                    })
+                })),
+                ..PreviewRoutes::default()
+            },
+            ..PickerInteractions::default()
+        };
+        let code =
+            response_exit_code(view_model.run_request_with_interactions(&request, interactions));
+        view_model.exit(code);
     });
 }
 
 fn run_structured_csv_request(
     view_model: Arc<ViewModel>,
+    preview_factory: Arc<PreviewFactory>,
+    actions: Arc<HashMap<String, ActionResolverDefinition>>,
     options: StructuredCsvOptions,
-    completion: crossbeam_channel::Sender<i32>,
 ) {
     std::thread::spawn(move || {
         let request = StructuredCsvStdinRequest::new(options, None);
-        let code = response_exit_code(view_model.run_request(&request));
-        let _ = completion.send(code);
+        let interactions =
+            command_interactions(preview_factory, actions, |item: &StructuredPickerItem| {
+                item.value.clone()
+            });
+        let code =
+            response_exit_code(view_model.run_request_with_interactions(&request, interactions));
+        view_model.exit(code);
     });
 }
 
@@ -259,24 +340,50 @@ fn debug_wait() {
     std::thread::sleep(std::time::Duration::from_secs(20));
 }
 
-fn run_stdin_request(view_model: Arc<ViewModel>, completion: crossbeam_channel::Sender<i32>) {
+fn run_stdin_request(
+    view_model: Arc<ViewModel>,
+    preview_factory: Arc<PreviewFactory>,
+    actions: Arc<HashMap<String, ActionResolverDefinition>>,
+) {
     std::thread::spawn(move || {
         let request = StdinRequest::new(None);
-        let code = response_exit_code(view_model.run_request(&request));
-        let _ = completion.send(code);
+        let interactions =
+            command_interactions(preview_factory, actions, |item: &String| item.clone());
+        let code =
+            response_exit_code(view_model.run_request_with_interactions(&request, interactions));
+        view_model.exit(code);
     });
 }
 
 #[cfg(windows)]
 fn run_list_windows_request(
     view_model: Arc<ViewModel>,
-    completion: crossbeam_channel::Sender<i32>,
+    preview_factory: Arc<PreviewFactory>,
+    actions: Arc<HashMap<String, ActionResolverDefinition>>,
 ) -> Result<()> {
     let items = rust_nfm::list_windows::list_windows()?;
     std::thread::spawn(move || {
         let request = WindowListPickerRequest { items };
-        let code = response_exit_code(view_model.run_request(&request));
-        let _ = completion.send(code);
+        let interactions = PickerInteractions {
+            actions: typed_actions(&actions),
+            preview_factory,
+            preview_routes: PreviewRoutes {
+                command_target: Some(Arc::new(|item: &WindowPickerItem| {
+                    Some(CommandPreviewTarget {
+                        item: item.title.clone(),
+                        center_line: None,
+                    })
+                })),
+                native_window: Some(Arc::new(|item: &WindowPickerItem| {
+                    Some(NativeWindowId(item.native_window))
+                })),
+                formatted: None,
+            },
+            ..PickerInteractions::default()
+        };
+        let code =
+            response_exit_code(view_model.run_request_with_interactions(&request, interactions));
+        view_model.exit(code);
     });
     Ok(())
 }
@@ -284,51 +391,51 @@ fn run_list_windows_request(
 #[cfg(windows)]
 fn run_list_processes_request(
     view_model: Arc<ViewModel>,
-    completion: crossbeam_channel::Sender<i32>,
+    preview_factory: Arc<PreviewFactory>,
+    actions: Arc<HashMap<String, ActionResolverDefinition>>,
 ) -> Result<()> {
     let items = rust_nfm::list_processes::list_processes()?;
     std::thread::spawn(move || {
         let request = ProcessListPickerRequest { items };
-        let code = response_exit_code(
-            view_model.run_request_with_interactions(&request, process_interactions()),
-        );
-        let _ = completion.send(code);
+        let code = response_exit_code(view_model.run_request_with_interactions(
+            &request,
+            process_interactions(preview_factory, actions),
+        ));
+        view_model.exit(code);
     });
     Ok(())
 }
 
 #[cfg(windows)]
-fn process_interactions() -> PickerInteractions {
+fn process_interactions(
+    preview_factory: Arc<PreviewFactory>,
+    actions: Arc<HashMap<String, ActionResolverDefinition>>,
+) -> PickerInteractions<ProcessPickerItem> {
     let refresh = Arc::new(|| {
         let items = rust_nfm::list_processes::list_processes()
             .map_err(|error| format!("Failed to refresh processes: {error}"))?;
         Ok(ProcessListPickerRequest { items }.run())
     });
-    let kill = Arc::new(|selected: Option<&SelectedItem>| {
+    let kill = Arc::new(|selected: Option<&ProcessPickerItem>| {
         let pid = selected
-            .and_then(|item| item.fields.get("PID"))
-            .ok_or_else(|| "No process selected".to_owned())?
-            .parse::<u32>()
-            .map_err(|error| format!("Selected item has an invalid PID: {error}"))?;
+            .map(|item| item.pid)
+            .ok_or_else(|| "No process selected".to_owned())?;
         rust_nfm::list_processes::terminate_process(pid)
             .map_err(|error| format!("Failed to terminate process {pid}: {error}"))?;
         Ok(PickerActionOutcome::RefreshWithToast(format!(
             "Terminated process {pid}"
         )))
     });
-    let refresh_action = Arc::new(|_: Option<&SelectedItem>| Ok(PickerActionOutcome::Refresh));
-    let preview = Arc::new(|item: &SelectedItem| {
-        Ok(["Name", "PID", "WorkingSet", "PrivateBytes", "CPU"]
-            .into_iter()
-            .filter_map(|name| {
-                item.fields
-                    .get(name)
-                    .map(|value| format!("{name}: {value}"))
-            })
-            .collect::<Vec<_>>()
-            .join("\n"))
+    let refresh_action = Arc::new(|_: Option<&ProcessPickerItem>| Ok(PickerActionOutcome::Refresh));
+    let preview = Arc::new(|item: &ProcessPickerItem| {
+        Ok(format!(
+            "Name: {}\nPID: {}\nWorkingSet: {}\nPrivateBytes: {}\nCPU: {}",
+            item.name, item.pid, item.working_set_kb, item.private_bytes_kb, item.cpu_seconds,
+        ))
     });
     PickerInteractions {
+        actions: typed_actions(&actions),
+        source_resolver: None,
         bindings: HashMap::from([
             (
                 KeyChord {
@@ -352,14 +459,19 @@ fn process_interactions() -> PickerInteractions {
             ),
         ]),
         refresh: Some(refresh),
-        preview: Some(preview),
+        preview_factory,
+        preview_routes: PreviewRoutes {
+            formatted: Some(preview),
+            ..PreviewRoutes::default()
+        },
     }
 }
 
 #[cfg(not(windows))]
 fn run_list_processes_request(
     _view_model: Arc<ViewModel>,
-    _completion: crossbeam_channel::Sender<i32>,
+    _preview_factory: Arc<PreviewFactory>,
+    _actions: Arc<HashMap<String, ActionResolverDefinition>>,
 ) -> Result<()> {
     anyhow::bail!("the listprocesses command is currently available only on Windows")
 }
@@ -367,7 +479,8 @@ fn run_list_processes_request(
 #[cfg(not(windows))]
 fn run_list_windows_request(
     _view_model: Arc<ViewModel>,
-    _completion: crossbeam_channel::Sender<i32>,
+    _preview_factory: Arc<PreviewFactory>,
+    _actions: Arc<HashMap<String, ActionResolverDefinition>>,
 ) -> Result<()> {
     anyhow::bail!("the listwindows command is currently available only on Windows")
 }
@@ -375,8 +488,9 @@ fn run_list_windows_request(
 #[cfg(windows)]
 fn run_filewalker_request(
     view_model: Arc<ViewModel>,
+    preview_factory: Arc<PreviewFactory>,
+    actions: Arc<HashMap<String, ActionResolverDefinition>>,
     roots: Vec<String>,
-    completion: crossbeam_channel::Sender<i32>,
 ) -> Result<()> {
     let roots = if roots.is_empty() {
         vec![default_home_directory()?]
@@ -391,8 +505,10 @@ fn run_filewalker_request(
             files_only: false,
             search_string: None,
         };
-        let code = response_exit_code(view_model.run_request(&request));
-        let _ = completion.send(code);
+        let interactions = filewalker_interactions(preview_factory, actions);
+        let code =
+            response_exit_code(view_model.run_request_with_interactions(&request, interactions));
+        view_model.exit(code);
     });
     Ok(())
 }
@@ -400,8 +516,9 @@ fn run_filewalker_request(
 #[cfg(not(windows))]
 fn run_filewalker_request(
     _view_model: Arc<ViewModel>,
+    _preview_factory: Arc<PreviewFactory>,
+    _actions: Arc<HashMap<String, ActionResolverDefinition>>,
     _roots: Vec<String>,
-    _completion: crossbeam_channel::Sender<i32>,
 ) -> Result<()> {
     anyhow::bail!("the filewalker input mode is currently available only on Windows")
 }
@@ -420,11 +537,11 @@ fn default_home_directory() -> Result<String> {
     Ok(std::env::current_dir()?.to_string_lossy().into_owned())
 }
 
-fn response_exit_code(response: Result<PickerResponse>) -> i32 {
+fn response_exit_code<I: rust_nfm::PickerItem>(response: Result<PickerResponse<I>>) -> i32 {
     match response {
-        Ok(PickerResponse::Selected(selection)) => {
+        Ok(PickerResponse::Selected(item)) => {
             let mut stdout = std::io::stdout().lock();
-            if writeln!(stdout, "{}", selection.value).is_err() || stdout.flush().is_err() {
+            if writeln!(stdout, "{}", item.value()).is_err() || stdout.flush().is_err() {
                 1
             } else {
                 0

@@ -4,21 +4,19 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::process::{Command, Stdio};
 use std::sync::OnceLock;
 
-use crate::action::{
-    ActionConfig, ActionDefinition, ActionResolution, ActionService, ActionState, PickerState,
-};
+use crate::action::{ActionDefinition, ActionResolution, ActionState, PickerState};
 use crate::key_binding::{KeyChord, KeyModifiers, KeyName};
 use crate::list_processes::{list_processes, terminate_process};
 use crate::list_windows::list_windows;
+use crate::picker_snapshot::{ProcessPickerItem, WindowPickerItem};
 use crate::preview::{
-    CommandPreviewTarget, PreviewCancellation, PreviewConfig, PreviewJob, PreviewOutputType,
-    PreviewProfile, PreviewResolver, PreviewService,
+    CommandPreviewTarget, PreviewCancellation, PreviewConfig, PreviewFactory, PreviewJob,
+    PreviewOutputType, PreviewProfile, PreviewResolver, PreviewRoutes,
 };
 use crate::request::{
     FileSystemPickerRequest, FlatItemsPickerRequest, PickerRequest, PickerResponse,
     ProcessListPickerRequest, WindowListPickerRequest,
 };
-use crate::selection::SelectedItem;
 use crate::skia_ui as picker_ui;
 use crate::view_model::{
     PickerActionOutcome, PickerInteractions, SourceResolver, SourceTransition, ViewModel,
@@ -49,6 +47,50 @@ fn output_debug_string(line: &str) {
     unsafe {
         OutputDebugStringW(PCWSTR(wide.as_ptr()));
     }
+}
+
+fn ffi_preview_factory() -> Arc<PreviewFactory> {
+    Arc::new(PreviewFactory::new(PreviewConfig::CommandOrNativeWindow(
+        PreviewResolver::Function(resolve_native_file_preview),
+    )))
+}
+
+fn command_interactions<I, F>(target: F) -> PickerInteractions<I>
+where
+    I: crate::PickerItem,
+    F: Fn(&I) -> String + Send + Sync + 'static,
+{
+    PickerInteractions {
+        actions: HashMap::from([(
+            "ffi-accept".into(),
+            ActionDefinition::Native(Arc::new(|_| Ok(ActionResolution::Complete))),
+        )]),
+        preview_factory: ffi_preview_factory(),
+        preview_routes: PreviewRoutes {
+            command_target: Some(Arc::new(move |item| {
+                Some(CommandPreviewTarget {
+                    item: target(item),
+                    center_line: None,
+                })
+            })),
+            ..PreviewRoutes::default()
+        },
+        ..PickerInteractions::default()
+    }
+}
+
+fn file_system_interactions() -> PickerInteractions<String> {
+    let mut interactions = command_interactions(|item: &String| item.clone());
+    interactions.actions.insert(
+        "ffi-accept".into(),
+        ActionDefinition::Native(Arc::new(resolve_file_system_accept)),
+    );
+    interactions.actions.insert(
+        "ffi-parent".into(),
+        ActionDefinition::Native(Arc::new(resolve_file_system_parent)),
+    );
+    interactions.source_resolver = Some(file_picker_source_resolver());
+    interactions
 }
 
 #[unsafe(no_mangle)]
@@ -82,10 +124,11 @@ pub extern "C" fn RustNfmShowProgramsList(
                 search_string: None,
             };
 
-            match view_model.run_request(&request) {
-                Ok(PickerResponse::Selected(selected)) => {
+            let interactions = file_system_interactions();
+            match view_model.run_request_with_interactions(&request, interactions) {
+                Ok(PickerResponse::Selected(item)) => {
                     if let Some(on_select) = on_select {
-                        if let Ok(selected) = CString::new(selected.value) {
+                        if let Ok(selected) = CString::new(item) {
                             unsafe {
                                 on_select(selected.as_ptr() as *mut c_char, state as *mut c_void);
                             }
@@ -102,37 +145,35 @@ pub extern "C" fn RustNfmShowProgramsList(
     }));
 }
 
-fn process_interactions() -> PickerInteractions {
+fn process_interactions() -> PickerInteractions<ProcessPickerItem> {
     let refresh = Arc::new(|| {
         let items =
             list_processes().map_err(|error| format!("Failed to refresh processes: {error}"))?;
         Ok(ProcessListPickerRequest { items }.run())
     });
-    let kill = Arc::new(|selected: Option<&SelectedItem>| {
+    let kill = Arc::new(|selected: Option<&ProcessPickerItem>| {
         let pid = selected
-            .and_then(|item| item.fields.get("PID"))
-            .ok_or_else(|| "No process selected".to_owned())?
-            .parse::<u32>()
-            .map_err(|error| format!("Selected item has an invalid PID: {error}"))?;
+            .map(|item| item.pid)
+            .ok_or_else(|| "No process selected".to_owned())?;
         terminate_process(pid)
             .map_err(|error| format!("Failed to terminate process {pid}: {error}"))?;
         Ok(PickerActionOutcome::RefreshWithToast(format!(
             "Terminated process {pid}"
         )))
     });
-    let refresh_action = Arc::new(|_: Option<&SelectedItem>| Ok(PickerActionOutcome::Refresh));
-    let preview = Arc::new(|item: &SelectedItem| {
-        Ok(["Name", "PID", "WorkingSet", "PrivateBytes", "CPU"]
-            .into_iter()
-            .filter_map(|name| {
-                item.fields
-                    .get(name)
-                    .map(|value| format!("{name}: {value}"))
-            })
-            .collect::<Vec<_>>()
-            .join("\n"))
+    let refresh_action = Arc::new(|_: Option<&ProcessPickerItem>| Ok(PickerActionOutcome::Refresh));
+    let preview = Arc::new(|item: &ProcessPickerItem| {
+        Ok(format!(
+            "Name: {}\nPID: {}\nWorkingSet: {}\nPrivateBytes: {}\nCPU: {}",
+            item.name, item.pid, item.working_set_kb, item.private_bytes_kb, item.cpu_seconds,
+        ))
     });
     PickerInteractions {
+        actions: HashMap::from([(
+            "ffi-accept".into(),
+            ActionDefinition::Native(Arc::new(|_| Ok(ActionResolution::Complete))),
+        )]),
+        source_resolver: None,
         bindings: HashMap::from([
             (
                 KeyChord {
@@ -156,7 +197,11 @@ fn process_interactions() -> PickerInteractions {
             ),
         ]),
         refresh: Some(refresh),
-        preview: Some(preview),
+        preview_factory: Arc::new(PreviewFactory::new(PreviewConfig::Formatted)),
+        preview_routes: PreviewRoutes {
+            formatted: Some(preview),
+            ..PreviewRoutes::default()
+        },
     }
 }
 
@@ -190,10 +235,11 @@ pub unsafe extern "C" fn RustNfmShowFileSystem(
                 files_only: false,
                 search_string: None,
             };
-            match view_model.run_request(&request) {
-                Ok(PickerResponse::Selected(selected)) => {
+            let interactions = file_system_interactions();
+            match view_model.run_request_with_interactions(&request, interactions) {
+                Ok(PickerResponse::Selected(item)) => {
                     if let Some(on_select) = on_select {
-                        if let Ok(selected) = CString::new(selected.value) {
+                        if let Ok(selected) = CString::new(item) {
                             unsafe {
                                 on_select(selected.as_ptr() as *mut c_char, state as *mut c_void)
                             };
@@ -228,23 +274,37 @@ pub extern "C" fn RustNfmShowWindows(
         let state = state as usize;
         thread::spawn(move || {
             let request = WindowListPickerRequest { items };
-            match view_model.run_request(&request) {
-                Ok(PickerResponse::Selected(selected)) => {
-                    let hwnd = selected
-                        .fields
-                        .get("NativeWindow")
-                        .and_then(|value| value.parse::<isize>().ok());
-                    match (hwnd, on_select) {
-                        (Some(hwnd), Some(on_select)) => unsafe {
-                            on_select(hwnd, state as *mut c_void)
-                        },
-                        _ => {
-                            if let Some(on_closed) = on_closed {
-                                unsafe { on_closed() };
-                            }
+            let interactions = PickerInteractions {
+                actions: HashMap::from([(
+                    "ffi-accept".into(),
+                    ActionDefinition::Native(Arc::new(|_| Ok(ActionResolution::Complete))),
+                )]),
+                preview_factory: ffi_preview_factory(),
+                preview_routes: PreviewRoutes {
+                    command_target: Some(Arc::new(|item: &WindowPickerItem| {
+                        Some(CommandPreviewTarget {
+                            item: item.title.clone(),
+                            center_line: None,
+                        })
+                    })),
+                    native_window: Some(Arc::new(|item: &WindowPickerItem| {
+                        Some(crate::preview::NativeWindowId(item.native_window))
+                    })),
+                    formatted: None,
+                },
+                ..PickerInteractions::default()
+            };
+            match view_model.run_request_with_interactions(&request, interactions) {
+                Ok(PickerResponse::Selected(item)) => match on_select {
+                    Some(on_select) => unsafe {
+                        on_select(item.native_window, state as *mut c_void)
+                    },
+                    _ => {
+                        if let Some(on_closed) = on_closed {
+                            unsafe { on_closed() };
                         }
                     }
-                }
+                },
                 _ => {
                     if let Some(on_closed) = on_closed {
                         unsafe { on_closed() };
@@ -274,22 +334,14 @@ pub extern "C" fn RustNfmShowProcesses(
         thread::spawn(move || {
             let request = ProcessListPickerRequest { items };
             match view_model.run_request_with_interactions(&request, process_interactions()) {
-                Ok(PickerResponse::Selected(selected)) => {
-                    let pid = selected
-                        .fields
-                        .get("PID")
-                        .and_then(|value| value.parse::<u32>().ok());
-                    match (pid, on_select) {
-                        (Some(pid), Some(on_select)) => unsafe {
-                            on_select(pid, state as *mut c_void)
-                        },
-                        _ => {
-                            if let Some(on_closed) = on_closed {
-                                unsafe { on_closed() };
-                            }
+                Ok(PickerResponse::Selected(item)) => match on_select {
+                    Some(on_select) => unsafe { on_select(item.pid, state as *mut c_void) },
+                    _ => {
+                        if let Some(on_closed) = on_closed {
+                            unsafe { on_closed() };
                         }
                     }
-                }
+                },
                 _ => {
                     if let Some(on_closed) = on_closed {
                         unsafe { on_closed() };
@@ -358,10 +410,11 @@ pub extern "C" fn RustNfmShowItemsList(
                 search_string: None,
             };
 
-            match view_model.run_request(&request) {
-                Ok(PickerResponse::Selected(selected)) => {
+            let interactions = command_interactions(|item: &String| item.clone());
+            match view_model.run_request_with_interactions(&request, interactions) {
+                Ok(PickerResponse::Selected(item)) => {
                     if let Some(on_select) = on_select {
-                        if let Ok(selected) = CString::new(selected.value) {
+                        if let Ok(selected) = CString::new(item) {
                             unsafe {
                                 on_select(selected.as_ptr() as *mut c_char, state as *mut c_void);
                             }
@@ -403,15 +456,6 @@ pub extern "C" fn RustNfmSetMenuLocation(x: i32, y: i32) {
 
 fn ensure_initialized() -> Arc<ViewModel> {
     Arc::clone(VIEW_MODEL.get_or_init(|| {
-        let mut resolvers = HashMap::new();
-        resolvers.insert(
-            "ffi-accept".into(),
-            ActionDefinition::Native(resolve_file_system_accept),
-        );
-        resolvers.insert(
-            "ffi-parent".into(),
-            ActionDefinition::Native(resolve_file_system_parent),
-        );
         let mut bindings = HashMap::new();
         bindings.insert(
             KeyChord {
@@ -430,18 +474,11 @@ fn ensure_initialized() -> Arc<ViewModel> {
             },
             "ffi-parent".into(),
         );
-        let view_model = ViewModel::new_with_services_bindings_and_source_resolver(
-            PreviewService::new(PreviewConfig::CommandOrNativeWindow(
-                PreviewResolver::Function(resolve_native_file_preview),
-            )),
-            ActionService::new(ActionConfig { resolvers }),
-            bindings,
-            false,
-            file_picker_source_resolver(),
-        );
+        let view = Arc::new(picker_ui::ViewHandle::new());
+        let view_model = ViewModel::new_with_bindings(bindings, false, view.clone());
         let ui_view_model = Arc::clone(&view_model);
         std::thread::spawn(move || {
-            if let Err(error) = picker_ui::run(ui_view_model, None, true, false) {
+            if let Err(error) = picker_ui::run(ui_view_model, view, true, false) {
                 eprintln!("RustNfm UI stopped: {error:?}");
             }
         });
@@ -608,23 +645,20 @@ fn resolve_video_frame_preview(
     }))
 }
 
-fn resolve_file_system_accept(state: &ActionState) -> Result<ActionResolution, String> {
-    let Some(selection) = &state.selection else {
+fn resolve_file_system_accept(state: &ActionState<String>) -> Result<ActionResolution, String> {
+    let Some(selection) = state.selection.as_ref() else {
         return Ok(ActionResolution::None);
     };
-    if selection.fields.contains_key("NativeWindow") {
-        return Ok(ActionResolution::Complete);
-    }
-    if std::path::Path::new(&selection.item).is_dir() {
+    if std::path::Path::new(selection).is_dir() {
         Ok(ActionResolution::Picker(PickerState::Filewalker {
-            roots: vec![selection.item.clone()],
+            roots: vec![selection.clone()],
         }))
     } else {
         Ok(ActionResolution::Complete)
     }
 }
 
-fn resolve_file_system_parent(state: &ActionState) -> Result<ActionResolution, String> {
+fn resolve_file_system_parent(state: &ActionState<String>) -> Result<ActionResolution, String> {
     let PickerState::Filewalker { roots } = &state.picker else {
         return Ok(ActionResolution::None);
     };
@@ -635,7 +669,7 @@ fn resolve_file_system_parent(state: &ActionState) -> Result<ActionResolution, S
     Ok(ActionResolution::Picker(PickerState::Filewalker { roots }))
 }
 
-fn file_picker_source_resolver() -> SourceResolver {
+fn file_picker_source_resolver() -> SourceResolver<String> {
     Arc::new(|picker| match picker {
         PickerState::Filewalker { roots } => {
             let request = FileSystemPickerRequest {
@@ -645,12 +679,12 @@ fn file_picker_source_resolver() -> SourceResolver {
                 files_only: false,
                 search_string: None,
             };
-            Ok(SourceTransition {
-                store: request.run(),
-                picker_state: request.picker_state(),
-                interactions: PickerInteractions::default(),
-                clear_query: true,
-            })
+            Ok(SourceTransition::new(
+                request.run(),
+                request.picker_state(),
+                file_system_interactions(),
+                true,
+            ))
         }
         _ => Err("unsupported picker source transition".into()),
     })
@@ -750,14 +784,9 @@ mod tests {
     }
 
     #[test]
-    fn window_accept_completes_instead_of_treating_the_title_as_a_path() {
+    fn file_accept_completes_for_a_non_directory() {
         let state = ActionState {
-            selection: Some(crate::selection::SelectedItem {
-                item: "00001234 app.exe Window title".into(),
-                value: "00001234 app.exe Window title".into(),
-                line: None,
-                fields: HashMap::from([("NativeWindow".into(), "4660".into())]),
-            }),
+            selection: Some(r"Z:\nfm-nonexistent-file".into()),
             picker: PickerState::Stdin,
             query: String::new(),
         };

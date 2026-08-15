@@ -6,9 +6,15 @@ use std::sync::{Arc, RwLock};
 
 use chrono::{DateTime, NaiveDate, NaiveDateTime};
 use nfm_search_core::store::{
-    ChunkedSnapshot, ChunkedStorage, FlatSnapshot, ItemsSource, SearchPlan,
+    ChunkedSnapshot, ChunkedStorage, FlatSnapshot, ItemsSource, SearchCompletion, SearchPlan,
 };
 use regex::RegexBuilder;
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+pub struct StructuredPickerItem {
+    pub value: String,
+    pub fields: HashMap<String, String>,
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StructuredSchema {
@@ -86,11 +92,11 @@ impl StructuredStreamingStore {
 
     pub fn add_record(&mut self, record: &csv::StringRecord) -> Result<(), String> {
         if record.len() != self.schema.columns.len() {
-            return Err(
-                format!("record has {} fields, expected {}",
+            return Err(format!(
+                "record has {} fields, expected {}",
                 record.len(),
                 self.schema.columns.len()
-            ))
+            ));
         }
 
         let first_cell = self.cells.len();
@@ -170,14 +176,6 @@ pub struct StructuredStreamingSnapshot {
     column_widths: Arc<[usize]>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct CompletionSuggestion {
-    pub text: String,
-    pub positions: Vec<usize>,
-    pub replacement: String,
-    pub replace: Range<usize>,
-}
-
 impl StructuredStreamingSnapshot {
     pub fn schema(&self) -> &StructuredSchema {
         &self.schema
@@ -195,12 +193,8 @@ impl StructuredStreamingSnapshot {
             .columns
             .iter()
             .enumerate()
-            .map(|(column_index, column)| {
-                (
-                    column.clone(),
-                    self.cell_string(row, column_index)
-                )
-            }).collect()
+            .map(|(column_index, column)| (column.clone(), self.cell_string(row, column_index)))
+            .collect()
     }
 
     pub fn header(&self, query: &str) -> String {
@@ -244,8 +238,7 @@ impl StructuredStreamingSnapshot {
     fn cell_string(&self, row: usize, column: usize) -> String {
         let mut stack = [0; 4096];
         let mut heap = Vec::new();
-        self
-            .cell_bytes(row, column, &mut stack, &mut heap)
+        self.cell_bytes(row, column, &mut stack, &mut heap)
             .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
             .unwrap_or_default()
     }
@@ -264,7 +257,7 @@ impl StructuredStreamingSnapshot {
         Some(self.range(self.cells[row.first_cell + column], stack, heap))
     }
 
-    pub fn completions(&self, input: &str, cursor: usize) -> Vec<CompletionSuggestion> {
+    pub fn completions(&self, input: &str, cursor: usize) -> Vec<SearchCompletion> {
         if cursor > input.len() || !input.is_char_boundary(cursor) {
             return Vec::new();
         }
@@ -280,7 +273,7 @@ impl StructuredStreamingSnapshot {
         if token == "/" {
             return [("/:", "Filter"), ("/!", "Sort"), ("/#", "Display columns")]
                 .into_iter()
-                .map(|(replacement, description)| CompletionSuggestion {
+                .map(|(replacement, description)| SearchCompletion {
                     text: format!("{replacement}   {description}"),
                     positions: Vec::new(),
                     replacement: if replacement == "/#" {
@@ -490,7 +483,7 @@ fn suggestions_for(
     prefix: &str,
     replace: Range<usize>,
     replacement: impl Fn(&str) -> String,
-) -> Vec<CompletionSuggestion> {
+) -> Vec<SearchCompletion> {
     let prefix = unquote(prefix).to_lowercase();
     let values = if prefix.is_empty() {
         values
@@ -511,7 +504,7 @@ fn suggestions_for(
     values
         .into_iter()
         .take(50)
-        .map(|text| CompletionSuggestion {
+        .map(|text| SearchCompletion {
             positions: if prefix.is_empty() {
                 Vec::new()
             } else {
@@ -536,6 +529,8 @@ fn quote_if_needed(value: &str) -> String {
 }
 
 impl ItemsSource for StructuredStreamingSnapshot {
+    type Item = StructuredPickerItem;
+
     fn version(&self) -> u64 {
         self.version
     }
@@ -562,6 +557,32 @@ impl ItemsSource for StructuredStreamingSnapshot {
 
     fn create_search_plan(&self, query: &str) -> Box<dyn SearchPlan + '_> {
         Box::new(StructuredSearchPlan::compile(self, query))
+    }
+
+    fn item(&self, node_index: usize) -> Option<Self::Item> {
+        if node_index >= self.row_count {
+            return None;
+        }
+        Some(StructuredPickerItem {
+            value: self.value(node_index),
+            fields: self.fields(node_index),
+        })
+    }
+
+    fn header(&self, query: &str) -> Option<String> {
+        Some(StructuredStreamingSnapshot::header(self, query))
+    }
+
+    fn display_text(&self, node_index: usize, query: &str) -> Option<String> {
+        (node_index < self.row_count).then(|| self.display_row(node_index, query))
+    }
+
+    fn completions(&self, input: &str, cursor: usize) -> Vec<SearchCompletion> {
+        StructuredStreamingSnapshot::completions(self, input, cursor)
+    }
+
+    fn effective_query(&self, input: &str) -> String {
+        fuzzy_query(input)
     }
 }
 
@@ -1003,9 +1024,15 @@ mod tests {
         let mut store = StructuredStreamingStore::new(
             StructuredSchema::new(vec!["Name".into(), "Length".into()]).unwrap(),
         );
-        store.add_record(&csv::StringRecord::from(vec!["beta", "2"])).unwrap();
-        store.add_record(&csv::StringRecord::from(vec!["alpha", "10"])).unwrap();
-        store.add_record(&csv::StringRecord::from(vec!["gamma", "1"])).unwrap();
+        store
+            .add_record(&csv::StringRecord::from(vec!["beta", "2"]))
+            .unwrap();
+        store
+            .add_record(&csv::StringRecord::from(vec!["alpha", "10"]))
+            .unwrap();
+        store
+            .add_record(&csv::StringRecord::from(vec!["gamma", "1"]))
+            .unwrap();
         let snapshot = store.snapshot();
         let output = nfm_search_core::search::search(
             Arc::clone(&snapshot),
@@ -1030,8 +1057,12 @@ mod tests {
         let mut store = StructuredStreamingStore::new(
             StructuredSchema::new(vec!["Name".into(), "Length".into()]).unwrap(),
         );
-        store.add_record(&csv::StringRecord::from(vec!["alpha", "10"])).unwrap();
-        store.add_record(&csv::StringRecord::from(vec!["beta", "2"])).unwrap();
+        store
+            .add_record(&csv::StringRecord::from(vec!["alpha", "10"]))
+            .unwrap();
+        store
+            .add_record(&csv::StringRecord::from(vec!["beta", "2"]))
+            .unwrap();
         let snapshot = store.snapshot();
 
         assert_eq!(snapshot.header(""), "Name   Length");
@@ -1048,7 +1079,9 @@ mod tests {
         let mut store = StructuredStreamingStore::new(
             StructuredSchema::new(vec!["Name".into(), "Status".into()]).unwrap(),
         );
-        store.add_record(&csv::StringRecord::from(vec!["alpha", "Running"])).unwrap();
+        store
+            .add_record(&csv::StringRecord::from(vec!["alpha", "Running"]))
+            .unwrap();
         let snapshot = store.snapshot();
 
         let sort = snapshot.completions("/!De", 4);
@@ -1068,7 +1101,9 @@ mod tests {
         let mut store = StructuredStreamingStore::new(
             StructuredSchema::new(vec!["Name".into(), "Status".into()]).unwrap(),
         );
-        store.add_record(&csv::StringRecord::from(vec!["alpha", "Running"])).unwrap();
+        store
+            .add_record(&csv::StringRecord::from(vec!["alpha", "Running"]))
+            .unwrap();
         let snapshot = store.snapshot();
 
         let columns = snapshot.completions("/:Na", 4);
@@ -1088,7 +1123,9 @@ mod tests {
         let mut store = StructuredStreamingStore::new(
             StructuredSchema::new(vec!["Name".into(), "Status".into()]).unwrap(),
         );
-        store.add_record(&csv::StringRecord::from(vec!["alpha", "Running"])).unwrap();
+        store
+            .add_record(&csv::StringRecord::from(vec!["alpha", "Running"]))
+            .unwrap();
         let snapshot = store.snapshot();
 
         let actions = snapshot.completions("/", 1);

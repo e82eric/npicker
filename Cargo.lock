@@ -320,17 +320,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "nfm-picker-sources"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "csv",
+ "nfm_search_core",
+ "regex",
+ "serde",
+]
+
+[[package]]
 name = "nfm-rust-win32host"
 version = "0.1.0"
 dependencies = [
  "anstyle-parse",
  "anyhow",
- "chrono",
  "crossbeam-channel",
  "csv",
+ "nfm-picker-sources",
  "nfm_file_system",
  "nfm_search_core",
- "regex",
  "serde",
  "serde_json",
  "skia-safe",
@@ -344,13 +354,6 @@ dependencies = [
  "crossbeam-channel",
  "nfm_search_core",
  "windows",
-]
-
-[[package]]
-name = "nfm_search-ffi"
-version = "0.1.0"
-dependencies = [
- "nfm_search_core",
 ]
 
 [[package]]
