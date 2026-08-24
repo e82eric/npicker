@@ -5,7 +5,7 @@ use crate::key_binding::{KeyChord, KeyModifiers, KeyName};
 use crate::list_processes::{list_processes, terminate_process};
 use crate::preview::{PreviewConfig, PreviewFactory};
 use crate::request::{PickerRequest, ProcessListPickerRequest};
-use crate::view_model::{PickerActionOutcome, PickerInteractions};
+use crate::view_model::{PickerActionOutcome, PickerBinding, PickerInteractions};
 use crate::ProcessPickerItem;
 
 pub fn request() -> Result<ProcessListPickerRequest, String> {
@@ -24,6 +24,20 @@ pub fn interactions() -> PickerInteractions<ProcessPickerItem> {
 pub fn interactions_with(
     mut interactions: PickerInteractions<ProcessPickerItem>,
 ) -> PickerInteractions<ProcessPickerItem> {
+    let kill_chord = KeyChord {
+        key: KeyName::Character('k'),
+        modifiers: KeyModifiers {
+            ctrl: true,
+            ..KeyModifiers::default()
+        },
+    };
+    let refresh_chord = KeyChord {
+        key: KeyName::Character('r'),
+        modifiers: KeyModifiers {
+            ctrl: true,
+            ..KeyModifiers::default()
+        },
+    };
     let refresh = Arc::new(|| Ok(request()?.run()));
     let kill = Arc::new(|selected: Option<&ProcessPickerItem>| {
         let pid = selected
@@ -48,27 +62,49 @@ pub fn interactions_with(
     );
     interactions.bindings.extend([
         (
-            KeyChord {
-                key: KeyName::Character('k'),
-                modifiers: KeyModifiers {
-                    ctrl: true,
-                    ..KeyModifiers::default()
-                },
+            kill_chord,
+            PickerBinding {
+                action: kill as _,
+                help: "Kill selected process".to_owned(),
             },
-            kill as _,
         ),
         (
-            KeyChord {
-                key: KeyName::Character('r'),
-                modifiers: KeyModifiers {
-                    ctrl: true,
-                    ..KeyModifiers::default()
-                },
+            refresh_chord,
+            PickerBinding {
+                action: refresh_action as _,
+                help: "Refresh current picker".to_owned(),
             },
-            refresh_action as _,
         ),
     ]);
     interactions.refresh = Some(refresh);
     interactions.preview_routes.formatted = Some(preview);
     interactions
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn process_shortcuts_have_specific_help_text() {
+        let interactions = interactions();
+        let binding_for = |key| {
+            interactions.bindings.get(&KeyChord {
+                key: KeyName::Character(key),
+                modifiers: KeyModifiers {
+                    ctrl: true,
+                    ..KeyModifiers::default()
+                },
+            })
+        };
+
+        assert_eq!(
+            binding_for('k').map(|binding| binding.help.as_str()),
+            Some("Kill selected process")
+        );
+        assert_eq!(
+            binding_for('r').map(|binding| binding.help.as_str()),
+            Some("Refresh current picker")
+        );
+    }
 }

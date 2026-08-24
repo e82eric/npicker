@@ -106,6 +106,20 @@ pub type PickerAction<I> =
 pub type PickerRefresh<I> =
     Arc<dyn Fn() -> Result<Arc<dyn SearchSource<Item = I>>, String> + Send + Sync>;
 
+pub struct PickerBinding<I> {
+    pub action: PickerAction<I>,
+    pub help: String,
+}
+
+impl<I> Clone for PickerBinding<I> {
+    fn clone(&self) -> Self {
+        Self {
+            action: Arc::clone(&self.action),
+            help: self.help.clone(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PickerActionOutcome {
     None,
@@ -141,7 +155,7 @@ pub struct PickerInteractions<I> {
     pub actions: HashMap<String, ActionDefinition<I>>,
     pub action_bindings: HashMap<KeyChord, String>,
     pub source_resolver: Option<SourceResolver<I>>,
-    pub bindings: HashMap<KeyChord, PickerAction<I>>,
+    pub bindings: HashMap<KeyChord, PickerBinding<I>>,
     pub refresh: Option<PickerRefresh<I>>,
     pub preview_factory: Arc<PreviewFactory>,
     pub preview_routes: PreviewRoutes<I>,
@@ -526,8 +540,8 @@ impl<I: PickerItem> PickerSession for TypedPickerSession<I> {
             .chain(
                 self.interactions
                     .bindings
-                    .keys()
-                    .map(|chord| (*chord, "Picker action".to_owned())),
+                    .iter()
+                    .map(|(chord, binding)| (*chord, binding.help.clone())),
             )
             .collect()
     }
@@ -540,7 +554,7 @@ impl<I: PickerItem> PickerSession for TypedPickerSession<I> {
         if let Some(action) = self.interactions.action_bindings.get(chord) {
             return self.prepare_action(action, index, query);
         }
-        let action = Arc::clone(self.interactions.bindings.get(chord)?);
+        let action = Arc::clone(&self.interactions.bindings.get(chord)?.action);
         let item = index.and_then(|i| self.source.snapshot()?.item(i));
         let refresh = self.interactions.refresh.clone();
         let interactions = self.interactions.clone();
