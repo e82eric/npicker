@@ -24,7 +24,7 @@ use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     keybd_event, GetKeyState, SendInput, SetFocus, INPUT, INPUT_MOUSE, KEYEVENTF_KEYUP, VK_BACK,
     VK_CONTROL, VK_DELETE, VK_DOWN, VK_END, VK_ESCAPE, VK_HOME, VK_LEFT, VK_MENU, VK_NEXT,
-    VK_PRIOR, VK_RETURN, VK_RIGHT, VK_SHIFT, VK_UP,
+    VK_OEM_2, VK_PRIOR, VK_RETURN, VK_RIGHT, VK_SHIFT, VK_UP,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DispatchMessageW, GetCaretBlinkTime, GetForegroundWindow,
@@ -1365,6 +1365,111 @@ impl WindowState {
                 );
             }
         }
+        let help_panel = Rect {
+            x: WINDOW_PANEL_INSET + PANEL_HORIZONTAL_PADDING,
+            y: WINDOW_PANEL_INSET + PANEL_VERTICAL_PADDING,
+            width: (self.layout.window.width
+                - (WINDOW_PANEL_INSET + PANEL_HORIZONTAL_PADDING) * 2.0)
+                .max(0.0),
+            height: (self.layout.window.height
+                - (WINDOW_PANEL_INSET + PANEL_VERTICAL_PADDING) * 2.0)
+                .max(0.0),
+        };
+        let help_header_rows = 2.0;
+        let help_visible_rows = ((help_panel.height - PADDING * 2.0) / self.layout.text_height
+            - help_header_rows)
+            .floor()
+            .max(1.0) as usize;
+        if let Some(help) = self.view_model.current_keybinding_help(help_visible_rows) {
+            let panel = help_panel;
+            draw_skia_round_rect(canvas, &fill_paint(COLOR_BACKGROUND), panel, 8.0);
+            draw_skia_text(
+                canvas,
+                &self.bold_font,
+                &self.text_paint,
+                "Key bindings",
+                Rect {
+                    x: panel.x + PADDING,
+                    y: panel.y + PADDING,
+                    width: panel.width - PADDING * 2.0,
+                    height: self.layout.text_height,
+                },
+                TextAlign::Left,
+            );
+            let status = if help.total == 0 {
+                "0 of 0".to_owned()
+            } else {
+                format!(
+                    "{}–{} of {}",
+                    help.first + 1,
+                    help.first + help.entries.len(),
+                    help.total
+                )
+            };
+            draw_skia_text(
+                canvas,
+                &self.counter_font,
+                &self.muted_paint,
+                &status,
+                Rect {
+                    x: panel.x + panel.width / 2.0,
+                    y: panel.y + PADDING,
+                    width: panel.width / 2.0 - PADDING,
+                    height: self.layout.text_height,
+                },
+                TextAlign::Right,
+            );
+            let chord_width = (panel.width * 0.3).max(140.0);
+            for (row, entry) in help.entries.iter().enumerate() {
+                let x = panel.x + PADDING;
+                let y = panel.y + PADDING * 2.0 + self.layout.text_height * (row + 1) as f32;
+                if entry.heading {
+                    if entry.chord.is_empty() {
+                        continue;
+                    }
+                    draw_skia_text(
+                        canvas,
+                        &self.bold_font,
+                        &self.muted_paint,
+                        &entry.chord,
+                        Rect {
+                            x,
+                            y,
+                            width: panel.width - PADDING * 2.0,
+                            height: self.layout.text_height,
+                        },
+                        TextAlign::Left,
+                    );
+                    continue;
+                }
+                draw_skia_text(
+                    canvas,
+                    &self.bold_font,
+                    &self.selected_accent_paint,
+                    &entry.chord,
+                    Rect {
+                        x,
+                        y,
+                        width: chord_width - PADDING,
+                        height: self.layout.text_height,
+                    },
+                    TextAlign::Left,
+                );
+                draw_skia_text(
+                    canvas,
+                    &self.font,
+                    &self.text_paint,
+                    &entry.description,
+                    Rect {
+                        x: x + chord_width,
+                        y,
+                        width: (panel.width - chord_width - PADDING * 2.0).max(0.0),
+                        height: self.layout.text_height,
+                    },
+                    TextAlign::Left,
+                );
+            }
+        }
         if let Some(toast) = &self.toast {
             let maximum_width = (self.layout.window.width - PADDING * 4.0).max(0.0);
             let text_width = skia_text_width(&self.font, &self.text_paint, &toast.text);
@@ -1437,6 +1542,7 @@ fn key_chord(vkey: usize, modifiers: KeyModifiers) -> Option<KeyChord> {
         value if value == VK_DELETE.0 => KeyName::Delete,
         value if value == VK_PRIOR.0 => KeyName::PageUp,
         value if value == VK_NEXT.0 => KeyName::PageDown,
+        value if value == VK_OEM_2.0 => KeyName::Character('/'),
         value @ 0x41..=0x5a => KeyName::Character((value as u8 as char).to_ascii_lowercase()),
         value @ 0x30..=0x39 => KeyName::Character(value as u8 as char),
         _ => return None,

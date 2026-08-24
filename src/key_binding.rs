@@ -28,6 +28,35 @@ pub struct KeyChord {
     pub modifiers: KeyModifiers,
 }
 
+pub fn format_key_chord(chord: KeyChord) -> String {
+    let mut parts = Vec::new();
+    if chord.modifiers.ctrl {
+        parts.push("Ctrl".to_owned());
+    }
+    if chord.modifiers.alt {
+        parts.push("Alt".to_owned());
+    }
+    if chord.modifiers.shift {
+        parts.push("Shift".to_owned());
+    }
+    parts.push(match chord.key {
+        KeyName::Character(value) => value.to_ascii_uppercase().to_string(),
+        KeyName::Enter => "Enter".to_owned(),
+        KeyName::Escape => "Escape".to_owned(),
+        KeyName::Up => "Up".to_owned(),
+        KeyName::Down => "Down".to_owned(),
+        KeyName::Left => "Left".to_owned(),
+        KeyName::Right => "Right".to_owned(),
+        KeyName::Home => "Home".to_owned(),
+        KeyName::End => "End".to_owned(),
+        KeyName::Backspace => "Backspace".to_owned(),
+        KeyName::Delete => "Delete".to_owned(),
+        KeyName::PageUp => "Page Up".to_owned(),
+        KeyName::PageDown => "Page Down".to_owned(),
+    });
+    parts.join("+")
+}
+
 pub fn parse_key_chord(value: &str) -> Option<KeyChord> {
     let mut modifiers = KeyModifiers::default();
     let mut key = None;

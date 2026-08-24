@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -9,7 +9,7 @@ use crate::action::{
     ActionController, ActionDefinition, ActionResolution, ActionState, PickerState, PreparedAction,
 };
 pub use crate::key_binding::KeyModifiers;
-use crate::key_binding::{KeyChord, KeyName};
+use crate::key_binding::{format_key_chord, KeyChord, KeyName};
 use crate::preview::{
     NativeWindowId, PreviewEvent, PreviewFactory, PreviewRoutes, PreviewUpdate, SelectionPreview,
 };
@@ -139,6 +139,7 @@ pub type SourceResolver<I> =
     Arc<dyn Fn(PickerState) -> Result<SourceTransition<I>, String> + Send + Sync>;
 pub struct PickerInteractions<I> {
     pub actions: HashMap<String, ActionDefinition<I>>,
+    pub action_bindings: HashMap<KeyChord, String>,
     pub source_resolver: Option<SourceResolver<I>>,
     pub bindings: HashMap<KeyChord, PickerAction<I>>,
     pub refresh: Option<PickerRefresh<I>>,
@@ -150,6 +151,7 @@ impl<I> Clone for PickerInteractions<I> {
     fn clone(&self) -> Self {
         Self {
             actions: self.actions.clone(),
+            action_bindings: self.action_bindings.clone(),
             source_resolver: self.source_resolver.clone(),
             bindings: self.bindings.clone(),
             refresh: self.refresh.clone(),
@@ -163,6 +165,7 @@ impl<I> Default for PickerInteractions<I> {
     fn default() -> Self {
         Self {
             actions: HashMap::new(),
+            action_bindings: HashMap::new(),
             source_resolver: None,
             bindings: HashMap::new(),
             refresh: None,
@@ -239,6 +242,23 @@ struct State {
     action_generation: Option<u64>,
     suggestions: Vec<SearchCompletion>,
     suggestion_selected: usize,
+    keybinding_help_visible: bool,
+    keybinding_help_offset: usize,
+    keybinding_help_visible_rows: usize,
+}
+
+#[derive(Clone, Debug)]
+pub struct KeyBindingHelp {
+    pub chord: String,
+    pub description: String,
+    pub heading: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct KeyBindingHelpState {
+    pub entries: Vec<KeyBindingHelp>,
+    pub first: usize,
+    pub total: usize,
 }
 
 #[derive(Clone)]
@@ -276,6 +296,7 @@ pub enum InputCommand {
     PreviewPageDown,
     TogglePreview,
     CopySelection,
+    ToggleKeyBindingHelp,
 }
 
 fn default_command(chord: KeyChord) -> Option<InputCommand> {
@@ -294,6 +315,9 @@ fn default_command(chord: KeyChord) -> Option<InputCommand> {
         KeyName::PageDown if chord.modifiers.ctrl => Some(InputCommand::PreviewPageDown),
         KeyName::Character('p') if chord.modifiers.ctrl => Some(InputCommand::TogglePreview),
         KeyName::Character('c') if chord.modifiers.ctrl => Some(InputCommand::CopySelection),
+        KeyName::Character('/') if chord.modifiers.ctrl && chord.modifiers.shift => {
+            Some(InputCommand::ToggleKeyBindingHelp)
+        }
         _ => None,
     }
 }
@@ -305,6 +329,7 @@ fn command_suppresses_repeat(command: InputCommand) -> bool {
             | InputCommand::Cancel
             | InputCommand::TogglePreview
             | InputCommand::CopySelection
+            | InputCommand::ToggleKeyBindingHelp
     )
 }
 
@@ -331,10 +356,12 @@ pub(crate) trait PickerSession: Send + Sync {
     fn render(&self, query: &str, indices: &[usize], rows: &mut [Option<String>]) -> PickerRender;
     fn query_update(&self, query: &str, input: &str, cursor: usize) -> PickerQueryUpdate;
     fn has_picker_action(&self, chord: &KeyChord) -> bool;
+    fn picker_binding_help(&self) -> Vec<(KeyChord, String)>;
     fn prepare_picker_action(
         &self,
         chord: &KeyChord,
         index: Option<usize>,
+        query: String,
     ) -> Option<PreparedAction>;
     fn selection_changed(&self, index: Option<usize>);
     fn clear_preview(&self);
@@ -489,12 +516,30 @@ impl<I: PickerItem> PickerSession for TypedPickerSession<I> {
     }
     fn has_picker_action(&self, chord: &KeyChord) -> bool {
         self.interactions.bindings.contains_key(chord)
+            || self.interactions.action_bindings.contains_key(chord)
+    }
+    fn picker_binding_help(&self) -> Vec<(KeyChord, String)> {
+        self.interactions
+            .action_bindings
+            .iter()
+            .map(|(chord, action)| (*chord, action.clone()))
+            .chain(
+                self.interactions
+                    .bindings
+                    .keys()
+                    .map(|chord| (*chord, "Picker action".to_owned())),
+            )
+            .collect()
     }
     fn prepare_picker_action(
         &self,
         chord: &KeyChord,
         index: Option<usize>,
+        query: String,
     ) -> Option<PreparedAction> {
+        if let Some(action) = self.interactions.action_bindings.get(chord) {
+            return self.prepare_action(action, index, query);
+        }
         let action = Arc::clone(self.interactions.bindings.get(chord)?);
         let item = index.and_then(|i| self.source.snapshot()?.item(i));
         let refresh = self.interactions.refresh.clone();
@@ -587,6 +632,9 @@ impl ViewModel {
                 action_generation: None,
                 suggestions: Vec::new(),
                 suggestion_selected: 0,
+                keybinding_help_visible: false,
+                keybinding_help_offset: 0,
+                keybinding_help_visible_rows: 1,
             }),
             request_generation: AtomicU64::new(0),
             search_update_tx,
@@ -834,10 +882,60 @@ impl ViewModel {
             InputCommand::PreviewPageDown => self.page_preview(1),
             InputCommand::TogglePreview => self.toggle_preview(),
             InputCommand::CopySelection => self.copy_selection(),
+            InputCommand::ToggleKeyBindingHelp => {
+                let mut state = self.state.lock().expect("view model poisoned");
+                state.keybinding_help_visible = !state.keybinding_help_visible;
+                state.keybinding_help_offset = 0;
+                state.suggestions.clear();
+                state.suggestion_selected = 0;
+            }
         }
     }
 
     pub fn handle_key(self: &Arc<Self>, chord: KeyChord, repeat: bool) -> bool {
+        let help_visible = self
+            .state
+            .lock()
+            .expect("view model poisoned")
+            .keybinding_help_visible;
+        if help_visible {
+            let mut state = self.state.lock().expect("view model poisoned");
+            if !repeat && default_command(chord) == Some(InputCommand::ToggleKeyBindingHelp) {
+                state.keybinding_help_visible = false;
+            } else {
+                match chord.key {
+                    KeyName::Escape if !repeat => state.keybinding_help_visible = false,
+                    KeyName::Up => {
+                        state.keybinding_help_offset =
+                            state.keybinding_help_offset.saturating_sub(1)
+                    }
+                    KeyName::Down => {
+                        state.keybinding_help_offset =
+                            state.keybinding_help_offset.saturating_add(1)
+                    }
+                    KeyName::PageUp => {
+                        state.keybinding_help_offset = state
+                            .keybinding_help_offset
+                            .saturating_sub(state.keybinding_help_visible_rows)
+                    }
+                    KeyName::PageDown => {
+                        state.keybinding_help_offset = state
+                            .keybinding_help_offset
+                            .saturating_add(state.keybinding_help_visible_rows)
+                    }
+                    KeyName::Home => state.keybinding_help_offset = 0,
+                    KeyName::End => state.keybinding_help_offset = usize::MAX,
+                    _ => {}
+                }
+            }
+            return true;
+        }
+        if default_command(chord) == Some(InputCommand::ToggleKeyBindingHelp) {
+            if !repeat {
+                self.handle_command(InputCommand::ToggleKeyBindingHelp, chord.modifiers);
+            }
+            return true;
+        }
         if !chord.modifiers.ctrl && !chord.modifiers.alt && !chord.modifiers.shift {
             let has_suggestions = !self
                 .state
@@ -896,7 +994,9 @@ impl ViewModel {
                     .results
                     .get(state.selected)
                     .map(|result| result.node_index);
-                active.picker.prepare_picker_action(&chord, index)
+                active
+                    .picker
+                    .prepare_picker_action(&chord, index, state.search_text.clone())
             };
             if let Some(action) = picker_action {
                 self.request_action(action);
@@ -1511,6 +1611,124 @@ impl ViewModel {
                 .collect(),
             selected: state.suggestion_selected,
         }
+    }
+
+    pub fn current_keybinding_help(&self, visible_rows: usize) -> Option<KeyBindingHelpState> {
+        let mut state = self.state.lock().expect("view model poisoned");
+        if !state.keybinding_help_visible {
+            return None;
+        }
+        let mut sections: Vec<(&str, Vec<(String, String)>)> = Vec::new();
+        let mut custom = self
+            .bindings
+            .iter()
+            .map(|(chord, action)| (format_key_chord(*chord), action.clone()))
+            .collect::<Vec<_>>();
+        custom.sort();
+        custom.dedup();
+        if !custom.is_empty() {
+            sections.push(("Custom", custom));
+        }
+        if let Some(active) = state.active.as_ref() {
+            let mut picker = active
+                .picker
+                .picker_binding_help()
+                .into_iter()
+                .map(|(chord, action)| (format_key_chord(chord), action))
+                .collect::<Vec<_>>();
+            picker.sort();
+            picker.dedup();
+            if !picker.is_empty() {
+                sections.push(("Picker", picker));
+            }
+        }
+        sections.extend([
+            (
+                "General",
+                vec![
+                    ("Enter".to_owned(), "Accept selection".to_owned()),
+                    ("Escape".to_owned(), "Close help / cancel".to_owned()),
+                    ("Ctrl+Shift+/".to_owned(), "Toggle key bindings".to_owned()),
+                ],
+            ),
+            (
+                "Results",
+                vec![
+                    ("Up / Down".to_owned(), "Move selection".to_owned()),
+                    ("Ctrl+C".to_owned(), "Copy selection".to_owned()),
+                ],
+            ),
+            (
+                "Preview",
+                vec![
+                    ("Ctrl+P".to_owned(), "Toggle preview".to_owned()),
+                    (
+                        "Ctrl+Page Up / Down".to_owned(),
+                        "Scroll preview".to_owned(),
+                    ),
+                ],
+            ),
+            (
+                "Search box",
+                vec![
+                    ("Left / Right".to_owned(), "Move cursor".to_owned()),
+                    (
+                        "Ctrl+Left / Right".to_owned(),
+                        "Move cursor by word".to_owned(),
+                    ),
+                    ("Shift+Arrows".to_owned(), "Select query text".to_owned()),
+                    ("Home / End".to_owned(), "Move to query boundary".to_owned()),
+                    (
+                        "Backspace / Delete".to_owned(),
+                        "Delete query text".to_owned(),
+                    ),
+                ],
+            ),
+        ]);
+        let mut seen_chords = HashSet::new();
+        let sections = sections
+            .into_iter()
+            .filter_map(|(section, mut bindings)| {
+                bindings.retain(|(chord, _)| seen_chords.insert(chord.to_ascii_lowercase()));
+                (!bindings.is_empty()).then_some((section, bindings))
+            })
+            .collect::<Vec<_>>();
+        let mut entries = Vec::new();
+        for (index, (section, bindings)) in sections.into_iter().enumerate() {
+            if index > 0 {
+                entries.push(KeyBindingHelp {
+                    chord: String::new(),
+                    description: String::new(),
+                    heading: true,
+                });
+            }
+            entries.push(KeyBindingHelp {
+                chord: section.to_owned(),
+                description: String::new(),
+                heading: true,
+            });
+            entries.extend(
+                bindings
+                    .into_iter()
+                    .map(|(chord, description)| KeyBindingHelp {
+                        chord,
+                        description,
+                        heading: false,
+                    }),
+            );
+        }
+        let total = entries.len();
+        let visible_rows = visible_rows.max(1);
+        state.keybinding_help_visible_rows = visible_rows;
+        state.keybinding_help_offset = state
+            .keybinding_help_offset
+            .min(total.saturating_sub(visible_rows));
+        let first = state.keybinding_help_offset;
+        Some(KeyBindingHelpState {
+            entries: entries.into_iter().skip(first).take(visible_rows).collect(),
+            first,
+            total,
+        })
     }
 
     fn apply_search_update(&self, search_update: FuzzySearchUpdate) {

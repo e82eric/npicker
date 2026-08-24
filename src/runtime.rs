@@ -71,25 +71,13 @@ impl Default for FileSystemPickerOptions {
 
 impl PickerRuntime {
     pub fn start() -> Result<Self> {
-        let bindings = HashMap::from([
-            (
-                KeyChord {
-                    key: KeyName::Enter,
-                    modifiers: KeyModifiers::default(),
-                },
-                "ffi-accept".into(),
-            ),
-            (
-                KeyChord {
-                    key: KeyName::Character('u'),
-                    modifiers: KeyModifiers {
-                        ctrl: true,
-                        ..KeyModifiers::default()
-                    },
-                },
-                "ffi-parent".into(),
-            ),
-        ]);
+        let bindings = HashMap::from([(
+            KeyChord {
+                key: KeyName::Enter,
+                modifiers: KeyModifiers::default(),
+            },
+            "ffi-accept".into(),
+        )]);
         let view = Arc::new(ViewHandle::new());
         let view_model = ViewModel::new_with_bindings(bindings, false, view.clone());
         let ui_view_model = Arc::clone(&view_model);

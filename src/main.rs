@@ -269,16 +269,6 @@ fn install_file_system_bindings(options: &mut AppOptions) {
             modifiers: KeyModifiers::default(),
         })
         .or_insert_with(|| rust_nfm::file_picker::ACCEPT_ACTION.into());
-    options
-        .bindings
-        .entry(KeyChord {
-            key: KeyName::Character('u'),
-            modifiers: KeyModifiers {
-                ctrl: true,
-                ..KeyModifiers::default()
-            },
-        })
-        .or_insert_with(|| rust_nfm::file_picker::PARENT_ACTION.into());
 }
 
 fn validate_action_options(options: &AppOptions) -> Result<()> {

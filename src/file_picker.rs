@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use crate::action::{ActionDefinition, ActionResolution, ActionState, PickerState};
+use crate::key_binding::{KeyChord, KeyModifiers, KeyName};
 use crate::preview::native_file::preview_factory;
 use crate::preview::{CommandPreviewTarget, PreviewFactory, PreviewRoutes};
 use crate::request::{FileSystemPickerRequest, PickerRequest};
@@ -32,6 +33,16 @@ pub(crate) fn interactions() -> PickerInteractions<String> {
 pub fn interactions_with(
     mut interactions: PickerInteractions<String>,
 ) -> PickerInteractions<String> {
+    interactions.action_bindings.insert(
+        KeyChord {
+            key: KeyName::Character('u'),
+            modifiers: KeyModifiers {
+                ctrl: true,
+                ..KeyModifiers::default()
+            },
+        },
+        PARENT_ACTION.into(),
+    );
     interactions.actions.insert(
         ACCEPT_ACTION.into(),
         ActionDefinition::Native(Arc::new(resolve_accept)),
