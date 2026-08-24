@@ -9,7 +9,9 @@ use nfm_search_core::store::ItemsSource;
 use crate::embedded_interactions;
 use crate::file_picker;
 use crate::key_binding::{KeyChord, KeyModifiers, KeyName};
+use crate::preview::{PreviewConfig, PreviewFactory};
 use crate::process_picker;
+pub use crate::request::StructuredPickerRow;
 use crate::request::{
     FileSystemPickerRequest, FlatItemsPickerRequest, PickerRequest, PickerResponse,
     StructuredItemsPickerRequest,
@@ -174,28 +176,63 @@ impl PickerRuntime {
         rows: Vec<Vec<String>>,
         search_string: Option<String>,
     ) -> Result<PickerTask<StructuredPickerItem>> {
+        self.show_structured_rows(
+            columns,
+            rows.into_iter()
+                .map(|cells| StructuredPickerRow {
+                    cells,
+                    preview: None,
+                })
+                .collect(),
+            search_string,
+            false,
+        )
+    }
+
+    pub fn show_structured_with_previews(
+        &self,
+        columns: Vec<String>,
+        rows: Vec<StructuredPickerRow>,
+        search_string: Option<String>,
+    ) -> Result<PickerTask<StructuredPickerItem>> {
+        self.show_structured_rows(columns, rows, search_string, true)
+    }
+
+    fn show_structured_rows(
+        &self,
+        columns: Vec<String>,
+        rows: Vec<StructuredPickerRow>,
+        search_string: Option<String>,
+        preview_visible: bool,
+    ) -> Result<PickerTask<StructuredPickerItem>> {
         if columns.is_empty() {
             return Err(anyhow!("structured picker requires at least one column"));
         }
-        if let Some(row) = rows.iter().find(|row| row.len() != columns.len()) {
+        if let Some(row) = rows.iter().find(|row| row.cells.len() != columns.len()) {
             return Err(anyhow!(
                 "structured picker row has {} cells, expected {}",
-                row.len(),
+                row.cells.len(),
                 columns.len()
             ));
         }
         nfm_picker_sources::structured::StructuredSchema::new(columns.clone())
             .map_err(|error| anyhow!(error))?;
-        self.view_model.set_preview_visible(false);
+        self.view_model.set_preview_visible(preview_visible);
         let request = StructuredItemsPickerRequest {
             columns,
             rows,
             search_string,
         };
-        self.spawn_request(
-            request,
-            embedded_interactions::command(|item: &StructuredPickerItem| item.value.clone()),
-        )
+        let mut interactions =
+            embedded_interactions::command(|item: &StructuredPickerItem| item.value.clone());
+        if preview_visible {
+            interactions.preview_factory = Arc::new(PreviewFactory::new(PreviewConfig::Formatted));
+            interactions.preview_routes.formatted =
+                Some(Arc::new(|item: &StructuredPickerItem| {
+                    Ok(item.preview.clone().unwrap_or_default())
+                }));
+        }
+        self.spawn_request(request, interactions)
     }
 
     fn spawn_request<R>(

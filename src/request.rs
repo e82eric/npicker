@@ -101,9 +101,15 @@ pub struct FlatItemsPickerRequest {
     pub search_string: Option<String>,
 }
 
+#[derive(Clone, Debug)]
+pub struct StructuredPickerRow {
+    pub cells: Vec<String>,
+    pub preview: Option<String>,
+}
+
 pub struct StructuredItemsPickerRequest {
     pub columns: Vec<String>,
-    pub rows: Vec<Vec<String>>,
+    pub rows: Vec<StructuredPickerRow>,
     pub search_string: Option<String>,
 }
 
@@ -120,7 +126,10 @@ impl PickerRequest for StructuredItemsPickerRequest {
         let mut store = StructuredStreamingStore::new(schema);
         for row in &self.rows {
             store
-                .add_record(&csv::StringRecord::from(row.clone()))
+                .add_record_with_preview(
+                    &csv::StringRecord::from(row.cells.clone()),
+                    row.preview.as_deref(),
+                )
                 .expect("StructuredItemsPickerRequest rows must match the schema");
         }
         completed_picker_source(store.snapshot())

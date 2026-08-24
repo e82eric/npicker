@@ -310,6 +310,7 @@ pub enum InputCommand {
     PreviewPageDown,
     TogglePreview,
     CopySelection,
+    CopyPreview,
     ToggleKeyBindingHelp,
 }
 
@@ -328,6 +329,9 @@ fn default_command(chord: KeyChord) -> Option<InputCommand> {
         KeyName::PageUp if chord.modifiers.ctrl => Some(InputCommand::PreviewPageUp),
         KeyName::PageDown if chord.modifiers.ctrl => Some(InputCommand::PreviewPageDown),
         KeyName::Character('p') if chord.modifiers.ctrl => Some(InputCommand::TogglePreview),
+        KeyName::Character('c') if chord.modifiers.ctrl && chord.modifiers.shift => {
+            Some(InputCommand::CopyPreview)
+        }
         KeyName::Character('c') if chord.modifiers.ctrl => Some(InputCommand::CopySelection),
         KeyName::Character('/') if chord.modifiers.ctrl && chord.modifiers.shift => {
             Some(InputCommand::ToggleKeyBindingHelp)
@@ -343,6 +347,7 @@ fn command_suppresses_repeat(command: InputCommand) -> bool {
             | InputCommand::Cancel
             | InputCommand::TogglePreview
             | InputCommand::CopySelection
+            | InputCommand::CopyPreview
             | InputCommand::ToggleKeyBindingHelp
     )
 }
@@ -896,6 +901,7 @@ impl ViewModel {
             InputCommand::PreviewPageDown => self.page_preview(1),
             InputCommand::TogglePreview => self.toggle_preview(),
             InputCommand::CopySelection => self.copy_selection(),
+            InputCommand::CopyPreview => self.copy_preview(),
             InputCommand::ToggleKeyBindingHelp => {
                 let mut state = self.state.lock().expect("view model poisoned");
                 state.keybinding_help_visible = !state.keybinding_help_visible;
@@ -1483,6 +1489,22 @@ impl ViewModel {
         });
     }
 
+    fn copy_preview(&self) {
+        let value = {
+            let state = self.state.lock().expect("view model poisoned");
+            state.preview_update.as_ref().and_then(preview_plain_text)
+        };
+        let Some(value) = value else {
+            self.show_toast("No text preview to copy".to_owned());
+            return;
+        };
+        let text = match crate::clipboard::copy_text(&value) {
+            Ok(()) => "Copied preview to clipboard".to_owned(),
+            Err(error) => format!("Copy failed: {error}"),
+        };
+        self.show_toast(text);
+    }
+
     fn show_toast(&self, text: String) {
         self.publish_ui_event(UiEvent::ShowToast {
             text,
@@ -1676,6 +1698,7 @@ impl ViewModel {
                 "Preview",
                 vec![
                     ("Ctrl+P".to_owned(), "Toggle preview".to_owned()),
+                    ("Ctrl+Shift+C".to_owned(), "Copy preview".to_owned()),
                     (
                         "Ctrl+Page Up / Down".to_owned(),
                         "Scroll preview".to_owned(),
@@ -1802,6 +1825,19 @@ impl ViewModel {
         }
         self.publish_ui_event(UiEvent::Results(update));
     }
+}
+
+fn preview_plain_text(update: &PreviewUpdate) -> Option<String> {
+    let PreviewUpdate::Ready { lines, .. } = update else {
+        return None;
+    };
+    Some(
+        lines
+            .iter()
+            .map(|line| line.plain_text())
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
 }
 
 impl State {
@@ -1953,6 +1989,36 @@ mod tests {
         });
         assert_eq!(command, Some(InputCommand::CopySelection));
         assert!(command_suppresses_repeat(command.unwrap()));
+    }
+
+    #[test]
+    fn default_control_shift_c_maps_to_copy_preview() {
+        let command = default_command(KeyChord {
+            key: KeyName::Character('c'),
+            modifiers: modifiers(true, true),
+        });
+        assert_eq!(command, Some(InputCommand::CopyPreview));
+        assert!(command_suppresses_repeat(command.unwrap()));
+    }
+
+    #[test]
+    fn preview_plain_text_preserves_lines_and_discards_styles() {
+        let mut document = crate::preview::document::PreviewDocument::default();
+        document.push(
+            crate::preview::PreviewStream::Stdout,
+            b"plain \x1b[31mred\x1b[0m\nsecond\n",
+        );
+        let update = PreviewUpdate::Ready {
+            generation: 1,
+            lines: document.into_lines().into(),
+            truncated: false,
+            center_line: None,
+        };
+
+        assert_eq!(
+            preview_plain_text(&update).as_deref(),
+            Some("plain red\nsecond\n")
+        );
     }
 
     #[test]

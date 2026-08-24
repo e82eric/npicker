@@ -45,6 +45,12 @@ pub struct PreviewLine {
     pub(crate) spans: Vec<PreviewSpan>,
 }
 
+impl PreviewLine {
+    pub(crate) fn plain_text(&self) -> String {
+        self.spans.iter().map(|span| span.text.as_str()).collect()
+    }
+}
+
 #[derive(Default)]
 struct StreamState {
     parser: Parser,

@@ -14,6 +14,7 @@ use regex::RegexBuilder;
 pub struct StructuredPickerItem {
     pub value: String,
     pub fields: HashMap<String, String>,
+    pub preview: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -56,6 +57,7 @@ struct ByteRange {
 struct StructuredRow {
     display: ByteRange,
     value: ByteRange,
+    preview: Option<ByteRange>,
     first_cell: usize,
     cell_count: usize,
 }
@@ -91,6 +93,14 @@ impl StructuredStreamingStore {
     }
 
     pub fn add_record(&mut self, record: &csv::StringRecord) -> Result<(), String> {
+        self.add_record_with_preview(record, None)
+    }
+
+    pub fn add_record_with_preview(
+        &mut self,
+        record: &csv::StringRecord,
+        preview: Option<&str>,
+    ) -> Result<(), String> {
         if record.len() != self.schema.columns.len() {
             return Err(format!(
                 "record has {} fields, expected {}",
@@ -136,9 +146,18 @@ impl StructuredStreamingStore {
             length: display.len(),
         };
         self.bytes.extend_from_slice(&display);
+        let preview = preview.map(|preview| {
+            let range = ByteRange {
+                offset: self.bytes.len(),
+                length: preview.len(),
+            };
+            self.bytes.extend_from_slice(preview.as_bytes());
+            range
+        });
         self.rows.push(StructuredRow {
             display: display_range,
             value: value_range,
+            preview,
             first_cell,
             cell_count: record.len(),
         });
@@ -195,6 +214,13 @@ impl StructuredStreamingSnapshot {
             .enumerate()
             .map(|(column_index, column)| (column.clone(), self.cell_string(row, column_index)))
             .collect()
+    }
+
+    pub fn preview(&self, row: usize) -> Option<String> {
+        let range = self.rows[row].preview?;
+        let mut stack = [0; 4096];
+        let mut heap = Vec::new();
+        Some(String::from_utf8_lossy(self.range(range, &mut stack, &mut heap)).into_owned())
     }
 
     pub fn header(&self, query: &str) -> String {
@@ -566,6 +592,7 @@ impl ItemsSource for StructuredStreamingSnapshot {
         Some(StructuredPickerItem {
             value: self.value(node_index),
             fields: self.fields(node_index),
+            preview: self.preview(node_index),
         })
     }
 
@@ -1009,6 +1036,30 @@ pub fn fuzzy_query(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn preview_metadata_is_not_part_of_display_or_fields() {
+        let mut store = StructuredStreamingStore::new(
+            StructuredSchema::new(vec!["Name".into(), "State".into()]).unwrap(),
+        );
+        store
+            .add_record_with_preview(
+                &csv::StringRecord::from(vec!["service", "failed"]),
+                Some("Stack trace:\nframe one\nframe two"),
+            )
+            .unwrap();
+        let snapshot = store.snapshot();
+
+        assert_eq!(
+            snapshot.preview(0).as_deref(),
+            Some("Stack trace:\nframe one\nframe two")
+        );
+        assert!(!snapshot.display_row(0, "").contains("frame one"));
+        assert!(!snapshot
+            .fields(0)
+            .values()
+            .any(|value| value.contains("frame one")));
+    }
 
     #[test]
     fn parser_removes_structured_tokens_from_fuzzy_query() {
