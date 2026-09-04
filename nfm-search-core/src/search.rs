@@ -979,10 +979,14 @@ impl SearchPattern {
         is_ascii: bool,
         scratch: &mut MatchScratch,
     ) -> Option<u32> {
+        // Smart Unicode mode: an ASCII query can use the byte scorer for any
+        // UTF-8 haystack. Non-ASCII bytes cannot match an ASCII term, although
+        // they intentionally count as individual scoring columns.
+        if let Some(pattern) = &self.ascii {
+            return pattern.score(text, scratch);
+        }
+
         if is_ascii {
-            if let Some(pattern) = &self.ascii {
-                return pattern.score(text, scratch);
-            }
             if !self.unicode.ascii_can_match {
                 return None;
             }
@@ -1643,7 +1647,6 @@ unsafe fn fzf_fuzzy_match_v4_ascii_avx2_u8(
     scratch: &mut MatchScratch,
 ) -> FzfResult {
     let pattern = query.pattern.as_slice();
-    debug_assert!(text.is_ascii());
     debug_assert!(pattern.is_ascii());
     debug_assert!(v4_score_fits_u8(pattern.len()));
 
@@ -1850,7 +1853,6 @@ unsafe fn fuzzy_window_v4_ascii_avx2(
     input: &[u8],
     query: &V4CompiledQuery,
 ) -> Option<(usize, usize)> {
-    debug_assert!(input.is_ascii());
     debug_assert!(!query.pattern.is_empty());
 
     let mut pattern_index = 0usize;
@@ -2778,6 +2780,30 @@ mod search_sort_tests {
         assert_eq!(output.matched, 1);
         assert_eq!(output.results[0].path, "café");
         assert_eq!(resolve_match_positions("fé", "café"), vec![2, 3]);
+    }
+
+    #[test]
+    fn ascii_queries_use_byte_scoring_for_unicode_paths_but_unicode_positions() {
+        let text = "aéb";
+        let pattern = SearchPattern::parse("ab");
+
+        let smart_score = pattern
+            .score(text.as_bytes(), false, &mut MatchScratch::default())
+            .expect("ASCII query should match across the Unicode character");
+        let byte_score = pattern
+            .ascii
+            .as_ref()
+            .expect("ASCII query")
+            .score(text.as_bytes(), &mut MatchScratch::default())
+            .expect("byte scorer should match");
+        let unicode_score = pattern
+            .unicode
+            .score(text, &mut MatchScratch::default())
+            .expect("Unicode scorer should match");
+
+        assert_eq!(smart_score, byte_score);
+        assert_ne!(smart_score, unicode_score);
+        assert_eq!(resolve_match_positions("ab", text), vec![0, 3]);
     }
 
     #[test]
