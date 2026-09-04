@@ -1313,6 +1313,10 @@ fn class_of_unicode(character: char) -> CharClass {
         CharClass::CharUpper
     } else if character.is_numeric() {
         CharClass::Digit
+    } else if character.is_alphabetic() {
+        // ICU classifies modifier and other letters as CharLower for fzf's
+        // scoring purposes. This includes uncased scripts such as CJK.
+        CharClass::CharLower
     } else {
         CharClass::NonWord
     }
@@ -1331,7 +1335,10 @@ fn fuzzy_index_of_unicode(text: &[char], pattern: &[char], case_sensitive: bool)
     let mut first = None;
     for (index, &character) in text.iter().enumerate() {
         if unicode_eq(character, pattern[pattern_index], case_sensitive) {
-            first.get_or_insert(index);
+            // Retain the character immediately before the first match so the
+            // scorer can classify the actual boundary. Starting directly at
+            // the match would make every first match look like a word boundary.
+            first.get_or_insert(index.saturating_sub(1));
             pattern_index += 1;
             if pattern_index == pattern.len() {
                 return first;
@@ -1679,6 +1686,7 @@ unsafe fn fzf_fuzzy_match_v4_ascii_avx2_u8(
     let capitalization_bonus = _mm256_set1_epi8(CAMEL_CASE_BONUS as i8);
     let delimiter_bonus = _mm256_set1_epi8(BOUNDARY_BONUS as i8);
     let mut previous_lower_mask = _mm256_setzero_si256();
+    let mut previous_digit_mask = _mm256_setzero_si256();
     let mut previous_delimiter_mask = _mm256_setzero_si256();
 
     for chunk_index in 0..text_chunks {
@@ -1706,19 +1714,26 @@ unsafe fn fzf_fuzzy_match_v4_ascii_avx2_u8(
             all_lanes,
         );
         let previous_is_lower = unsafe { v4_shift_right::<1>(is_lower, previous_lower_mask) };
+        let previous_is_digit = unsafe { v4_shift_right::<1>(is_digit, previous_digit_mask) };
         let previous_is_delimiter =
             unsafe { v4_shift_right::<1>(is_delimiter, previous_delimiter_mask) };
         let capitalization_mask = _mm256_and_si256(is_upper, previous_is_lower);
+        let digit_boundary_mask = _mm256_andnot_si256(previous_is_digit, is_digit);
+        let camel_or_digit_boundary_mask =
+            _mm256_or_si256(capitalization_mask, digit_boundary_mask);
         let mut delimiter_boundary_mask =
             _mm256_andnot_si256(is_delimiter, previous_is_delimiter);
         if window_start == 0 && chunk_index == 0 {
             delimiter_boundary_mask = _mm256_or_si256(delimiter_boundary_mask, first_lane);
         }
-        let boundary_bonus = _mm256_add_epi8(
-            _mm256_and_si256(capitalization_mask, capitalization_bonus),
-            _mm256_and_si256(delimiter_boundary_mask, delimiter_bonus),
+        let non_word_or_boundary_mask =
+            _mm256_or_si256(delimiter_boundary_mask, is_delimiter);
+        let boundary_bonus = _mm256_max_epu8(
+            _mm256_and_si256(camel_or_digit_boundary_mask, capitalization_bonus),
+            _mm256_and_si256(non_word_or_boundary_mask, delimiter_bonus),
         );
         previous_lower_mask = is_lower;
+        previous_digit_mask = is_digit;
         previous_delimiter_mask = is_delimiter;
         let mut previous_row_scores = _mm256_setzero_si256();
         let mut previous_row_match_mask = _mm256_setzero_si256();
@@ -1763,7 +1778,7 @@ unsafe fn fzf_fuzzy_match_v4_ascii_avx2_u8(
             let diagonal_run_bonus =
                 unsafe { v4_shift_right::<1>(previous_row_run_bonus, adjacent_previous_run_bonus) };
             let can_continue = _mm256_andnot_si256(
-                delimiter_boundary_mask,
+                non_word_or_boundary_mask,
                 _mm256_and_si256(match_mask, diagonal_match_mask),
             );
             let continued_bonus = _mm256_and_si256(
@@ -3058,5 +3073,11 @@ mod tests_from_fzf {
         assert_eq!(result.score, SCORE_MATCH * 2 + BONUS_CONSECUTIVE);
     }
 }
+
+#[cfg(test)]
+mod cascadia_fzf_tests;
+
+#[cfg(test)]
+mod unicode_cascadia_fzf_tests;
 
 }
