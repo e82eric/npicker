@@ -13,13 +13,13 @@ pub const DISPLAY_LIMIT: usize = 15;
 pub const RESULT_LIMIT: usize = 1_000;
 const SEARCH_TIMING_SAMPLE_RATE: usize = 256;
 const SLAB_CAP: usize = 2_000_000;
-const SCORE_MATCH: i32 = 16;
-const SCORE_GAP_START: i32 = -3;
+const SCORE_MATCH: i32 = 8;
+const SCORE_GAP_START: i32 = -2;
 const SCORE_GAP_EXTENSION: i32 = -1;
-const BOUNDARY_BONUS: i32 = SCORE_MATCH / 2;
-const NON_WORD_BONUS: i32 = SCORE_MATCH / 2;
-const CAMEL_CASE_BONUS: i32 = BOUNDARY_BONUS + SCORE_GAP_EXTENSION;
-const BONUS_CONSECUTIVE: i32 = -(SCORE_GAP_START + SCORE_GAP_EXTENSION);
+const BOUNDARY_BONUS: i32 = 4;
+const NON_WORD_BONUS: i32 = 4;
+const CAMEL_CASE_BONUS: i32 = 3;
+const BONUS_CONSECUTIVE: i32 = 2;
 const BONUS_FIRST_CHAR_MULTIPLIER: i32 = 2;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -1627,12 +1627,12 @@ impl V4CompiledQuery {
 
 #[inline(always)]
 fn v4_score_fits_u8(pattern_size: usize) -> bool {
-    // Conservative V3 bound: at most 25 per needle byte, 11 one-time
-    // boundary points, 16 prefix points, and 6 points of transient mismatch
-    // headroom.
+    // The maximum completed score is 12 points per needle byte plus four
+    // one-time first-character boundary points. SIMD adds the three-point
+    // mismatch value before subtracting it, so retain that transient headroom.
     pattern_size
-        .checked_mul(25)
-        .and_then(|score| score.checked_add(33))
+        .checked_mul(12)
+        .and_then(|score| score.checked_add(7))
         .is_some_and(|score| score <= u8::MAX as usize)
 }
 
@@ -1676,9 +1676,9 @@ unsafe fn fzf_fuzzy_match_v4_ascii_avx2_u8(
     // bank contents. Every bank row is overwritten before a later chunk reads it.
 
     let gap_extend = _mm256_set1_epi8(1);
-    let gap_open_after_extend = _mm256_set1_epi8(2);
-    let match_plus_mismatch = _mm256_set1_epi8(22);
-    let mismatch = _mm256_set1_epi8(6);
+    let gap_open_after_extend = _mm256_set1_epi8(1);
+    let match_plus_mismatch = _mm256_set1_epi8(11);
+    let mismatch = _mm256_set1_epi8(3);
     let consecutive_bonus = _mm256_set1_epi8(BONUS_CONSECUTIVE as i8);
     let first_lane = _mm256_setr_epi8(
         -1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
@@ -2817,7 +2817,15 @@ mod search_sort_tests {
         #[cfg(target_arch = "x86_64")]
         assert!(positions.ascii.unwrap().term_sets[0].terms[0].v4.is_none());
 
-        let long_query = "a".repeat(9);
+        let longest_v4_query = "a".repeat(20);
+        let longest_v4 = AsciiPattern::parse(&longest_v4_query).expect("ASCII query");
+        #[cfg(target_arch = "x86_64")]
+        assert_eq!(
+            longest_v4.term_sets[0].terms[0].v4.is_some(),
+            is_x86_feature_detected!("avx2")
+        );
+
+        let long_query = "a".repeat(21);
         let long = AsciiPattern::parse(&long_query).expect("ASCII query");
         #[cfg(target_arch = "x86_64")]
         assert!(long.term_sets[0].terms[0].v4.is_none());
