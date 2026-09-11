@@ -626,7 +626,10 @@ impl ChunkedSnapshot<u8> {
         &stack_buffer[..length]
     }
 
-    fn copy_range_to(&self, mut offset: usize, mut target: &mut [u8]) {
+    /// Copies `target.len()` bytes starting at `offset`, across chunk boundaries.
+    /// Panics if the requested range lies outside this snapshot.
+    pub fn copy_range_to(&self, mut offset: usize, mut target: &mut [u8]) {
+        assert!(offset <= self.len && target.len() <= self.len - offset);
         while !target.is_empty() {
             let (chunk_index, chunk_offset) = self.locate_direct(offset);
             let chunk = &self.chunks[chunk_index];

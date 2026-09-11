@@ -205,22 +205,11 @@ impl PublishedSnapshot {
     }
 
     fn copy_name_to_slice(&self, name: Name, out: &mut [u8]) {
-        let mut offset = name.offset as usize;
-        let mut remaining = name.len as usize;
-        let mut written = 0usize;
-        assert!(offset + remaining <= self.byte_count);
-        assert!(remaining <= out.len());
-
-        while remaining > 0 {
-            let (chunk_index, chunk_offset) = self.name_bytes.locate_direct(offset);
-            let chunk = &self.name_bytes.chunks[chunk_index];
-            let readable = remaining.min(chunk.len() - chunk_offset);
-            out[written..written + readable]
-                .copy_from_slice(&chunk[chunk_offset..chunk_offset + readable]);
-            offset += readable;
-            written += readable;
-            remaining -= readable;
-        }
+        let offset = name.offset as usize;
+        let len = name.len as usize;
+        assert!(offset <= self.byte_count && len <= self.byte_count - offset);
+        assert!(len <= out.len());
+        self.name_bytes.copy_range_to(offset, &mut out[..len]);
     }
 
     fn path_utf8_full_len(&self, node_index: usize) -> usize {
