@@ -145,10 +145,15 @@ impl ItemsSource for PublishedSnapshot {
         stack_buffer: &'a mut [u8],
         heap_buffer: &'a mut Vec<u8>,
     ) -> &'a [u8] {
-        if let Some(path) = self.path_utf8_stack(index, stack_buffer) {
-            path
+        let full_len = self.path_utf8_full_len(index);
+        let len = full_len.saturating_sub(1);
+        if full_len <= stack_buffer.len() {
+            self.write_path_utf8_backwards(index, &mut stack_buffer[..full_len]);
+            &stack_buffer[..len]
         } else {
-            self.path_utf8(index, heap_buffer);
+            heap_buffer.resize(full_len, 0);
+            self.write_path_utf8_backwards(index, heap_buffer);
+            heap_buffer.truncate(len);
             heap_buffer.as_slice()
         }
     }
@@ -181,17 +186,6 @@ impl PublishedSnapshot {
         out.resize(full_len, 0);
         self.write_path_utf8_backwards(node_index, out);
         out.truncate(len);
-    }
-
-    fn path_utf8_stack<'a>(&self, node_index: usize, out: &'a mut [u8]) -> Option<&'a [u8]> {
-        let full_len = self.path_utf8_full_len(node_index);
-        let len = full_len.saturating_sub(1);
-        if full_len > out.len() {
-            return None;
-        }
-
-        self.write_path_utf8_backwards(node_index, &mut out[..full_len]);
-        Some(&out[..len])
     }
 
     fn node(&self, index: usize) -> Node {
