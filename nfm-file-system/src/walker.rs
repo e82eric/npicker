@@ -324,7 +324,7 @@ impl CompactUtf8FileStore {
     }
 
     fn get_or_add_name(&mut self, bytes: &[u8]) -> u32 {
-        let Some(interned) = self.interned_names.as_mut() else {
+        let Some(interned) = self.interned_names.as_ref() else {
             return self.add_name(bytes);
         };
 
