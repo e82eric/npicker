@@ -546,18 +546,29 @@ impl<T: Copy + Default> ChunkedStorage<T> {
         }
     }
 
-    pub fn eq_slice(&self, offset: usize, items: &[T]) -> bool
+    pub fn eq_slice(&self, mut offset: usize, mut items: &[T]) -> bool
     where
         T: Eq,
     {
-        if offset + items.len() > self.len {
+        if offset > self.len || items.len() > self.len - offset {
             return false;
         }
 
-        for (index, item) in items.iter().enumerate() {
-            if *self.get(offset + index) != *item {
+        while !items.is_empty() {
+            if offset >= self.sealed_len {
+                let start = offset - self.sealed_len;
+                return &self.current[start..start + items.len()] == items;
+            }
+
+            let chunk_index = offset / self.chunk_size;
+            let chunk_offset = offset % self.chunk_size;
+            let chunk = &self.chunks[chunk_index];
+            let count = items.len().min(chunk.len() - chunk_offset);
+            if chunk[chunk_offset..chunk_offset + count] != items[..count] {
                 return false;
             }
+            offset += count;
+            items = &items[count..];
         }
 
         true
@@ -628,6 +639,7 @@ impl ChunkedSnapshot<u8> {
 
     /// Copies `target.len()` bytes starting at `offset`, across chunk boundaries.
     /// Panics if the requested range lies outside this snapshot.
+    #[inline]
     pub fn copy_range_to(&self, mut offset: usize, mut target: &mut [u8]) {
         assert!(offset <= self.len && target.len() <= self.len - offset);
         while !target.is_empty() {
@@ -661,6 +673,33 @@ impl<T: Copy> std::ops::Index<usize> for ChunkedStorage<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chunked_equality_matches_contiguous_storage() {
+        let bytes = b"abcdefghij";
+        for chunk_size in [1, 2, 4, 16] {
+            let mut storage = ChunkedStorage::new(chunk_size);
+            storage.extend_from_slice(bytes);
+            // Every valid range, including empty ranges and chunk boundaries.
+            for start in 0..=bytes.len() {
+                for end in start..=bytes.len() {
+                    assert!(storage.eq_slice(start, &bytes[start..end]));
+                    let mut different = bytes[start..end].to_vec();
+                    for index in 0..different.len() {
+                        different[index] ^= 0xff;
+                        assert!(!storage.eq_slice(start, &different));
+                        different[index] ^= 0xff;
+                    }
+                }
+            }
+            assert!(!storage.eq_slice(bytes.len(), b"x"));
+            assert!(!storage.eq_slice(bytes.len() + 1, b""));
+            assert!(!storage.eq_slice(usize::MAX, b"xx"));
+        }
+        let empty = ChunkedStorage::<u8>::new(4);
+        assert!(empty.eq_slice(0, b""));
+        assert!(!empty.eq_slice(0, b"x"));
+    }
 
     #[test]
     fn flat_snapshot_returns_direct_item_bytes() {

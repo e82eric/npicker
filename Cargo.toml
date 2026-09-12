@@ -7,6 +7,9 @@ members = [
 ]
 resolver = "2"
 
+[profile.release]
+lto = "thin"
+
 [package]
 name = "nfm-rust-win32host"
 version = "0.1.0"
