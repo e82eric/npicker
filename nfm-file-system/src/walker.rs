@@ -615,15 +615,16 @@ fn scan_directory(
                     let will_recurse = is_dir && work.depth + 1 < effective_max_depth;
 
                     if (!options.directories_only || is_dir) && (!options.files_only || !is_dir) {
+                        let child_path =
+                            will_recurse.then(|| make_child_path(&work.path, name.as_bytes()));
                         let child_index = if is_dir {
-                            add_node_sync(writer_tx, work.node_index, name.clone())
+                            add_node_sync(writer_tx, work.node_index, name)
                         } else {
-                            add_node_async(writer_tx, work.node_index, name.clone());
+                            add_node_async(writer_tx, work.node_index, name);
                             u32::MAX
                         };
 
-                        if will_recurse {
-                            let child_path = make_child_path(&work.path, name.as_bytes());
+                        if let Some(child_path) = child_path {
                             pending.fetch_add(1, Ordering::AcqRel);
                             if tx
                                 .send(DirectoryWork {
@@ -637,8 +638,8 @@ fn scan_directory(
                             }
                         }
                     } else if will_recurse {
-                        let child_index = add_node_sync(writer_tx, work.node_index, name.clone());
                         let child_path = make_child_path(&work.path, name.as_bytes());
+                        let child_index = add_node_sync(writer_tx, work.node_index, name);
                         pending.fetch_add(1, Ordering::AcqRel);
                         if tx
                             .send(DirectoryWork {
