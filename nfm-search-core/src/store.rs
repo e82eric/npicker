@@ -494,6 +494,7 @@ pub struct ChunkedStorage<T: Copy> {
 
 impl<T: Copy + Default> ChunkedStorage<T> {
     pub fn new(chunk_size: usize) -> Self {
+        assert!(chunk_size > 0, "chunk size must be nonzero");
         Self {
             chunk_size,
             len: 0,
@@ -516,9 +517,16 @@ impl<T: Copy + Default> ChunkedStorage<T> {
         }
     }
 
-    pub fn extend_from_slice(&mut self, items: &[T]) {
-        for &item in items {
-            self.push(item);
+    pub fn extend_from_slice(&mut self, mut items: &[T]) {
+        while !items.is_empty() {
+            let count = items.len().min(self.chunk_size - self.current.len());
+            self.current.extend_from_slice(&items[..count]);
+            self.len += count;
+            items = &items[count..];
+
+            if self.current.len() == self.chunk_size {
+                self.seal_current();
+            }
         }
     }
 
@@ -536,7 +544,7 @@ impl<T: Copy + Default> ChunkedStorage<T> {
     pub fn snapshot(&self) -> ChunkedSnapshot<T> {
         let mut chunks = self.chunks.clone();
         if !self.current.is_empty() {
-            chunks.push(Arc::from(self.current.clone().into_boxed_slice()));
+            chunks.push(Arc::<[T]>::from(self.current.as_slice()));
         }
 
         ChunkedSnapshot {
@@ -673,6 +681,53 @@ impl<T: Copy> std::ops::Index<usize> for ChunkedStorage<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bulk_appends_match_pushes_and_preserve_snapshots() {
+        let input: Vec<u8> = (0..37).collect();
+        for chunk_size in [1, 2, 4, 8, 64] {
+            for split in 0..=input.len() {
+                let mut bulk = ChunkedStorage::new(chunk_size);
+                let mut reference = ChunkedStorage::new(chunk_size);
+                for &byte in &input[..split] {
+                    bulk.push(byte);
+                    reference.push(byte);
+                }
+                let earlier = bulk.snapshot();
+                bulk.extend_from_slice(&[]);
+                bulk.extend_from_slice(&input[split..]);
+                for &byte in &input[split..] {
+                    reference.push(byte);
+                }
+                assert_eq!(bulk.len(), reference.len());
+                assert_eq!(bulk.sealed_len, reference.sealed_len);
+                assert_eq!(bulk.current, reference.current);
+                assert_eq!(bulk.chunks, reference.chunks);
+                assert_eq!(earlier.len, split);
+                for index in 0..split {
+                    assert_eq!(earlier[index], input[index]);
+                }
+                // A subsequent scalar push must still work after bulk sealing.
+                bulk.push(99);
+                assert_eq!(bulk[input.len()], 99);
+            }
+        }
+    }
+
+    #[test]
+    fn bulk_appends_support_zero_sized_elements() {
+        let mut storage = ChunkedStorage::new(2);
+        storage.extend_from_slice(&[(); 5]);
+        assert_eq!(storage.len(), 5);
+        assert_eq!(storage.sealed_len, 4);
+        assert_eq!(storage.current.len(), 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "chunk size must be nonzero")]
+    fn rejects_zero_chunk_size() {
+        let _ = ChunkedStorage::<u8>::new(0);
+    }
 
     #[test]
     fn chunked_equality_matches_contiguous_storage() {
