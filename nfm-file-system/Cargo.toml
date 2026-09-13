@@ -3,10 +3,18 @@ name = "nfm_file_system"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+scan-bench = []
+
+[[example]]
+name = "scan_bench"
+required-features = ["scan-bench"]
+
 [dependencies]
 crossbeam-channel = "0.5.15"
 
 [target.'cfg(windows)'.dependencies]
+hashbrown = { version = "0.17.1", default-features = false }
 windows = { version = "0.62.2", features = [
     "Win32_Foundation",
     "Win32_Storage_FileSystem",

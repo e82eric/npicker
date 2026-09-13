@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use hashbrown::HashTable;
 use std::ffi::c_void;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
@@ -20,6 +20,9 @@ const NODE_CHUNK_SIZE: usize = 64 * 1024;
 const NAME_CHUNK_SIZE: usize = 64 * 1024;
 const PUBLISH_NODE_INTERVAL: usize = 1_000;
 const BYTE_CHUNK_SIZE: usize = 1024 * 1024;
+
+#[cfg(feature = "scan-bench")]
+pub mod benchmark;
 
 pub struct ScanOptions {
     pub roots: Vec<PathBuf>,
@@ -253,11 +256,16 @@ impl PublishedSnapshot {
     }
 }
 
+struct InternEntry {
+    hash: u64,
+    name_index: u32,
+}
+
 pub struct CompactUtf8FileStore {
     nodes: ChunkedStorage<Node>,
     names: ChunkedStorage<Name>,
     name_bytes: ChunkedStorage<u8>,
-    interned_names: Option<HashMap<u64, Vec<u32>>>,
+    interned_names: Option<HashTable<InternEntry>>,
     published: Arc<PublishedSnapshot>,
     snapshot_version: AtomicU64,
 }
@@ -280,7 +288,7 @@ impl CompactUtf8FileStore {
             nodes: ChunkedStorage::new(NODE_CHUNK_SIZE),
             names: ChunkedStorage::new(NAME_CHUNK_SIZE),
             name_bytes: ChunkedStorage::new(BYTE_CHUNK_SIZE),
-            interned_names: Some(HashMap::new()),
+            interned_names: Some(HashTable::new()),
             published: Arc::new(PublishedSnapshot::empty()),
             snapshot_version: AtomicU64::new(0),
         }
@@ -324,29 +332,33 @@ impl CompactUtf8FileStore {
     }
 
     fn get_or_add_name(&mut self, bytes: &[u8]) -> u32 {
+        let hash = hash_bytes(bytes);
+        self.get_or_add_name_hashed(bytes, hash)
+    }
+
+    // Callers must consistently supply the same hash for equal byte strings.
+    fn get_or_add_name_hashed(&mut self, bytes: &[u8], hash: u64) -> u32 {
         let Some(interned) = self.interned_names.as_ref() else {
             return self.add_name(bytes);
         };
 
-        let hash = hash_bytes(bytes);
-        if let Some(candidates) = interned.get(&hash) {
-            for &candidate in candidates {
-                let name = self.names[candidate as usize];
-                if name.len as usize == bytes.len()
-                    && self.name_bytes.eq_slice(name.offset as usize, bytes)
-                {
-                    return candidate;
-                }
+        if let Some(entry) = interned.find(hash, |entry| {
+            if entry.hash != hash {
+                return false;
             }
+            let name = self.names[entry.name_index as usize];
+            name.len as usize == bytes.len()
+                && self.name_bytes.eq_slice(name.offset as usize, bytes)
+        }) {
+            return entry.name_index;
         }
 
         let name_index = self.add_name(bytes);
         self.interned_names
             .as_mut()
             .expect("interning is still enabled")
-            .entry(hash)
-            .or_default()
-            .push(name_index);
+            // Cache full hashes so table growth never re-reads name bytes.
+            .insert_unique(hash, InternEntry { hash, name_index }, |entry| entry.hash);
         name_index
     }
 
@@ -359,6 +371,64 @@ impl CompactUtf8FileStore {
             len: bytes.len() as u32,
         });
         index as u32
+    }
+}
+
+#[cfg(test)]
+mod interning_tests {
+    use super::*;
+
+    #[test]
+    fn collisions_and_growth_preserve_distinct_names() {
+        let mut store = CompactUtf8FileStore::new();
+        // Exercise names spanning sealed chunks and the unfinished chunk.
+        store.name_bytes = ChunkedStorage::new(4);
+        let inputs = [
+            b"alpha".as_slice(),
+            b"bravo",
+            b"",
+            b"longer-name",
+            b"alpha!",
+        ];
+        let indexes: Vec<_> = inputs
+            .iter()
+            .map(|bytes| store.get_or_add_name_hashed(bytes, 7))
+            .collect();
+        assert_eq!(indexes, vec![0, 1, 2, 3, 4]);
+        for index in 0..1000 {
+            store.get_or_add_name(format!("unique-{index}").as_bytes());
+        }
+        let name_count = store.names.len();
+        let byte_count = store.name_bytes.len();
+        for (bytes, expected) in inputs.iter().zip(indexes) {
+            assert_eq!(store.get_or_add_name_hashed(bytes, 7), expected);
+        }
+        assert_eq!(store.names.len(), name_count);
+        assert_eq!(store.name_bytes.len(), byte_count);
+        for index in 0..1000 {
+            assert_eq!(
+                store.get_or_add_name(format!("unique-{index}").as_bytes()),
+                5 + index
+            );
+        }
+    }
+
+    #[test]
+    fn repeated_node_names_share_storage_and_publish() {
+        let mut store = CompactUtf8FileStore::new();
+        let first = store.add_node(-1, "same");
+        let second = store.add_node(-1, "same");
+        assert_eq!(
+            store.nodes[first as usize].name,
+            store.nodes[second as usize].name
+        );
+        assert_eq!(store.names.len(), 1);
+        store.complete_adding();
+        assert!(store.interned_names.is_none());
+        let snapshot = store.snapshot();
+        assert_eq!(snapshot.node_count, 2);
+        assert_eq!(snapshot.name_count, 1);
+        assert_eq!(snapshot.byte_count, 4);
     }
 }
 

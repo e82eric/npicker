@@ -347,6 +347,7 @@ name = "nfm_file_system"
 version = "0.1.0"
 dependencies = [
  "crossbeam-channel",
+ "hashbrown",
  "nfm_search_core",
  "windows",
 ]
