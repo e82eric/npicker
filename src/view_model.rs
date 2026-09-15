@@ -2142,6 +2142,7 @@ mod tests {
         let runner = Arc::clone(&view_model);
         let request_thread = thread::spawn(move || {
             let request = WindowListPickerRequest {
+                search_string: None,
                 items: vec![WindowListItem {
                     text: "00001234      100 app.exe Window title".into(),
                     hwnd: 0x1234,

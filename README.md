@@ -30,6 +30,12 @@ Run the picker by piping candidates to stdin. The selected item is printed to st
 some-command-producing-lines | nfm-rust-win32host
 ```
 
+Use `--query "text"` to prefill the search box in any input mode:
+
+```powershell
+nfm-rust-win32host filesystem G:\src --query "walker"
+```
+
 Delimited stdin can map separate fields to the searchable text, accepted value,
 preview file, and one-based preview center line. Field numbers are one-based,
 and the highest selected field consumes the rest of the line:

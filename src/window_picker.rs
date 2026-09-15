@@ -10,6 +10,7 @@ use crate::WindowPickerItem;
 
 pub fn request() -> Result<WindowListPickerRequest, String> {
     Ok(WindowListPickerRequest {
+        search_string: None,
         items: list_windows().map_err(|error| format!("Failed to list windows: {error}"))?,
     })
 }

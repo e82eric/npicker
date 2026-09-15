@@ -10,6 +10,7 @@ use crate::ProcessPickerItem;
 
 pub fn request() -> Result<ProcessListPickerRequest, String> {
     Ok(ProcessListPickerRequest {
+        search_string: None,
         items: list_processes().map_err(|error| format!("Failed to list processes: {error}"))?,
     })
 }

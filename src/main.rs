@@ -121,6 +121,7 @@ fn main() -> Result<()> {
             .collect(),
     );
     let bindings = options.bindings;
+    let query = options.query;
     let preview_factory = if is_file_system && !command_preview {
         rust_nfm::file_picker::default_preview_factory()
     } else {
@@ -133,34 +134,40 @@ fn main() -> Result<()> {
             Arc::clone(&view_model),
             Arc::clone(&preview_factory),
             Arc::clone(&actions),
+            query,
         ),
         InputMode::Stdin(Some(options)) => run_delimited_request(
             Arc::clone(&view_model),
             Arc::clone(&preview_factory),
             Arc::clone(&actions),
+            query,
             options,
         ),
         InputMode::StructuredCsv(options) => run_structured_csv_request(
             Arc::clone(&view_model),
             Arc::clone(&preview_factory),
             Arc::clone(&actions),
+            query,
             options,
         ),
         InputMode::FileSystem(roots) => run_file_system_request(
             Arc::clone(&view_model),
             Arc::clone(&preview_factory),
             Arc::clone(&actions),
+            query,
             roots,
         )?,
         InputMode::Windows => run_windows_request(
             Arc::clone(&view_model),
             Arc::clone(&preview_factory),
             Arc::clone(&actions),
+            query,
         )?,
         InputMode::Processes => run_processes_request(
             Arc::clone(&view_model),
             Arc::clone(&preview_factory),
             Arc::clone(&actions),
+            query,
         )?,
     }
     let code = picker_ui::run(view_model, view, preview_enabled, preview_visible)?;
@@ -190,6 +197,7 @@ FILESYSTEM OPTIONS:\n\
 With no command, candidates are read from stdin.\n\
 \n\
 INPUT OPTIONS:\n\
+    --query <TEXT>                  Set the initial search query (all modes)\n\
     --stdin                         Read candidates from stdin (default)\n\
     --delimiter <CHAR|\\t>          Parse delimited input\n\
     --text-field <all|N>            Field used for display and search\n\
@@ -360,10 +368,11 @@ fn run_delimited_request(
     view_model: Arc<ViewModel>,
     preview_factory: Arc<PreviewFactory>,
     actions: Arc<HashMap<String, ActionResolverDefinition>>,
+    query: Option<String>,
     options: DelimitedInputOptions,
 ) {
     std::thread::spawn(move || {
-        let request = DelimitedStdinRequest::new(options, None);
+        let request = DelimitedStdinRequest::new(options, query);
         let interactions = PickerInteractions {
             actions: typed_actions(&actions),
             preview_factory,
@@ -391,10 +400,11 @@ fn run_structured_csv_request(
     view_model: Arc<ViewModel>,
     preview_factory: Arc<PreviewFactory>,
     actions: Arc<HashMap<String, ActionResolverDefinition>>,
+    query: Option<String>,
     options: StructuredCsvOptions,
 ) {
     std::thread::spawn(move || {
-        let request = StructuredCsvStdinRequest::new(options, None);
+        let request = StructuredCsvStdinRequest::new(options, query);
         let interactions =
             command_interactions(preview_factory, actions, |item: &StructuredPickerItem| {
                 item.value.clone()
@@ -415,9 +425,10 @@ fn run_stdin_request(
     view_model: Arc<ViewModel>,
     preview_factory: Arc<PreviewFactory>,
     actions: Arc<HashMap<String, ActionResolverDefinition>>,
+    query: Option<String>,
 ) {
     std::thread::spawn(move || {
-        let request = StdinRequest::new(None);
+        let request = StdinRequest::new(query);
         let interactions =
             command_interactions(preview_factory, actions, |item: &String| item.clone());
         let code =
@@ -431,8 +442,10 @@ fn run_windows_request(
     view_model: Arc<ViewModel>,
     preview_factory: Arc<PreviewFactory>,
     actions: Arc<HashMap<String, ActionResolverDefinition>>,
+    query: Option<String>,
 ) -> Result<()> {
-    let request = rust_nfm::window_picker::request().map_err(anyhow::Error::msg)?;
+    let mut request = rust_nfm::window_picker::request().map_err(anyhow::Error::msg)?;
+    request.search_string = query;
     std::thread::spawn(move || {
         let interactions = rust_nfm::window_picker::interactions_with(PickerInteractions {
             actions: typed_actions(&actions),
@@ -463,8 +476,10 @@ fn run_processes_request(
     view_model: Arc<ViewModel>,
     preview_factory: Arc<PreviewFactory>,
     actions: Arc<HashMap<String, ActionResolverDefinition>>,
+    query: Option<String>,
 ) -> Result<()> {
-    let request = rust_nfm::process_picker::request().map_err(anyhow::Error::msg)?;
+    let mut request = rust_nfm::process_picker::request().map_err(anyhow::Error::msg)?;
+    request.search_string = query;
     std::thread::spawn(move || {
         let interactions =
             command_interactions(preview_factory, actions, |item: &ProcessPickerItem| {
@@ -485,6 +500,7 @@ fn run_processes_request(
     _view_model: Arc<ViewModel>,
     _preview_factory: Arc<PreviewFactory>,
     _actions: Arc<HashMap<String, ActionResolverDefinition>>,
+    _query: Option<String>,
 ) -> Result<()> {
     anyhow::bail!("the processes command is currently available only on Windows")
 }
@@ -494,6 +510,7 @@ fn run_windows_request(
     _view_model: Arc<ViewModel>,
     _preview_factory: Arc<PreviewFactory>,
     _actions: Arc<HashMap<String, ActionResolverDefinition>>,
+    _query: Option<String>,
 ) -> Result<()> {
     anyhow::bail!("the windows command is currently available only on Windows")
 }
@@ -503,6 +520,7 @@ fn run_file_system_request(
     view_model: Arc<ViewModel>,
     preview_factory: Arc<PreviewFactory>,
     actions: Arc<HashMap<String, ActionResolverDefinition>>,
+    query: Option<String>,
     options: FileSystemInputOptions,
 ) -> Result<()> {
     let roots = if options.roots.is_empty() {
@@ -516,7 +534,7 @@ fn run_file_system_request(
             max_depth: options.max_depth,
             directories_only: options.directories_only,
             files_only: options.files_only,
-            search_string: None,
+            search_string: query,
         };
         let interactions = file_system_interactions(preview_factory, actions);
         let code =
@@ -531,6 +549,7 @@ fn run_file_system_request(
     _view_model: Arc<ViewModel>,
     _preview_factory: Arc<PreviewFactory>,
     _actions: Arc<HashMap<String, ActionResolverDefinition>>,
+    _query: Option<String>,
     _options: FileSystemInputOptions,
 ) -> Result<()> {
     anyhow::bail!("the filesystem input mode is currently available only on Windows")
@@ -574,6 +593,7 @@ struct FileSystemInputOptions {
 }
 
 struct AppOptions {
+    query: Option<String>,
     debug_wait: bool,
     input: InputMode,
     preview_program: Option<String>,
@@ -609,6 +629,7 @@ struct ActionResolverOptions {
 
 fn app_options() -> AppOptions {
     let mut options = AppOptions {
+        query: None,
         debug_wait: false,
         input: InputMode::Stdin(None),
         preview_program: None,
@@ -679,6 +700,12 @@ fn app_options() -> AppOptions {
                 {
                     Some(delimiter) => csv_delimiter = delimiter as u8,
                     None => eprintln!("--csv-delimiter requires one ASCII character or \\t"),
+                }
+            }
+            "--query" => {
+                options.query = args.next();
+                if options.query.is_none() {
+                    eprintln!("--query requires a value");
                 }
             }
             "--debug-wait" => options.debug_wait = true,

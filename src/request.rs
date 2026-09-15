@@ -163,6 +163,7 @@ impl PickerRequest for FlatItemsPickerRequest {
 
 #[cfg(windows)]
 pub struct WindowListPickerRequest {
+    pub search_string: Option<String>,
     pub items: Vec<WindowListItem>,
 }
 
@@ -171,7 +172,7 @@ impl PickerRequest for WindowListPickerRequest {
     type Source = FlatSnapshot<WindowPickerItem>;
 
     fn search_string(&self) -> Option<&str> {
-        None
+        self.search_string.as_deref()
     }
 
     fn run(&self) -> Arc<dyn SearchSource<Item = <Self::Source as ItemsSource>::Item>> {
@@ -194,6 +195,7 @@ impl PickerRequest for WindowListPickerRequest {
 
 #[cfg(windows)]
 pub struct ProcessListPickerRequest {
+    pub search_string: Option<String>,
     pub items: Vec<ProcessInfo>,
 }
 
@@ -202,7 +204,7 @@ impl PickerRequest for ProcessListPickerRequest {
     type Source = ProcessPickerSnapshot;
 
     fn search_string(&self) -> Option<&str> {
-        None
+        self.search_string.as_deref()
     }
 
     fn run(&self) -> Arc<dyn SearchSource<Item = <Self::Source as ItemsSource>::Item>> {
@@ -687,6 +689,7 @@ mod tests {
     #[test]
     fn window_list_request_retains_native_window_payload() {
         let request = WindowListPickerRequest {
+            search_string: None,
             items: vec![WindowListItem {
                 text: "00001234      100 app.exe Window title".into(),
                 hwnd: 0x1234,
@@ -705,6 +708,7 @@ mod tests {
     #[test]
     fn process_list_request_retains_structured_fields() {
         let request = ProcessListPickerRequest {
+            search_string: None,
             items: vec![ProcessInfo {
                 name: "example.exe".into(),
                 pid: 1234,
@@ -725,6 +729,7 @@ mod tests {
     #[test]
     fn process_list_request_retains_structured_search_and_completions() {
         let request = ProcessListPickerRequest {
+            search_string: None,
             items: vec![
                 ProcessInfo {
                     name: "small.exe".into(),
