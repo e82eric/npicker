@@ -1,5 +1,6 @@
 //! Optional standalone benchmark support; absent from production builds.
 use super::*;
+use crossbeam_channel::bounded;
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::sync::Mutex;

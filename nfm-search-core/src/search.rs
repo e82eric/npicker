@@ -46,6 +46,16 @@ pub struct SearchOutput {
     pub(crate) match_bitmap: Option<MatchBitmap>,
 }
 
+/// Compact set of matching item indexes, stored as one bit per item.
+/// `words` is a contiguous array of 64-bit integers: item `i` uses bit
+/// `i % 64` in `words[i / 64]`. A set bit means the item matched; a clear
+/// bit means it did not. For example, indexes 0..64 occupy the first word,
+/// and index 64 uses the lowest bit of the second word.
+///
+/// `covered_len` is the number of items represented, not the match count.
+/// The final word may contain unused padding bits. Items at or beyond
+/// `covered_len` have not been checked by this bitmap, so iteration and
+/// counting include them as candidates rather than treating them as nonmatches.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct MatchBitmap {
     words: Vec<u64>,

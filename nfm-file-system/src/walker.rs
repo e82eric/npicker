@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use crossbeam_channel::{bounded, unbounded, Receiver, Sender};
+use crossbeam_channel::{unbounded, Receiver, Sender};
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{HANDLE, INVALID_HANDLE_VALUE};
 use windows::Win32::Storage::FileSystem::{
@@ -442,7 +442,7 @@ enum WriterCommand {
     Add {
         parent: i32,
         name: String,
-        response: Option<Sender<u32>>,
+        directory: Option<(usize, Vec<u8>)>,
     },
 }
 
@@ -486,8 +486,17 @@ where
 
     let writer_status = Arc::clone(&status);
     let writer_cancelled = Arc::clone(&cancelled);
+    let writer_pending = Arc::clone(&pending);
+    let directory_tx = tx.clone();
     let writer = std::thread::spawn(move || {
-        store_writer_loop(writer_rx, sink, writer_status, writer_cancelled)
+        store_writer_loop(
+            writer_rx,
+            directory_tx,
+            writer_pending,
+            sink,
+            writer_status,
+            writer_cancelled,
+        )
     });
 
     for root in &options.roots {
@@ -496,19 +505,13 @@ where
         }
 
         let root_text = root.to_string_lossy().into_owned();
-        let root_index = add_node_sync(&writer_tx, -1, root_text.clone());
-
-        pending.fetch_add(1, Ordering::AcqRel);
-        if tx
-            .send(DirectoryWork {
-                depth: 0,
-                node_index: root_index as i32,
-                path: root_text.into_bytes(),
-            })
-            .is_err()
-        {
-            pending.fetch_sub(1, Ordering::AcqRel);
-        }
+        add_node(
+            &writer_tx,
+            &pending,
+            -1,
+            root_text.clone(),
+            Some((0, root_text.into_bytes())),
+        );
     }
 
     let options = Arc::new(options);
@@ -517,7 +520,6 @@ where
         let worker_options = Arc::clone(&options);
         let worker_pending = Arc::clone(&pending);
         let worker_writer_tx = writer_tx.clone();
-        let worker_tx = tx.clone();
         let worker_rx = rx.clone();
         let worker_cancelled = Arc::clone(&cancelled);
         workers.push(std::thread::spawn(move || {
@@ -525,7 +527,6 @@ where
                 worker_options,
                 worker_pending,
                 worker_writer_tx,
-                worker_tx,
                 worker_rx,
                 worker_cancelled,
             );
@@ -533,6 +534,7 @@ where
     }
 
     drop(tx);
+    drop(rx);
     drop(writer_tx);
 
     for worker in workers {
@@ -542,11 +544,128 @@ where
     let _ = writer.join();
 }
 
+#[cfg(test)]
+mod scheduling_tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    #[derive(Default)]
+    struct Sink(Mutex<Option<Arc<PublishedSnapshot>>>);
+
+    impl ScanEventSink for Sink {
+        fn snapshot(&self, snapshot: Arc<PublishedSnapshot>) {
+            *self.0.lock().unwrap() = Some(snapshot);
+        }
+        fn complete(&self, _: ScanStatus) {}
+    }
+
+    #[test]
+    fn writer_schedules_inserted_directories_and_preserves_parent_indexes() {
+        let (writer_tx, writer_rx) = unbounded();
+        let (directory_tx, directory_rx) = unbounded();
+        let pending = Arc::new(AtomicUsize::new(0));
+        let sink = Arc::new(Sink::default());
+        let status = Arc::new(AtomicU8::new(ScanStatus::Scanning.as_u8()));
+        // Enqueue before starting the writer: insertion must not wait for a reply.
+        add_node(
+            &writer_tx,
+            &pending,
+            -1,
+            "root".into(),
+            Some((0, b"root".to_vec())),
+        );
+        assert_eq!(pending.load(Ordering::Acquire), 1);
+        let writer = {
+            let pending = Arc::clone(&pending);
+            let sink = Arc::clone(&sink);
+            let status = Arc::clone(&status);
+            std::thread::spawn(move || {
+                store_writer_loop(
+                    writer_rx,
+                    directory_tx,
+                    pending,
+                    sink,
+                    status,
+                    Arc::new(AtomicBool::new(false)),
+                )
+            })
+        };
+        let root = directory_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(root.node_index, 0);
+        add_node(
+            &writer_tx,
+            &pending,
+            root.node_index,
+            "child".into(),
+            Some((1, b"root\\child".to_vec())),
+        );
+        pending.fetch_sub(1, Ordering::AcqRel);
+        let child = directory_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(child.node_index, 1);
+        assert_eq!(child.depth, 1);
+        assert_eq!(child.path, b"root\\child");
+        add_node(&writer_tx, &pending, child.node_index, "file".into(), None);
+        pending.fetch_sub(1, Ordering::AcqRel);
+        drop(writer_tx);
+        writer.join().unwrap();
+        assert_eq!(pending.load(Ordering::Acquire), 0);
+        assert_eq!(
+            ScanStatus::from_u8(status.load(Ordering::Acquire)),
+            ScanStatus::Completed
+        );
+        assert_eq!(
+            sink.0.lock().unwrap().as_ref().unwrap().item(2).unwrap(),
+            "root\\child\\file"
+        );
+        assert!(directory_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn failed_writer_send_releases_pending_work() {
+        let (tx, rx) = unbounded();
+        drop(rx);
+        let pending = AtomicUsize::new(0);
+        add_node(&tx, &pending, -1, "root".into(), Some((0, Vec::new())));
+        assert_eq!(pending.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn cancelled_or_disconnected_scheduling_releases_pending_work() {
+        for cancelled in [false, true] {
+            let (tx, rx) = unbounded();
+            let (directory_tx, directory_rx) = unbounded();
+            let pending = Arc::new(AtomicUsize::new(0));
+            add_node(&tx, &pending, -1, "root".into(), Some((0, Vec::new())));
+            drop(tx);
+            if !cancelled {
+                drop(directory_rx);
+            }
+            let status = Arc::new(AtomicU8::new(ScanStatus::Scanning.as_u8()));
+            store_writer_loop(
+                rx,
+                directory_tx,
+                Arc::clone(&pending),
+                Arc::new(Sink::default()),
+                Arc::clone(&status),
+                Arc::new(AtomicBool::new(cancelled)),
+            );
+            assert_eq!(pending.load(Ordering::Acquire), 0);
+            assert_eq!(
+                ScanStatus::from_u8(status.load(Ordering::Acquire)),
+                if cancelled {
+                    ScanStatus::Cancelled
+                } else {
+                    ScanStatus::Completed
+                }
+            );
+        }
+    }
+}
+
 fn worker_loop(
     options: Arc<ScanOptions>,
     pending: Arc<AtomicUsize>,
     writer_tx: Sender<WriterCommand>,
-    tx: Sender<DirectoryWork>,
     rx: Receiver<DirectoryWork>,
     cancelled: Arc<AtomicBool>,
 ) {
@@ -557,7 +676,7 @@ fn worker_loop(
 
         match rx.recv_timeout(Duration::from_millis(25)) {
             Ok(work) => {
-                scan_directory(&options, &pending, &writer_tx, &tx, &cancelled, work);
+                scan_directory(&options, &pending, &writer_tx, &cancelled, work);
                 pending.fetch_sub(1, Ordering::AcqRel);
             }
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
@@ -574,7 +693,6 @@ fn scan_directory(
     options: &ScanOptions,
     pending: &AtomicUsize,
     writer_tx: &Sender<WriterCommand>,
-    tx: &Sender<DirectoryWork>,
     cancelled: &AtomicBool,
     work: DirectoryWork,
 ) {
@@ -612,43 +730,16 @@ fn scan_directory(
                     let is_dir = (find_data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY.0) != 0;
                     let will_recurse = is_dir && work.depth + 1 < effective_max_depth;
 
-                    if (!options.directories_only || is_dir) && (!options.files_only || !is_dir) {
-                        let child_path =
-                            will_recurse.then(|| make_child_path(&work.path, name.as_bytes()));
-                        let child_index = if is_dir {
-                            add_node_sync(writer_tx, work.node_index, name)
-                        } else {
-                            add_node_async(writer_tx, work.node_index, name);
-                            u32::MAX
-                        };
-
-                        if let Some(child_path) = child_path {
-                            pending.fetch_add(1, Ordering::AcqRel);
-                            if tx
-                                .send(DirectoryWork {
-                                    depth: work.depth + 1,
-                                    node_index: child_index as i32,
-                                    path: child_path,
-                                })
-                                .is_err()
-                            {
-                                pending.fetch_sub(1, Ordering::AcqRel);
-                            }
-                        }
-                    } else if will_recurse {
-                        let child_path = make_child_path(&work.path, name.as_bytes());
-                        let child_index = add_node_sync(writer_tx, work.node_index, name);
-                        pending.fetch_add(1, Ordering::AcqRel);
-                        if tx
-                            .send(DirectoryWork {
-                                depth: work.depth + 1,
-                                node_index: child_index as i32,
-                                path: child_path,
-                            })
-                            .is_err()
-                        {
-                            pending.fetch_sub(1, Ordering::AcqRel);
-                        }
+                    let included = if is_dir {
+                        !options.files_only
+                    } else {
+                        !options.directories_only
+                    };
+                    if included || will_recurse {
+                        let directory = will_recurse.then(|| {
+                            (work.depth + 1, make_child_path(&work.path, name.as_bytes()))
+                        });
+                        add_node(writer_tx, pending, work.node_index, name, directory);
                     }
                 }
             } else {
@@ -664,6 +755,8 @@ fn scan_directory(
 
 fn store_writer_loop<S>(
     rx: Receiver<WriterCommand>,
+    directory_tx: Sender<DirectoryWork>,
+    pending: Arc<AtomicUsize>,
     sink: Arc<S>,
     status: Arc<AtomicU8>,
     cancelled: Arc<AtomicBool>,
@@ -676,14 +769,24 @@ fn store_writer_loop<S>(
             WriterCommand::Add {
                 parent,
                 name,
-                response,
+                directory,
             } => {
                 let node_index = store.add_node(parent, &name);
                 if node_index == 0 || (node_index + 1) % 1_000 == 0 {
                     sink.snapshot(store.snapshot());
                 }
-                if let Some(response) = response {
-                    let _ = response.send(node_index);
+                if let Some((depth, path)) = directory {
+                    if cancelled.load(Ordering::Acquire)
+                        || directory_tx
+                            .send(DirectoryWork {
+                                depth,
+                                node_index: node_index as i32,
+                                path,
+                            })
+                            .is_err()
+                    {
+                        pending.fetch_sub(1, Ordering::AcqRel);
+                    }
                 }
             }
         }
@@ -701,29 +804,31 @@ fn store_writer_loop<S>(
     sink.complete(final_status);
 }
 
-fn add_node_sync(writer_tx: &Sender<WriterCommand>, parent: i32, name: String) -> u32 {
-    let (response_tx, response_rx) = bounded(1);
-    let sent = writer_tx.send(WriterCommand::Add {
-        parent,
-        name,
-        response: Some(response_tx),
-    });
-    let node_index = if sent.is_ok() {
-        response_rx.recv().unwrap_or(u32::MAX)
-    } else {
-        u32::MAX
-    };
-    node_index
+fn add_node(
+    writer_tx: &Sender<WriterCommand>,
+    pending: &AtomicUsize,
+    parent: i32,
+    name: String,
+    directory: Option<(usize, Vec<u8>)>,
+) {
+    let schedules_directory = directory.is_some();
+    // Count work before enqueueing so workers stay alive while the writer
+    // still has directories waiting to be inserted and scheduled.
+    if schedules_directory {
+        pending.fetch_add(1, Ordering::AcqRel);
+    }
+    if writer_tx
+        .send(WriterCommand::Add {
+            parent,
+            name,
+            directory,
+        })
+        .is_err()
+        && schedules_directory
+    {
+        pending.fetch_sub(1, Ordering::AcqRel);
+    }
 }
-
-fn add_node_async(writer_tx: &Sender<WriterCommand>, parent: i32, name: String) {
-    let _ = writer_tx.send(WriterCommand::Add {
-        parent,
-        name,
-        response: None,
-    });
-}
-
 struct FindHandle(HANDLE);
 
 impl Drop for FindHandle {
