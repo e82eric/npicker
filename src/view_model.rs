@@ -759,7 +759,7 @@ impl ViewModel {
             .search_string()
             .as_ref()
             .map_or(0, |value| value.len());
-        timing::write(format!("begin_request search_len={search_len}",));
+        timing::write_lazy(|| format!("begin_request search_len={search_len}",));
 
         let request_id = self.request_generation.fetch_add(1, Ordering::AcqRel) + 1;
         let (response_tx, response_rx) = unbounded();
@@ -804,7 +804,7 @@ impl ViewModel {
         picker.start_search(request_id, query, self.search_update_tx.clone());
 
         let response = response_rx.recv().unwrap_or(PickerResponse::Cancelled);
-        timing::write(format!("response status={}", response.status_label()));
+        timing::write_lazy(|| format!("response status={}", response.status_label()));
         Ok(response)
     }
 

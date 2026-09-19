@@ -54,7 +54,7 @@ fn main() -> Result<()> {
         debug_wait();
     }
 
-    nfm_search_core::timing::set_sink(output_timing);
+    nfm_search_core::timing::set_sink_from_env(output_timing);
     let is_window_list = matches!(&options.input, InputMode::Windows);
     let is_process_list = matches!(&options.input, InputMode::Processes);
     let is_file_system = matches!(&options.input, InputMode::FileSystem(_));

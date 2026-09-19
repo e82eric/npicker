@@ -42,7 +42,7 @@ fn output_debug_string(line: &str) {
 #[unsafe(no_mangle)]
 pub extern "C" fn RustNfmInitialize() {
     let _ = catch_unwind(AssertUnwindSafe(|| {
-        nfm_search_core::timing::set_sink(output_debug_string);
+        nfm_search_core::timing::set_sink_from_env(output_debug_string);
         ensure_initialized();
     }));
 }

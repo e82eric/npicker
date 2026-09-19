@@ -474,13 +474,15 @@ where
         .unwrap_or(1)
         .saturating_sub(2)
         .max(1);
-    timing::write(format!(
+    timing::write_lazy(|| {
+        format!(
         "source_start mode=rust_win32 workers={worker_count} roots={} max_depth={} directories_only={} files_only={}",
         options.roots.len(),
         options.max_depth,
         options.directories_only,
         options.files_only
-    ));
+    )
+    });
 
     let writer_status = Arc::clone(&status);
     let writer_cancelled = Arc::clone(&cancelled);
@@ -495,10 +497,6 @@ where
 
         let root_text = root.to_string_lossy().into_owned();
         let root_index = add_node_sync(&writer_tx, -1, root_text.clone());
-
-        if !options.files_only {
-            // Root entries are published through the store; no separate item callback exists in Rust.
-        }
 
         pending.fetch_add(1, Ordering::AcqRel);
         if tx

@@ -292,6 +292,7 @@ fn accumulate_fzf<S, F, I>(
     collect_matches: bool,
     plan: &(dyn SearchPlan + '_),
     filters_items: bool,
+    timing_enabled: bool,
 ) -> SearchAccumulator
 where
     S: ItemsSource + Send + Sync,
@@ -321,7 +322,8 @@ where
                     return (state, scratch);
                 }
 
-                let time_sample = (node_index & (SEARCH_TIMING_SAMPLE_RATE - 1)) == 0;
+                let time_sample =
+                    timing_enabled && (node_index & (SEARCH_TIMING_SAMPLE_RATE - 1)) == 0;
                 let path_start = time_sample.then(Instant::now);
                 let path_bytes = snapshot.get_string(
                     node_index,
@@ -334,7 +336,9 @@ where
                 }
 
                 let is_ascii = path_bytes.is_ascii();
-                state.utf8_count += usize::from(!is_ascii);
+                if timing_enabled {
+                    state.utf8_count += usize::from(!is_ascii);
+                }
                 let score_start = time_sample.then(Instant::now);
                 let score = pattern.score(path_bytes, is_ascii, &mut scratch);
                 if let Some(score_start) = score_start {
@@ -485,7 +489,8 @@ where
     S: ItemsSource + Send + Sync,
     F: Fn() -> bool + Sync,
 {
-    let total_start = Instant::now();
+    let timing_enabled = timing::is_enabled();
+    let total_start = timing_enabled.then(Instant::now);
     let plan = snapshot.create_search_plan(query);
     let fuzzy_query = plan.fuzzy_query();
     let filters_items = plan.filters_items();
@@ -498,10 +503,12 @@ where
     }
 
     if snapshot.is_empty() || searched == 0 {
-        let total_us = timing::elapsed_us(total_start);
-        timing::write(format!(
+        let total_us = total_start.map_or(0, timing::elapsed_us);
+        timing::write_lazy(|| {
+            format!(
             "search_detail total_us={total_us} parse_us=0 match_us=0 sort_us=0 append_us=0 shown=0 matched=0 total={total}",
-        ));
+        )
+        });
         return Some(SearchOutput {
             results: Vec::new(),
             matched: 0,
@@ -511,7 +518,7 @@ where
     }
 
     if fuzzy_query.is_empty() {
-        let append_start = Instant::now();
+        let append_start = timing_enabled.then(Instant::now);
         let mut included = Vec::with_capacity(RESULT_LIMIT.min(searched));
         let mut matched = 0;
         for index in start_index..end_index {
@@ -534,22 +541,24 @@ where
             match_bitmap: None,
         };
         apply_custom_sort(&mut output.results, plan.as_ref());
-        let append_us = timing::elapsed_us(append_start);
-        let total_us = timing::elapsed_us(total_start);
-        timing::write(format!(
+        let append_us = append_start.map_or(0, timing::elapsed_us);
+        let total_us = total_start.map_or(0, timing::elapsed_us);
+        timing::write_lazy(|| {
+            format!(
             "search_detail mode=unfiltered total_us={total_us} parse_us=0 match_us=0 sort_us=0 append_us={append_us} shown={} matched={} total={}",
             output.results.len(),
             output.matched,
             output.total
-        ));
+        )
+        });
         return Some(output);
     }
 
-    let parse_start = Instant::now();
+    let parse_start = timing_enabled.then(Instant::now);
     let pattern = fzf::SearchPattern::parse(fuzzy_query);
-    let parse_us = timing::elapsed_us(parse_start);
+    let parse_us = parse_start.map_or(0, timing::elapsed_us);
 
-    let match_start = Instant::now();
+    let match_start = timing_enabled.then(Instant::now);
     debug_assert!(filter.is_none() || start_index == 0);
     let accumulator = if let Some(filter) = filter {
         accumulate_fzf(
@@ -561,6 +570,7 @@ where
             collect_matches,
             plan.as_ref(),
             filters_items,
+            timing_enabled,
         )
     } else {
         accumulate_fzf(
@@ -572,9 +582,10 @@ where
             collect_matches,
             plan.as_ref(),
             filters_items,
+            timing_enabled,
         )
     };
-    let match_us = timing::elapsed_us(match_start);
+    let match_us = match_start.map_or(0, timing::elapsed_us);
     let SearchAccumulator {
         candidates,
         matched,
@@ -588,18 +599,20 @@ where
         ..
     } = accumulator;
     if cancelled || is_cancelled() {
-        timing::write(format!(
-            "search_cancelled mode={} match_us={match_us} matched={matched} total={total}",
-            sort_mode.timing_label()
-        ));
+        timing::write_lazy(|| {
+            format!(
+                "search_cancelled mode={} match_us={match_us} matched={matched} total={total}",
+                sort_mode.timing_label()
+            )
+        });
         return None;
     }
 
-    let sort_start = Instant::now();
+    let sort_start = timing_enabled.then(Instant::now);
     let candidates = candidates.into_sorted_candidates();
-    let sort_us = timing::elapsed_us(sort_start);
+    let sort_us = sort_start.map_or(0, timing::elapsed_us);
 
-    let append_start = Instant::now();
+    let append_start = timing_enabled.then(Instant::now);
     let mut path_buffer = Vec::with_capacity(512);
     let mut results: Vec<SearchResult> = candidates
         .into_iter()
@@ -615,28 +628,29 @@ where
         })
         .collect();
     apply_custom_sort(&mut results, plan.as_ref());
-    let append_us = timing::elapsed_us(append_start);
-    let total_us = timing::elapsed_us(total_start);
+    let append_us = append_start.map_or(0, timing::elapsed_us);
+    let total_us = total_start.map_or(0, timing::elapsed_us);
 
-    let sampled_scale = if timing_samples > 0 {
-        SEARCH_TIMING_SAMPLE_RATE as u128
-    } else {
-        0
-    };
-    let utf8_path_estimate_us = path_us * sampled_scale;
-    let ascii_score_estimate_us = score_us * sampled_scale;
-    let retention_estimate_us = retention_us * sampled_scale;
-
-    let searched = filter.map_or(searched, |filter| filter.count_matches(end_index));
     let match_bitmap = matched_indexes
         .as_deref()
         .map(|indexes| MatchBitmap::from_indexes(end_index, indexes));
 
-    timing::write(format!(
+    timing::write_lazy(|| {
+        let sampled_scale = if timing_samples > 0 {
+            SEARCH_TIMING_SAMPLE_RATE as u128
+        } else {
+            0
+        };
+        let utf8_path_estimate_us = path_us * sampled_scale;
+        let ascii_score_estimate_us = score_us * sampled_scale;
+        let retention_estimate_us = retention_us * sampled_scale;
+        let searched = filter.map_or(searched, |filter| filter.count_matches(end_index));
+        format!(
         "search_detail mode={} total_us={total_us} parse_us={parse_us} match_us={match_us} sort_us={sort_us} append_us={append_us} utf8_path_estimate_us={utf8_path_estimate_us} ascii_score_estimate_us={ascii_score_estimate_us} char_fallback_estimate_us=0 retention_estimate_us={retention_estimate_us} timing_sample_rate={SEARCH_TIMING_SAMPLE_RATE} timing_samples={timing_samples} utf8_count={utf8_count} fallback_count=0 shown={} matched={matched} total={total} searched={searched}",
         sort_mode.timing_label(),
         results.len()
-    ));
+    )
+    });
 
     Some(SearchOutput {
         results,

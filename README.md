@@ -30,6 +30,19 @@ Run the picker by piping candidates to stdin. The selected item is printed to st
 some-command-producing-lines | nfm-rust-win32host
 ```
 
+Timing output is disabled by default. Set `NFM_TIMING=1` before launching the
+CLI or the application hosting the DLL to enable it:
+
+```powershell
+$env:NFM_TIMING = '1'
+nfm-rust-win32host filesystem G:\src
+```
+
+Set `$env:NFM_TIMING = '0'` and restart the application to disable it again.
+Only the exact value `1` enables timing output. On Windows, output goes to
+`OutputDebugStringW`; on other platforms, the CLI writes it to stderr.
+When disabled, timing logging and search profiling measurements are skipped.
+
 Use `--query "text"` to prefill the search box in any input mode:
 
 ```powershell
