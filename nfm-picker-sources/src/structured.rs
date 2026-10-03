@@ -10,6 +10,46 @@ use nfm_search_core::store::{
 };
 use regex::RegexBuilder;
 
+/// Build and publish a completed source from an in-memory structured table.
+/// Validates column names and row widths before returning the source.
+pub fn structured_source(
+    columns: Vec<String>,
+    rows: Vec<Vec<String>>,
+) -> Result<Arc<nfm_search_core::snapshot_store::SnapshotStore<StructuredStreamingSnapshot>>, String>
+{
+    structured_source_with_previews(
+        columns,
+        rows.into_iter().map(|cells| StructuredSourceRow {
+            cells,
+            preview: None,
+        }),
+    )
+}
+
+/// A row in an in-memory structured source, with optional preview content.
+#[derive(Clone, Debug)]
+pub struct StructuredSourceRow {
+    pub cells: Vec<String>,
+    pub preview: Option<String>,
+}
+
+/// Build a completed source, preserving each row's optional preview independently.
+pub fn structured_source_with_previews(
+    columns: Vec<String>,
+    rows: impl IntoIterator<Item = StructuredSourceRow>,
+) -> Result<Arc<nfm_search_core::snapshot_store::SnapshotStore<StructuredStreamingSnapshot>>, String>
+{
+    let mut store = StructuredStreamingStore::new(StructuredSchema::new(columns)?);
+    for row in rows {
+        store
+            .add_record_with_preview(&csv::StringRecord::from(row.cells), row.preview.as_deref())?;
+    }
+    let source = Arc::new(nfm_search_core::snapshot_store::SnapshotStore::new());
+    source.publish(store.snapshot());
+    source.complete();
+    Ok(source)
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
 pub struct StructuredPickerItem {
     pub value: String,
@@ -196,6 +236,15 @@ pub struct StructuredStreamingSnapshot {
 }
 
 impl StructuredStreamingSnapshot {
+    /// Build a validated immutable structured source for embedded controls.
+    pub fn from_rows(columns: Vec<String>, rows: Vec<Vec<String>>) -> Result<Arc<Self>, String> {
+        let mut store = StructuredStreamingStore::new(StructuredSchema::new(columns)?);
+        for row in rows {
+            store.add_record(&csv::StringRecord::from(row))?;
+        }
+        Ok(store.snapshot())
+    }
+
     pub fn schema(&self) -> &StructuredSchema {
         &self.schema
     }
@@ -1201,5 +1250,28 @@ mod tests {
         assert_eq!(compare_case_insensitive("Alpha", "alpha"), Ordering::Equal);
         assert_eq!(compare_case_insensitive("alpha", "BETA"), Ordering::Less);
         assert_eq!(compare_case_insensitive("GAMMA", "beta"), Ordering::Greater);
+    }
+}
+
+#[cfg(test)]
+mod completed_source_tests {
+    use super::*;
+    #[test]
+    fn completed_tables_validate_schema_and_row_widths() {
+        let source = structured_source(vec!["Name".into()], vec![vec!["entry".into()]]).unwrap();
+        assert!(source.is_done());
+        assert_eq!(
+            source.snapshot().unwrap().item(0).unwrap().fields["Name"],
+            "entry"
+        );
+        let empty = structured_source(vec!["Name".into()], Vec::new()).unwrap();
+        assert!(empty.is_done());
+        assert!(empty.snapshot().unwrap().is_empty());
+        assert!(structured_source(Vec::new(), Vec::new()).is_err());
+        assert!(structured_source(vec!["Name".into(), "name".into()], Vec::new()).is_err());
+        assert!(structured_source(vec!["Name".into()], vec![Vec::new()]).is_err());
+        assert!(
+            structured_source(vec!["Name".into()], vec![vec!["a".into(), "b".into()]]).is_err()
+        );
     }
 }

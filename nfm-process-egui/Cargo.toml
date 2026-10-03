@@ -1,0 +1,10 @@
+[package]
+name = "nfm-process-egui"
+version = "0.1.0"
+edition = "2024"
+description = "Embedded NFM process picker with background refresh and actions"
+
+[dependencies]
+nfm-egui = { path = "../nfm-egui" }
+nfm_search_core = { path = "../nfm-search-core" }
+nfm-win32 = { path = "../nfm-win32" }

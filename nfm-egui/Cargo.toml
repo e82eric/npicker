@@ -1,0 +1,26 @@
+[package]
+name = "nfm-egui"
+version = "0.1.0"
+edition = "2024"
+description = "Host-owned embedded egui picker using NFM stores"
+
+[features]
+default = []
+opengl = ["dep:egui_glow", "dep:glow"]
+
+[dependencies]
+regex = "1.13"
+unicode-segmentation = "1.13"
+unicode-width = "0.2.2"
+nfm-preview-command = { path = "../nfm-preview-command" }
+egui = { version = "=0.36.2", default-features = false, features = ["default_fonts"] }
+nfm_search_core = { path = "../nfm-search-core" }
+crossbeam-channel = "0.5"
+egui_glow = { version = "=0.36.2", default-features = false, optional = true }
+glow = { version = "=0.17.0", optional = true }
+nfm-preview-vt = { path = "../nfm-preview-vt" }
+
+
+[dev-dependencies]
+nfm-picker-sources = { path = "../nfm-picker-sources" }
+csv = "1.3"

@@ -18,6 +18,15 @@ where
     fn snapshot(&self) -> Option<Arc<S>>;
     fn snapshot_version(&self) -> u64;
     fn is_done(&self) -> bool;
+    /// Register a coalescing wake signal. Return true only if every publication
+    /// and completion change sends it; otherwise the search retains polling.
+    fn subscribe_updates(&self, _wake: Sender<()>) -> bool {
+        false
+    }
+    /// True only when every publication preserves all existing indices and payloads.
+    fn is_append_only(&self) -> bool {
+        false
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -56,11 +65,15 @@ where
     signal_tx: Sender<()>,
     signal_rx: Receiver<()>,
     updates_tx: Sender<FuzzySearchUpdate>,
+    observer: Option<Arc<dyn Fn(FuzzySearchUpdate, Arc<S>) + Send + Sync>>,
+    append_only: bool,
+    source_notifies: bool,
     _snapshot: PhantomData<S>,
 }
 
 #[derive(Default)]
 struct SearchCache {
+    snapshot_version: Option<u64>,
     query: String,
     searched_len: usize,
     results: Vec<SearchResult>,
@@ -108,6 +121,7 @@ where
         sort_mode: SearchSortMode,
     ) -> Self {
         let (signal_tx, signal_rx) = bounded(1);
+        let source_notifies = provider.subscribe_updates(signal_tx.clone());
         Self {
             inner: Arc::new(FuzzySearcherInner {
                 session_id,
@@ -119,9 +133,30 @@ where
                 signal_tx,
                 signal_rx,
                 updates_tx,
+                observer: None,
+                append_only: true,
+                source_notifies,
                 _snapshot: PhantomData,
             }),
         }
+    }
+
+    /// Snapshot-aware/coalescing consumers can retain the exact searched source.
+    /// Existing channel constructors retain their append-only cache behavior.
+    pub fn new_with_snapshot_observer(
+        session_id: u64,
+        provider: Arc<P>,
+        initial_query: String,
+        sort_mode: SearchSortMode,
+        observer: impl Fn(FuzzySearchUpdate, Arc<S>) + Send + Sync + 'static,
+    ) -> Self {
+        let append_only = provider.is_append_only();
+        let (tx, _) = bounded(1);
+        let mut session = Self::new_with_sort(session_id, provider, initial_query, tx, sort_mode);
+        let inner = Arc::get_mut(&mut session.inner).expect("new search session is uniquely owned");
+        inner.observer = Some(Arc::new(observer));
+        inner.append_only = append_only;
+        session
     }
 
     pub fn start(&self) {
@@ -198,11 +233,15 @@ where
                 Duration::from_millis(250)
             };
 
-            let _ = self.signal_rx.recv_timeout(timeout);
+            if self.source_notifies {
+                let _ = self.signal_rx.recv();
+            } else {
+                let _ = self.signal_rx.recv_timeout(timeout);
+            }
         }
     }
 
-    fn run_search_generation(&self, version: u64, snapshot_version: u64, cache: &mut SearchCache) {
+    fn run_search_generation(&self, version: u64, _snapshot_version: u64, cache: &mut SearchCache) {
         let query = self.query.lock().expect("search query poisoned").clone();
 
         let Some(snapshot) = self.provider.snapshot() else {
@@ -218,8 +257,12 @@ where
         };
 
         let cacheable = is_plain_fuzzy_term(&query);
-        let use_incremental = cache.query == query && cache.searched_len <= total;
-        let use_extension_cache = cacheable
+        let compatible_source =
+            self.append_only || cache.snapshot_version == Some(snapshot.version());
+        let use_incremental =
+            compatible_source && cache.query == query && cache.searched_len <= total;
+        let use_extension_cache = compatible_source
+            && cacheable
             && is_compatible_query_extension(&cache.query, &query)
             && cache.searched_len <= total
             && cache.match_bitmap.is_some();
@@ -256,6 +299,7 @@ where
                 return;
             };
             *cache = SearchCache {
+                snapshot_version: Some(snapshot.version()),
                 query,
                 searched_len: output.total,
                 results: output.results.clone(),
@@ -279,6 +323,7 @@ where
                 return;
             };
             *cache = SearchCache {
+                snapshot_version: Some(snapshot.version()),
                 query,
                 searched_len: output.total,
                 results: output.results.clone(),
@@ -291,7 +336,8 @@ where
             return;
         }
 
-        let _ = self.updates_tx.send(FuzzySearchUpdate {
+        cache.snapshot_version = Some(snapshot.version());
+        let update = FuzzySearchUpdate {
             session_id: self.session_id,
             generation: version,
             query: cache.query.clone(),
@@ -299,9 +345,14 @@ where
             matched: output.matched,
             searched: output.total,
             total,
-            source_version: snapshot_version,
+            source_version: snapshot.version(),
             source_done,
-        });
+        };
+        if let Some(observer) = &self.observer {
+            observer(update, snapshot);
+        } else {
+            let _ = self.updates_tx.send(update);
+        }
     }
 }
 

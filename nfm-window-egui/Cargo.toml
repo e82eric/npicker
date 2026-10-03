@@ -1,0 +1,11 @@
+[package]
+name = "nfm-window-egui"
+version = "0.1.0"
+edition = "2024"
+description = "Embedded NFM window picker with live DWM previews"
+
+[dependencies]
+nfm-egui = { path = "../nfm-egui" }
+nfm_search_core = { path = "../nfm-search-core" }
+nfm-win32 = { path = "../nfm-win32" }
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Graphics_Dwm", "Win32_UI_WindowsAndMessaging"] }

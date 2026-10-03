@@ -403,9 +403,13 @@ impl<I: PickerItem> TypedPickerSession<I> {
         events: Sender<ViewModelEvent>,
         response_tx: Sender<PickerResponse<I>>,
     ) -> Arc<Self> {
-        let preview = interactions
-            .preview_factory
-            .create(events.clone(), interactions.preview_routes.clone());
+        let preview_events = events.clone();
+        let preview = interactions.preview_factory.create(
+            crate::preview::PreviewEvents::new(move |event| {
+                let _ = preview_events.send(ViewModelEvent::Preview(event));
+            }),
+            interactions.preview_routes.clone(),
+        );
         Arc::new(Self {
             source,
             interactions,
@@ -2010,7 +2014,7 @@ mod tests {
         );
         let update = PreviewUpdate::Ready {
             generation: 1,
-            lines: document.into_lines().into(),
+            lines: document.into_lines().unwrap().into(),
             truncated: false,
             center_line: None,
         };

@@ -48,28 +48,7 @@ impl<T> PickerTask<T> {
     }
 }
 
-#[derive(Clone, Debug)]
-pub struct FileSystemPickerOptions {
-    pub roots: Vec<String>,
-    pub max_depth: i32,
-    pub directories_only: bool,
-    pub files_only: bool,
-    pub search_string: Option<String>,
-    pub preview_visible: bool,
-}
-
-impl Default for FileSystemPickerOptions {
-    fn default() -> Self {
-        Self {
-            roots: Vec::new(),
-            max_depth: i32::MAX,
-            directories_only: false,
-            files_only: false,
-            search_string: None,
-            preview_visible: true,
-        }
-    }
-}
+pub use nfm_file_system::FileSystemPickerOptions;
 
 impl PickerRuntime {
     pub fn start() -> Result<Self> {

@@ -1,0 +1,9 @@
+[package]
+name = "nfm-preview-vt"
+version = "0.1.0"
+edition = "2024"
+links = "nfm_ghostty_vt"
+description = "Owned ANSI preview grids backed by standalone Ghostty VT"
+
+[build-dependencies]
+cc = "1.2"

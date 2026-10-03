@@ -1,21 +1,17 @@
+use super::PreviewEvents;
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crossbeam_channel::{bounded, RecvTimeoutError, Sender};
-
 use super::{
     send_preview, PreviewDocument, PreviewEvent, PreviewStream, PreviewUpdate, SelectionPreview,
 };
-use crate::view_model::ViewModelEvent;
 
 const OUTPUT_LIMIT: usize = 1024 * 1024;
 const IMAGE_OUTPUT_LIMIT: usize = 32 * 1024 * 1024;
 const RESOLVER_OUTPUT_LIMIT: usize = 64 * 1024;
-const OUTPUT_CHANNEL_CAPACITY: usize = 32;
 const DEBOUNCE: Duration = Duration::from_millis(75);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -36,6 +32,9 @@ pub enum PreviewResolver {
         default_profile: Option<String>,
     },
     Function(NativePreviewResolver),
+    NativeFile {
+        bat_theme: Option<String>,
+    },
 }
 
 pub type NativePreviewResolver = fn(&CommandPreviewTarget) -> Result<Option<PreviewJob>, String>;
@@ -83,11 +82,6 @@ pub enum PreviewOutputType {
     Image,
 }
 
-struct OutputChunk {
-    stream: PreviewStream,
-    bytes: Vec<u8>,
-}
-
 pub(super) struct CommandPreviewBackend<I> {
     controller: CommandPreviewController,
     selected: Mutex<Option<CommandPreviewTarget>>,
@@ -97,7 +91,7 @@ pub(super) struct CommandPreviewBackend<I> {
 impl<I> CommandPreviewBackend<I> {
     pub(super) fn new(
         resolver: PreviewResolver,
-        events: Sender<ViewModelEvent>,
+        events: PreviewEvents,
         generation: Arc<AtomicU64>,
         target: Option<Arc<dyn Fn(&I) -> Option<CommandPreviewTarget> + Send + Sync>>,
     ) -> Self {
@@ -141,13 +135,13 @@ impl<I> SelectionPreview<I> for CommandPreviewBackend<I> {
 pub(super) struct CommandPreviewController {
     resolver: Arc<PreviewResolver>,
     generation: Arc<AtomicU64>,
-    events: Sender<ViewModelEvent>,
+    events: PreviewEvents,
 }
 
 impl CommandPreviewController {
     pub(super) fn with_generation(
         resolver: PreviewResolver,
-        events: Sender<ViewModelEvent>,
+        events: PreviewEvents,
         generation: Arc<AtomicU64>,
     ) -> Self {
         Self {
@@ -218,6 +212,18 @@ impl CommandPreviewController {
                         return;
                     }
                 },
+                PreviewResolver::NativeFile { bat_theme } => {
+                    match super::native_file::resolve_native_file_preview_with_theme(
+                        &target,
+                        bat_theme.as_deref(),
+                    ) {
+                        Ok(job) => job,
+                        Err(message) => {
+                            publish_error(&events, generation, message);
+                            return;
+                        }
+                    }
+                }
             };
             let Some(job) = job else {
                 return;
@@ -248,7 +254,7 @@ fn execute_preview_job(
     target: &CommandPreviewTarget,
     generation: u64,
     current_generation: Arc<AtomicU64>,
-    events: Sender<ViewModelEvent>,
+    events: PreviewEvents,
 ) {
     if current_generation.load(Ordering::Acquire) != generation {
         return;
@@ -292,88 +298,49 @@ pub(super) fn run_resolver(
     generation: u64,
     current_generation: Arc<AtomicU64>,
 ) -> Result<Option<String>, String> {
-    let mut command = Command::new(program);
-    command.args(
-        arguments
-            .iter()
-            .map(|argument| expand_preview_argument(argument, target)),
-    );
-    command
-        .env("NFM_PREVIEW_ITEM", &target.item)
-        .env(
-            "NFM_PREVIEW_LINE",
+    let mut spec = nfm_preview_command::CommandSpec::new(program.clone());
+    spec.arguments = arguments
+        .iter()
+        .map(|arg| expand_preview_argument(arg, target))
+        .collect();
+    spec.environment = vec![
+        ("NFM_PREVIEW_ITEM".into(), target.item.clone().into()),
+        (
+            "NFM_PREVIEW_LINE".into(),
             target
                 .center_line
-                .map(|line| line.to_string())
-                .unwrap_or_default(),
-        )
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        command.creation_flags(CREATE_NO_WINDOW);
-    }
-
-    let mut child = command
-        .spawn()
-        .map_err(|error| format!("preview resolver failed to start: {error}"))?;
-    let (output_tx, output_rx) = bounded(OUTPUT_CHANNEL_CAPACITY);
-    if let Some(stdout) = child.stdout.take() {
-        forward_output(stdout, PreviewStream::Stdout, output_tx.clone());
-    }
-    if let Some(stderr) = child.stderr.take() {
-        forward_output(stderr, PreviewStream::Stderr, output_tx.clone());
-    }
-    drop(output_tx);
-
+                .map(|l| l.to_string())
+                .unwrap_or_default()
+                .into(),
+        ),
+    ];
+    spec.output_limit = RESOLVER_OUTPUT_LIMIT;
     let started = Instant::now();
-    let mut stdout = Vec::new();
-    let mut stderr = Vec::new();
-    let status = loop {
-        if current_generation.load(Ordering::Acquire) != generation {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Ok(None);
-        }
-        if started.elapsed() >= Duration::from_secs(2) {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err("preview resolver timed out".into());
-        }
-        match output_rx.recv_timeout(Duration::from_millis(20)) {
-            Ok(chunk) => {
-                if stdout.len() + stderr.len() + chunk.bytes.len() > RESOLVER_OUTPUT_LIMIT {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err("preview resolver output exceeded 64 KiB".into());
-                }
-                let destination = match chunk.stream {
-                    PreviewStream::Stdout => &mut stdout,
-                    PreviewStream::Stderr => &mut stderr,
-                };
-                destination.extend_from_slice(&chunk.bytes);
-            }
-            Err(RecvTimeoutError::Timeout) => {}
-            Err(RecvTimeoutError::Disconnected) => {}
-        }
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) => {}
-            Err(error) => return Err(format!("preview resolver process error: {error}")),
-        }
-    };
-    while let Ok(chunk) = output_rx.recv_timeout(Duration::from_millis(100)) {
-        if stdout.len() + stderr.len() + chunk.bytes.len() > RESOLVER_OUTPUT_LIMIT {
-            return Err("preview resolver output exceeded 64 KiB".into());
-        }
-        match chunk.stream {
-            PreviewStream::Stdout => stdout.extend_from_slice(&chunk.bytes),
-            PreviewStream::Stderr => stderr.extend_from_slice(&chunk.bytes),
-        }
+    let mut received: usize = 0;
+    let result = nfm_preview_command::run(
+        &spec,
+        || {
+            current_generation.load(Ordering::Acquire) != generation
+                || started.elapsed() >= Duration::from_secs(2)
+        },
+        |_, bytes| {
+            received += bytes.len();
+            received <= RESOLVER_OUTPUT_LIMIT
+        },
+    );
+    if current_generation.load(Ordering::Acquire) != generation {
+        return Ok(None);
     }
+    if started.elapsed() >= Duration::from_secs(2) {
+        return Err("preview resolver timed out".into());
+    }
+    let result = result?;
+    if result.truncated {
+        return Err("preview resolver output exceeded 64 KiB".into());
+    }
+    let status = result.status;
+    let stdout = result.stdout;
+    let stderr = result.stderr;
 
     if !status.success() {
         let message = String::from_utf8_lossy(&stderr).trim().to_owned();
@@ -396,7 +363,7 @@ pub(super) fn run_resolver(
     Ok(profile)
 }
 
-fn publish_error(events: &Sender<ViewModelEvent>, generation: u64, message: String) {
+fn publish_error(events: &PreviewEvents, generation: u64, message: String) {
     send_preview(
         events,
         PreviewEvent::Command(PreviewUpdate::Error {
@@ -414,144 +381,86 @@ pub(super) fn run_process(
     target: &CommandPreviewTarget,
     generation: u64,
     current_generation: Arc<AtomicU64>,
-    events: Sender<ViewModelEvent>,
+    events: PreviewEvents,
 ) {
-    let mut command = Command::new(program);
-    command.args(
-        arguments
-            .iter()
-            .map(|argument| expand_preview_argument(argument, target)),
-    );
-    if let Some(working_directory) = working_directory {
-        command.current_dir(working_directory);
-    }
-    command
-        .env("NFM_PREVIEW_ITEM", &target.item)
-        .env(
-            "NFM_PREVIEW_LINE",
+    let mut spec = nfm_preview_command::CommandSpec::new(program.clone());
+    spec.arguments = arguments
+        .iter()
+        .map(|arg| expand_preview_argument(arg, target))
+        .collect();
+    spec.working_directory = working_directory.cloned();
+    spec.environment = vec![
+        ("NFM_PREVIEW_ITEM".into(), target.item.clone().into()),
+        (
+            "NFM_PREVIEW_LINE".into(),
             target
                 .center_line
-                .map(|line| line.to_string())
-                .unwrap_or_default(),
-        )
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        command.creation_flags(CREATE_NO_WINDOW);
-    }
-
-    let mut child = match command.spawn() {
-        Ok(child) => child,
-        Err(error) => {
-            send_preview(
-                &events,
-                PreviewEvent::Command(PreviewUpdate::Error {
-                    generation,
-                    message: format!("preview failed to start: {error}"),
-                }),
-            );
-            return;
-        }
+                .map(|l| l.to_string())
+                .unwrap_or_default()
+                .into(),
+        ),
+    ];
+    spec.output_limit = match output_type {
+        PreviewOutputType::Text => OUTPUT_LIMIT,
+        PreviewOutputType::Image => IMAGE_OUTPUT_LIMIT,
     };
-
-    let (output_tx, output_rx) = bounded(OUTPUT_CHANNEL_CAPACITY);
-    if let Some(stdout) = child.stdout.take() {
-        forward_output(stdout, PreviewStream::Stdout, output_tx.clone());
-    }
-    if let Some(stderr) = child.stderr.take() {
-        forward_output(stderr, PreviewStream::Stderr, output_tx.clone());
-    }
-    drop(output_tx);
-
     let mut document = PreviewDocument::default();
     let mut image_bytes = Vec::new();
     let mut image_error = PreviewDocument::default();
-    let mut bytes_received = 0;
-    let mut truncated = false;
-    let mut child_finished = false;
-    let mut child_succeeded = true;
-    let mut readers_finished = false;
-    loop {
-        if current_generation.load(Ordering::Acquire) != generation {
-            let _ = child.kill();
-            let _ = child.wait();
+    let mut bytes_received: usize = 0;
+    let result = nfm_preview_command::run(
+        &spec,
+        || current_generation.load(Ordering::Acquire) != generation,
+        |stream, bytes| {
+            let stream = match stream {
+                nfm_preview_command::Stream::Stdout => PreviewStream::Stdout,
+                nfm_preview_command::Stream::Stderr => PreviewStream::Stderr,
+            };
+            let count = bytes
+                .len()
+                .min(spec.output_limit.saturating_sub(bytes_received));
+            bytes_received += count;
+            match output_type {
+                PreviewOutputType::Text => document.push(stream, &bytes[..count]),
+                PreviewOutputType::Image => match stream {
+                    PreviewStream::Stdout => image_bytes.extend_from_slice(&bytes[..count]),
+                    PreviewStream::Stderr => image_error.push(stream, &bytes[..count]),
+                },
+            }
+            count == bytes.len()
+                && !(output_type == PreviewOutputType::Text && document.line_limit_reached())
+        },
+    );
+    let result = match result {
+        Ok(result) => result,
+        Err(error) => {
+            if current_generation.load(Ordering::Acquire) == generation {
+                send_preview(
+                    &events,
+                    PreviewEvent::Command(PreviewUpdate::Error {
+                        generation,
+                        message: error,
+                    }),
+                );
+            }
             return;
         }
-
-        if !readers_finished {
-            match output_rx.recv_timeout(Duration::from_millis(20)) {
-                Ok(chunk) => {
-                    let output_limit = match output_type {
-                        PreviewOutputType::Text => OUTPUT_LIMIT,
-                        PreviewOutputType::Image => IMAGE_OUTPUT_LIMIT,
-                    };
-                    let remaining = output_limit.saturating_sub(bytes_received);
-                    let allowed = remaining.min(chunk.bytes.len());
-                    if allowed > 0 {
-                        match output_type {
-                            PreviewOutputType::Text => {
-                                document.push(chunk.stream, &chunk.bytes[..allowed]);
-                            }
-                            PreviewOutputType::Image => match chunk.stream {
-                                PreviewStream::Stdout => {
-                                    image_bytes.extend_from_slice(&chunk.bytes[..allowed]);
-                                }
-                                PreviewStream::Stderr => {
-                                    image_error.push(chunk.stream, &chunk.bytes[..allowed]);
-                                }
-                            },
-                        }
-                        bytes_received += allowed;
-                    }
-                    if allowed < chunk.bytes.len()
-                        || (output_type == PreviewOutputType::Text && document.line_limit_reached())
-                    {
-                        truncated = true;
-                        let _ = child.kill();
-                        let _ = child.wait();
-                        break;
-                    }
-                }
-                Err(RecvTimeoutError::Timeout) => {}
-                Err(RecvTimeoutError::Disconnected) => readers_finished = true,
-            }
-        }
-
-        if !child_finished {
-            match child.try_wait() {
-                Ok(Some(status)) => {
-                    child_succeeded = status.success();
-                    child_finished = true;
-                }
-                Ok(None) => {}
-                Err(error) => {
-                    send_preview(
-                        &events,
-                        PreviewEvent::Command(PreviewUpdate::Error {
-                            generation,
-                            message: format!("preview process error: {error}"),
-                        }),
-                    );
-                    return;
-                }
-            }
-        }
-
-        if child_finished && readers_finished {
-            break;
-        }
-    }
+    };
+    let truncated = result.truncated;
+    let child_succeeded = result.status.success();
 
     let update = match output_type {
-        PreviewOutputType::Text => PreviewUpdate::Ready {
-            generation,
-            lines: document.into_lines().into(),
-            truncated,
-            center_line: target.center_line,
+        PreviewOutputType::Text => match document.into_lines() {
+            Ok(lines) => PreviewUpdate::Ready {
+                generation,
+                lines: lines.into(),
+                truncated,
+                center_line: target.center_line,
+            },
+            Err(message) => PreviewUpdate::Error {
+                generation,
+                message,
+            },
         },
         PreviewOutputType::Image if truncated => PreviewUpdate::Error {
             generation,
@@ -593,6 +502,7 @@ pub(super) fn expand_preview_argument(argument: &str, target: &CommandPreviewTar
 fn preview_document_text(document: PreviewDocument) -> Option<String> {
     let text = document
         .into_lines()
+        .ok()?
         .into_iter()
         .map(|line| {
             line.spans
@@ -603,31 +513,4 @@ fn preview_document_text(document: PreviewDocument) -> Option<String> {
         .collect::<Vec<_>>()
         .join("\n");
     (!text.is_empty()).then_some(text)
-}
-
-fn forward_output(
-    reader: impl std::io::Read + Send + 'static,
-    stream: PreviewStream,
-    output: Sender<OutputChunk>,
-) {
-    std::thread::spawn(move || {
-        let mut reader = reader;
-        let mut buffer = [0_u8; 8192];
-        loop {
-            match reader.read(&mut buffer) {
-                Ok(0) | Err(_) => break,
-                Ok(read) => {
-                    if output
-                        .send(OutputChunk {
-                            stream,
-                            bytes: buffer[..read].to_vec(),
-                        })
-                        .is_err()
-                    {
-                        break;
-                    }
-                }
-            }
-        }
-    });
 }

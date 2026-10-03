@@ -79,7 +79,25 @@ pub struct FileWalkerScan {
     cancelled: Arc<AtomicBool>,
 }
 
+/// A scan owner that requests cancellation when dropped.
+pub struct OwnedFileWalkerScan(FileWalkerScan);
+impl std::ops::Deref for OwnedFileWalkerScan {
+    type Target = FileWalkerScan;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+impl Drop for OwnedFileWalkerScan {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
+}
 impl FileWalkerScan {
+    /// Tie cancellation to the lifetime of the returned owner.
+    pub fn cancel_on_drop(self) -> OwnedFileWalkerScan {
+        OwnedFileWalkerScan(self)
+    }
+
     pub fn cancel(&self) {
         self.cancelled.store(true, Ordering::Release);
     }
@@ -871,4 +889,21 @@ fn make_child_path(parent: &[u8], name: &[u8]) -> Vec<u8> {
     }
     path.extend_from_slice(name);
     path
+}
+
+#[cfg(test)]
+mod ownership_tests {
+    use super::*;
+    #[test]
+    fn dropping_owned_handle_cancels_scan() {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let scan = FileWalkerScan {
+            status: Arc::new(AtomicU8::new(ScanStatus::Scanning.as_u8())),
+            cancelled: cancelled.clone(),
+        };
+        let owner = scan.cancel_on_drop();
+        assert!(!cancelled.load(Ordering::Acquire));
+        drop(owner);
+        assert!(cancelled.load(Ordering::Acquire));
+    }
 }

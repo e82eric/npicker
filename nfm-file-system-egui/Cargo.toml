@@ -1,0 +1,11 @@
+[package]
+name = "nfm-file-system-egui"
+version = "0.1.0"
+edition = "2024"
+description = "Embedded NFM filesystem picker with navigation and previews"
+
+[dependencies]
+nfm-egui = { path = "../nfm-egui" }
+nfm_file_system = { path = "../nfm-file-system" }
+nfm-preview = { path = "../nfm-preview", features = ["egui"] }
+nfm-win32 = { path = "../nfm-win32" }

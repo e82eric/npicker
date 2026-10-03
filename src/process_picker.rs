@@ -51,12 +51,7 @@ pub fn interactions_with(
         )))
     });
     let refresh_action = Arc::new(|_: Option<&ProcessPickerItem>| Ok(PickerActionOutcome::Refresh));
-    let preview = Arc::new(|item: &ProcessPickerItem| {
-        Ok(format!(
-            "Name: {}\nPID: {}\nWorkingSet: {}\nPrivateBytes: {}\nCPU: {}",
-            item.name, item.pid, item.working_set_kb, item.private_bytes_kb, item.cpu_seconds,
-        ))
-    });
+    let preview = Arc::new(|item: &ProcessPickerItem| Ok(nfm_win32::format_process_preview(item)));
     interactions.actions.insert(
         "ffi-accept".into(),
         ActionDefinition::Native(Arc::new(|_| Ok(ActionResolution::Complete))),

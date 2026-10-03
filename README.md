@@ -367,3 +367,12 @@ cancelled and late output is ignored. Output is accumulated and ANSI-parsed
 off the UI thread, then displayed when the command finishes. A preview is
 truncated and its process stopped after 4,000 lines or 1 MiB of combined
 stdout/stderr.
+
+## Shared embedded egui picker
+
+The new [nfm-egui control](nfm-egui/README.md) embeds into a host-owned window,
+egui context and renderer. It supports the existing NFM stores, owned selection
+payloads, cancellable previews, host fonts/palettes and per-frame placement.
+Its optional [Ghostty VT preview wrapper](nfm-preview-vt/README.md) consumes a
+standalone VT build without depending on the terminal application. The existing
+Skia host remains available; application migrations are separate work.

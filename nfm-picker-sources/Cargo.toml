@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+nfm-preview-command = { path = "../nfm-preview-command" }
 nfm_search_core = { path = "../nfm-search-core" }
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 csv = "1.3"

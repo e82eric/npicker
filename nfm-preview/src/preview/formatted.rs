@@ -1,16 +1,14 @@
+use super::PreviewEvents;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-
-use crossbeam_channel::Sender;
 
 use super::{
     send_preview, PreviewDocument, PreviewEvent, PreviewStream, PreviewUpdate, SelectionPreview,
 };
-use crate::view_model::ViewModelEvent;
 pub type PickerPreviewFormatter<I> = Arc<dyn Fn(&I) -> Result<String, String> + Send + Sync>;
 
 pub(super) struct FormattedPreviewBackend<I> {
-    pub(super) events: Sender<ViewModelEvent>,
+    pub(super) events: PreviewEvents,
     pub(super) formatter: Option<PickerPreviewFormatter<I>>,
     pub(super) selected: Mutex<Option<Result<String, String>>>,
     pub(super) generation: Arc<AtomicU64>,
@@ -65,13 +63,20 @@ impl<I> FormattedPreviewBackend<I> {
         };
         let mut document = PreviewDocument::default();
         document.push(PreviewStream::Stdout, text.as_bytes());
+        let truncated = document.line_limit_reached();
         send_preview(
             &self.events,
-            PreviewEvent::Command(PreviewUpdate::Ready {
-                generation,
-                lines: Arc::from(document.into_lines()),
-                truncated: false,
-                center_line: None,
+            PreviewEvent::Command(match document.into_lines() {
+                Ok(lines) => PreviewUpdate::Ready {
+                    generation,
+                    lines: Arc::from(lines),
+                    truncated,
+                    center_line: None,
+                },
+                Err(message) => PreviewUpdate::Error {
+                    generation,
+                    message,
+                },
             }),
         );
     }

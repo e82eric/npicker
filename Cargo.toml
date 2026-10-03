@@ -2,8 +2,17 @@
 members = [
     ".",
     "nfm-file-system",
+    "nfm-file-system-egui",
+    "nfm-process-egui",
+    "nfm-window-egui",
     "nfm-picker-sources",
     "nfm-search-core",
+    "nfm-egui",
+    "nfm-egui-demo",
+    "nfm-preview-vt",
+    "nfm-preview-command",
+    "nfm-win32",
+    "nfm-preview",
 ]
 resolver = "2"
 
@@ -19,10 +28,15 @@ edition = "2021"
 name = "rust_nfm"
 crate-type = ["cdylib", "rlib"]
 
+[features]
+egui-previews = ["nfm-preview/egui"]
+
 [dependencies]
+nfm-win32 = { path = "nfm-win32" }
+nfm-preview = { path = "nfm-preview" }
+nfm-preview-command = { path = "nfm-preview-command" }
 nfm_search_core = { path = "nfm-search-core" }
 nfm-picker-sources = { path = "nfm-picker-sources" }
-anstyle-parse = "1.0"
 anyhow = "1"
 crossbeam-channel = "0.5"
 csv = "1.3"

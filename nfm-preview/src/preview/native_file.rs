@@ -6,14 +6,20 @@ use super::{
     PreviewOutputType, PreviewProfile, PreviewResolver,
 };
 
-pub(crate) fn preview_factory() -> Arc<PreviewFactory> {
+pub fn preview_factory() -> Arc<PreviewFactory> {
+    preview_factory_with_bat_theme(None)
+}
+
+/// An explicit theme overrides bat's config and inherited BAT_THEME.
+pub fn preview_factory_with_bat_theme(bat_theme: Option<String>) -> Arc<PreviewFactory> {
     Arc::new(PreviewFactory::new(PreviewConfig::CommandOrNativeWindow(
-        PreviewResolver::Function(resolve_native_file_preview),
+        PreviewResolver::NativeFile { bat_theme },
     )))
 }
 
-fn resolve_native_file_preview(
+pub(super) fn resolve_native_file_preview_with_theme(
     target: &CommandPreviewTarget,
+    bat_theme: Option<&str>,
 ) -> Result<Option<PreviewJob>, String> {
     let path = std::path::Path::new(&target.item);
     if path.is_dir() {
@@ -88,14 +94,18 @@ fn resolve_native_file_preview(
             | "java"
             | "log"
     ) {
+        let mut arguments = vec![
+            "--color=always".into(),
+            "--style=plain".into(),
+            "--paging=never".into(),
+        ];
+        if let Some(theme) = bat_theme {
+            arguments.extend(["--theme".into(), theme.into()]);
+        }
+        arguments.push("{item}".into());
         return Ok(Some(PreviewJob::Process(PreviewProfile {
             program: "bat".into(),
-            arguments: vec![
-                "--color=always".into(),
-                "--style=plain".into(),
-                "--paging=never".into(),
-                "{item}".into(),
-            ],
+            arguments,
             working_directory: None,
             output_type: PreviewOutputType::Text,
         })));

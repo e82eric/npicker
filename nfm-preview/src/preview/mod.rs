@@ -1,11 +1,14 @@
+#[cfg(all(windows, feature = "egui"))]
+pub mod egui;
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex};
 
-pub(crate) mod document;
-use crate::view_model::ViewModelEvent;
+pub mod document;
 #[cfg(test)]
-use crossbeam_channel::bounded;
-use crossbeam_channel::Sender;
+fn bounded(capacity: usize) -> (PreviewEvents, crossbeam_channel::Receiver<PreviewEvent>) {
+    let (sender, receiver) = crossbeam_channel::bounded(capacity);
+    (sender.into(), receiver)
+}
 use document::PreviewDocument;
 pub use document::PreviewLine;
 
@@ -21,7 +24,7 @@ mod formatted;
 use formatted::FormattedPreviewBackend;
 pub use formatted::PickerPreviewFormatter;
 #[cfg(windows)]
-pub(crate) mod native_file;
+pub mod native_file;
 mod native_window;
 pub use native_window::NativeWindowId;
 use native_window::NativeWindowPreviewBackend;
@@ -54,7 +57,7 @@ pub enum PreviewEvent {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum PreviewStream {
+pub enum PreviewStream {
     Stdout,
     Stderr,
 }
@@ -82,9 +85,9 @@ impl PreviewFactory {
         }
     }
 
-    pub(crate) fn create<I: Send + Sync + 'static>(
+    pub fn create<I: Send + Sync + 'static>(
         &self,
-        events: Sender<ViewModelEvent>,
+        events: PreviewEvents,
         routes: PreviewRoutes<I>,
     ) -> Arc<dyn SelectionPreview<I>> {
         match self.config.clone() {
@@ -208,8 +211,8 @@ impl<I> SelectionPreview<I> for NoPreviewBackend {
     fn clear(&self) {}
 }
 
-fn send_preview(events: &Sender<ViewModelEvent>, event: PreviewEvent) {
-    let _ = events.send(ViewModelEvent::Preview(event));
+fn send_preview(events: &PreviewEvents, event: PreviewEvent) {
+    let _ = events.send(event);
 }
 
 #[cfg(test)]
@@ -257,9 +260,7 @@ mod tests {
             events,
         );
 
-        let ViewModelEvent::Preview(PreviewEvent::Command(update)) =
-            receiver.recv().expect("preview update")
-        else {
+        let PreviewEvent::Command(update) = receiver.recv().expect("preview update") else {
             panic!("expected command preview event");
         };
         let PreviewUpdate::Ready {
@@ -366,10 +367,10 @@ mod tests {
 
         assert!(matches!(
             receiver.recv().unwrap(),
-            ViewModelEvent::Preview(PreviewEvent::Command(PreviewUpdate::ImageReady {
+            PreviewEvent::Command(PreviewUpdate::ImageReady {
                 generation: 9,
                 encoded
-            })) if encoded.as_ref() == [1, 2, 3]
+            }) if encoded.as_ref() == [1, 2, 3]
         ));
     }
 
@@ -388,11 +389,11 @@ mod tests {
 
         assert!(matches!(
             receiver.recv().unwrap(),
-            ViewModelEvent::Preview(PreviewEvent::NativeWindow(Some(NativeWindowId(42))))
+            PreviewEvent::NativeWindow(Some(NativeWindowId(42)))
         ));
         assert!(matches!(
             receiver.recv().unwrap(),
-            ViewModelEvent::Preview(PreviewEvent::NativeWindow(None))
+            PreviewEvent::NativeWindow(None)
         ));
         assert!(receiver.try_recv().is_err());
     }
@@ -411,15 +412,11 @@ mod tests {
 
         assert!(matches!(
             receiver.recv().unwrap(),
-            ViewModelEvent::Preview(PreviewEvent::Command(PreviewUpdate::Clear {
-                generation: 1
-            }))
+            PreviewEvent::Command(PreviewUpdate::Clear { generation: 1 })
         ));
-        let ViewModelEvent::Preview(PreviewEvent::Command(PreviewUpdate::Ready {
-            generation,
-            lines,
-            ..
-        })) = receiver.recv().unwrap()
+        let PreviewEvent::Command(PreviewUpdate::Ready {
+            generation, lines, ..
+        }) = receiver.recv().unwrap()
         else {
             panic!("expected formatted preview")
         };
@@ -474,7 +471,7 @@ mod tests {
         backend.selection_changed(Some(&window));
         assert!(matches!(
             receiver.recv().unwrap(),
-            ViewModelEvent::Preview(PreviewEvent::NativeWindow(Some(NativeWindowId(42))))
+            PreviewEvent::NativeWindow(Some(NativeWindowId(42)))
         ));
 
         let item = TestItem {
@@ -484,7 +481,28 @@ mod tests {
         backend.selection_changed(Some(&item));
         assert!(matches!(
             receiver.recv().unwrap(),
-            ViewModelEvent::Preview(PreviewEvent::NativeWindow(None))
+            PreviewEvent::NativeWindow(None)
         ));
     }
 }
+
+/// Host-owned event delivery, independent of any view model or UI thread.
+#[derive(Clone)]
+pub struct PreviewEvents(Arc<dyn Fn(PreviewEvent) + Send + Sync>);
+impl PreviewEvents {
+    pub fn new(deliver: impl Fn(PreviewEvent) + Send + Sync + 'static) -> Self {
+        Self(Arc::new(deliver))
+    }
+    pub fn send(&self, event: PreviewEvent) {
+        (self.0)(event);
+    }
+}
+impl From<crossbeam_channel::Sender<PreviewEvent>> for PreviewEvents {
+    fn from(sender: crossbeam_channel::Sender<PreviewEvent>) -> Self {
+        Self::new(move |event| {
+            let _ = sender.send(event);
+        })
+    }
+}
+
+pub mod file_fallback;

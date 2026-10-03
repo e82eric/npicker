@@ -1,0 +1,16 @@
+[package]
+name = "nfm-preview"
+version = "0.1.0"
+edition = "2021"
+description = "UI-independent preview engine and optional egui adapter"
+
+[features]
+default = []
+egui = ["dep:nfm-egui", "dep:image"]
+
+[dependencies]
+nfm-preview-vt = { path = "../nfm-preview-vt" }
+crossbeam-channel = "0.5"
+nfm-preview-command = { path = "../nfm-preview-command" }
+nfm-egui = { path = "../nfm-egui", optional = true }
+image = { version = "0.25", default-features = false, features = ["png"], optional = true }

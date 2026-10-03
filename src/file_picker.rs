@@ -56,14 +56,7 @@ pub fn interactions_with(
     interactions
 }
 
-pub fn logical_drive_roots() -> Vec<String> {
-    use windows::Win32::Storage::FileSystem::GetLogicalDrives;
-    let mask = unsafe { GetLogicalDrives() };
-    (0..26)
-        .filter(|index| mask & (1 << index) != 0)
-        .map(|index| format!("{}:\\", (b'A' + index as u8) as char))
-        .collect()
-}
+pub use nfm_win32::logical_drive_roots;
 
 fn resolve_accept(state: &ActionState<String>) -> Result<ActionResolution, String> {
     let Some(selection) = state.selection.as_ref() else {
@@ -110,17 +103,7 @@ fn source_resolver(transition_interactions: PickerInteractions<String>) -> Sourc
     })
 }
 
-fn parent_roots(roots: &[String], drive_roots: Vec<String>) -> Vec<String> {
-    if roots.len() == 1 {
-        if let Some(parent) = std::path::Path::new(&roots[0])
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-        {
-            return vec![parent.to_string_lossy().into_owned()];
-        }
-    }
-    drive_roots
-}
+use nfm_file_system::parent_roots;
 
 #[cfg(test)]
 mod tests {

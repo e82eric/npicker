@@ -1,0 +1,5 @@
+[package]
+name = "nfm-preview-command"
+version = "0.1.0"
+edition = "2024"
+description = "Host-independent bounded command execution for NFM previews"

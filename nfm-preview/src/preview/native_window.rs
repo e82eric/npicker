@@ -1,15 +1,13 @@
+use super::PreviewEvents;
 use std::sync::{Arc, Mutex};
 
-use crossbeam_channel::Sender;
-
 use super::{send_preview, PreviewEvent, SelectionPreview};
-use crate::view_model::ViewModelEvent;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct NativeWindowId(pub isize);
 
 pub(super) struct NativeWindowPreviewBackend<I> {
-    pub(super) events: Sender<ViewModelEvent>,
+    pub(super) events: PreviewEvents,
     pub(super) selected: Mutex<Option<NativeWindowId>>,
     pub(super) target: Option<Arc<dyn Fn(&I) -> Option<NativeWindowId> + Send + Sync>>,
 }

@@ -1,0 +1,11 @@
+[package]
+name = "nfm-egui-demo"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+nfm-egui = { path = "../nfm-egui" }
+nfm_search_core = { path = "../nfm-search-core" }
+eframe = { version = "=0.36.2", default-features = false, features = ["glow", "default_fonts", "x11", "wayland"] }
+image = { version = "0.25", default-features = false, features = ["png"] }
