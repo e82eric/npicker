@@ -1,0 +1,12 @@
+[package]
+name = "nfm-preview-text"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Source-independent syntax-highlighted text previews for NFM"
+
+[dependencies]
+nfm-egui = { path = "../nfm-egui" }
+two-face = "0.5.2"
+unicode-segmentation = "1.13"
+unicode-width = "0.2.2"

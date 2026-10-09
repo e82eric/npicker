@@ -11,6 +11,8 @@ members = [
     "nfm-egui-demo",
     "nfm-preview-vt",
     "nfm-preview-command",
+    "nfm-preview-file",
+    "nfm-preview-text",
     "nfm-win32",
     "nfm-preview",
 ]

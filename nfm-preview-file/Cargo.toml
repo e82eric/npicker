@@ -1,0 +1,12 @@
+[package]
+name = "nfm-preview-file"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Native syntax-highlighted file preview provider for NFM"
+
+[dependencies]
+nfm-egui = { path = "../nfm-egui" }
+nfm-preview-text = { path = "../nfm-preview-text" }
+nfm-preview-command = { path = "../nfm-preview-command" }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "bmp", "webp", "tiff"] }
