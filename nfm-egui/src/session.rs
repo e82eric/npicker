@@ -117,14 +117,25 @@ impl<S: ItemsSource + Send + Sync + 'static> Session<S> {
                     }
                     timings.clone()
                 };
-                *worker_latest.lock().unwrap() = Some(Update {
+                let incoming = Update {
                     revision: update.generation,
                     query: update.query,
                     snapshot,
                     output,
                     done: update.source_done,
                     append_only,
-                });
+                };
+                let count = incoming.output.results.len();
+                let hold_timer = crate::timing::Span::new("nfm_publish_mutex", count);
+                let previous = replace_pending(&worker_latest, incoming);
+                drop(hold_timer);
+                // Destroy potentially large superseded results without blocking UI take().
+                let drop_timer = crate::timing::Span::new(
+                    "nfm_worker_old_update_drop",
+                    previous.as_ref().map_or(0, |u| u.output.results.len()),
+                );
+                drop(previous);
+                drop(drop_timer);
                 let callback = worker_wake.lock().unwrap().clone();
                 if let Some(callback) = callback {
                     callback(ready);
@@ -147,7 +158,10 @@ impl<S: ItemsSource + Send + Sync + 'static> Session<S> {
         self.revision
     }
     pub fn take(&self) -> Option<Update<S>> {
+        let _timer = crate::timing::Span::new("nfm_take_update", 0);
+        let lock_timer = crate::timing::Span::new("nfm_take_update_mutex", 0);
         let update = self.latest.lock().unwrap().take();
+        drop(lock_timer);
         if update.as_ref().is_some_and(|u| u.output.matched > 0) {
             self.timings
                 .lock()
@@ -175,5 +189,44 @@ impl<S: ItemsSource + Send + Sync + 'static> Session<S> {
 impl<S: ItemsSource + Send + Sync + 'static> Drop for Session<S> {
     fn drop(&mut self) {
         self.search.stop();
+    }
+}
+
+// Return ownership after releasing the mailbox guard. The caller must dispose
+// of old results outside the lock used by the UI.
+fn replace_pending<T>(latest: &Mutex<Option<T>>, incoming: T) -> Option<T> {
+    latest.lock().unwrap().replace(incoming)
+}
+
+#[cfg(test)]
+mod publication_tests {
+    use super::*;
+    use std::sync::{
+        Weak,
+        atomic::{AtomicBool, Ordering},
+    };
+    struct CheckDrop {
+        latest: Weak<Mutex<Option<CheckDrop>>>,
+        unlocked: Arc<AtomicBool>,
+    }
+    impl Drop for CheckDrop {
+        fn drop(&mut self) {
+            if let Some(latest) = self.latest.upgrade() {
+                self.unlocked
+                    .store(latest.try_lock().is_ok(), Ordering::Release);
+            }
+        }
+    }
+    #[test]
+    fn superseded_results_are_destroyed_without_holding_the_ui_mailbox() {
+        let latest = Arc::new(Mutex::new(None));
+        let unlocked = Arc::new(AtomicBool::new(false));
+        let item = || CheckDrop {
+            latest: Arc::downgrade(&latest),
+            unlocked: unlocked.clone(),
+        };
+        *latest.lock().unwrap() = Some(item());
+        drop(replace_pending(&latest, item()));
+        assert!(unlocked.load(Ordering::Acquire));
     }
 }

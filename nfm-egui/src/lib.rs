@@ -16,6 +16,7 @@ pub mod renderer;
 pub mod search_service;
 mod session;
 pub mod shared;
+mod timing;
 
 pub use appearance::{Appearance, FontFace, Palette, Typography};
 pub use egui;

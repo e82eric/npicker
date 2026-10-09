@@ -421,3 +421,22 @@ constructors. Pass `into_picker()` from the previous workflow to switch types;
 the specialized components supply their own shared adapters, previews, and actions.
 Native windows, event loops, focus policy, and selection actions remain host-owned.
 The generic sharing layer adds no native-enumeration or specialized-picker dependency.
+
+
+### Picker timing diagnostics
+
+Set `NFM_PICKER_TRACE` to an output file before starting the host. The bounded
+asynchronous trace logs phase durations and counts, never queries, item text,
+or paths. Headers contain a Unix millisecond timestamp for alignment with host
+traces. Records cover search mailbox acquisition, selection restoration, old
+result disposal (UI and worker), completion snapshots and suggestions, search
+submission, input dispatch, layout, result text/match/font layout, query widgets,
+preview preparation, and total UI construction. Nested spans overlap; do not sum
+all durations. Logging may drop records when its 4096-entry queue fills.
+
+Result selection restoration can scan the full match list. Replacing displayed
+results destroys the old list on the UI thread; destructing results and snapshots
+can grow with their size. The search worker releases its publication mutex before
+disposing of superseded pending results, so UI mailbox acquisition does not wait
+for that disposal. Rendering visits only visible result rows. FileSystem sources
+use the default empty completion provider, rather than scanning files for completions.

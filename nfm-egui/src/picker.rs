@@ -314,7 +314,9 @@ where
             self.query_cursor = self.query.len();
             self.suggestion_selected = 0;
             self.dismissed_completion = None;
+            let submit_timer = crate::timing::Span::new("nfm_search_submit", self.query.len());
             self.revision = self.session.set_query(self.query.clone());
+            drop(submit_timer);
             self.selected = 0;
             self.visible_start = 0;
             self.scroll_offset = 0;
@@ -358,6 +360,7 @@ where
         true
     }
     fn refresh_completions(&mut self) {
+        let _timer = crate::timing::Span::new("nfm_completions", self.query.len());
         if self
             .dismissed_completion
             .as_ref()
@@ -784,6 +787,12 @@ where
             .flatten()
     }
     fn poll(&mut self) {
+        let _poll = crate::timing::Span::new(
+            "nfm_poll",
+            self.displayed
+                .as_ref()
+                .map_or(0, |d| d.output.results.len()),
+        );
         if let Some(update) = self.session.take()
             && update.revision == self.revision
             && update.query == self.query
@@ -807,6 +816,8 @@ where
                 .as_ref()
                 .and_then(|d| d.output.results.get(self.selected))
                 .map(|r| r.node_index);
+            let selection_timer =
+                crate::timing::Span::new("nfm_selection_restore", update.output.results.len());
             self.selected = if same_query && stable_indices {
                 old_index
                     .and_then(|index| {
@@ -820,6 +831,7 @@ where
             } else {
                 0
             };
+            drop(selection_timer);
             let new_index = update
                 .output
                 .results
@@ -828,8 +840,20 @@ where
             if old_index != new_index || !same_query || !stable_indices {
                 self.leave_preview_focus();
             }
+            let snapshot_timer = crate::timing::Span::new(
+                "nfm_completion_snapshot_replace",
+                update.output.results.len(),
+            );
             self.completion_snapshot = Some(update.snapshot.clone());
-            self.displayed = Some(update);
+            drop(snapshot_timer);
+            let count = self
+                .displayed
+                .as_ref()
+                .map_or(0, |d| d.output.results.len());
+            let old = self.displayed.replace(update);
+            let disposal_timer = crate::timing::Span::new("nfm_old_update_drop", count);
+            drop(old);
+            drop(disposal_timer);
             self.keep_selected_visible();
         }
         if let Some(preview) = &mut self.preview {
@@ -899,6 +923,7 @@ where
             .min(total.saturating_sub(rows));
     }
     fn refresh_preview(&mut self, width: f32, appearance: &Appearance) {
+        let _timer = crate::timing::Span::new("nfm_preview_prepare", self.visible_result_rows);
         if self.preview_viewport.is_some() {
             return;
         }
@@ -1020,6 +1045,7 @@ where
         accept: &mut bool,
         double_click: &mut bool,
     ) {
+        let _timer = crate::timing::Span::new("nfm_result_rows", self.visible_result_rows);
         let row_height = appearance.typography.preview_row_height(ui.ctx());
         let mut first_rect = None;
         for slot in 0..self.visible_result_rows {
@@ -1050,17 +1076,24 @@ where
                         appearance.palette.accent,
                     );
                 }
+                let text_timer = crate::timing::Span::new("nfm_result_text", 1);
                 let display = displayed
                     .snapshot
                     .display_text(result.node_index, &displayed.query)
                     .unwrap_or_else(|| result.path.clone());
+                drop(text_timer);
+                let match_timer =
+                    crate::timing::Span::new("nfm_result_match_layout", display.len());
                 let job = result_layout(
                     &display,
                     &displayed.snapshot.effective_query(&displayed.query),
                     index == self.selected,
                     appearance,
                 );
+                drop(match_timer);
+                let font_timer = crate::timing::Span::new("nfm_result_font_layout", display.len());
                 let galley = painter.layout_job(job);
+                drop(font_timer);
                 painter.galley(
                     egui::pos2(rect.left() + 12.0, rect.center().y - galley.size().y / 2.0),
                     galley,
@@ -1168,6 +1201,7 @@ where
         complete: bool,
         interactive: bool,
     ) {
+        let _timer = crate::timing::Span::new("nfm_query_ui", self.visible_result_rows);
         let before = self.query.clone();
         let row_height = appearance.typography.preview_row_height(ctx);
         ui.horizontal(|ui| {
@@ -1300,6 +1334,12 @@ where
         appearance: &Appearance,
         interactive: bool,
     ) -> PickerOutput<S::Item> {
+        let _show = crate::timing::Span::new(
+            "nfm_show",
+            self.displayed
+                .as_ref()
+                .map_or(0, |d| d.output.results.len()),
+        );
         self.poll();
         if self
             .preview_viewport
@@ -1309,6 +1349,7 @@ where
             self.leave_preview_focus();
         }
         self.refresh_completions();
+        let input_timer = crate::timing::Span::new("nfm_input_dispatch", self.query.len());
         let input_id = self.id.with("query");
         let focus_id = if self.preview_focused() {
             self.id.with("preview-copy")
@@ -1592,6 +1633,8 @@ where
                 });
             });
         }
+        drop(input_timer);
+        let layout_timer = crate::timing::Span::new("nfm_layout", self.visible_result_rows);
         let row_height = appearance.typography.preview_row_height(ctx);
         let available = (placement.bounds.height() - 2.0 * placement.margin.max(0.0)).max(0.0);
         let header = self
@@ -1632,6 +1675,8 @@ where
         if has_preview {
             self.refresh_preview((rect.width() - 38.0).max(1.0), appearance);
         }
+        drop(layout_timer);
+        let build_timer = crate::timing::Span::new("nfm_build_ui", self.visible_result_rows);
         if !self.closed && rect.is_positive() {
             let previous_size =
                 ctx.memory(|memory| memory.area_rect(self.id).map(|rect| rect.size()));
@@ -1761,6 +1806,7 @@ where
             | Some(PickerEvent::CopyRequested(_)) => None,
             _ => self.selection(),
         };
+        drop(build_timer);
         PickerOutput {
             frame_selection,
             preview_rendered: self.preview_rendered,
