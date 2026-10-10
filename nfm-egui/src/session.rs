@@ -117,14 +117,16 @@ impl<S: ItemsSource + Send + Sync + 'static> Session<S> {
                     }
                     timings.clone()
                 };
-                *worker_latest.lock().unwrap() = Some(Update {
+                let incoming = Update {
                     revision: update.generation,
                     query: update.query,
                     snapshot,
                     output,
                     done: update.source_done,
                     append_only,
-                });
+                };
+                // Release the UI mailbox before destroying superseded results.
+                drop(replace_pending(&worker_latest, incoming));
                 let callback = worker_wake.lock().unwrap().clone();
                 if let Some(callback) = callback {
                     callback(ready);
@@ -175,5 +177,44 @@ impl<S: ItemsSource + Send + Sync + 'static> Session<S> {
 impl<S: ItemsSource + Send + Sync + 'static> Drop for Session<S> {
     fn drop(&mut self) {
         self.search.stop();
+    }
+}
+
+// Return ownership after releasing the mailbox guard. The caller must dispose
+// of old results outside the lock used by the UI.
+fn replace_pending<T>(latest: &Mutex<Option<T>>, incoming: T) -> Option<T> {
+    latest.lock().unwrap().replace(incoming)
+}
+
+#[cfg(test)]
+mod publication_tests {
+    use super::*;
+    use std::sync::{
+        Weak,
+        atomic::{AtomicBool, Ordering},
+    };
+    struct CheckDrop {
+        latest: Weak<Mutex<Option<CheckDrop>>>,
+        unlocked: Arc<AtomicBool>,
+    }
+    impl Drop for CheckDrop {
+        fn drop(&mut self) {
+            if let Some(latest) = self.latest.upgrade() {
+                self.unlocked
+                    .store(latest.try_lock().is_ok(), Ordering::Release);
+            }
+        }
+    }
+    #[test]
+    fn superseded_results_are_destroyed_without_holding_the_ui_mailbox() {
+        let latest = Arc::new(Mutex::new(None));
+        let unlocked = Arc::new(AtomicBool::new(false));
+        let item = || CheckDrop {
+            latest: Arc::downgrade(&latest),
+            unlocked: unlocked.clone(),
+        };
+        *latest.lock().unwrap() = Some(item());
+        drop(replace_pending(&latest, item()));
+        assert!(unlocked.load(Ordering::Acquire));
     }
 }
