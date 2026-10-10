@@ -1,7 +1,7 @@
 # NFM embedded egui control
 
-Preview selections preserve syntax and ANSI foreground colors and use the muted
-blue `Appearance.palette.preview_selection_background` fill. This is separate
+Preview selections preserve syntax and ANSI foreground colors and use the warm
+gray Gruvbox `bg3` (`#665c54`) `Appearance.palette.preview_selection_background` fill. This is separate
 from picker-row `selection_background`/`selection_text` styling. Copy cursors,
 active search matches, and yank feedback retain their contrasting overlays.
 

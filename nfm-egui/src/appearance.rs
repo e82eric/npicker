@@ -33,7 +33,7 @@ impl Default for Palette {
             muted: Color32::from_rgb(168, 153, 132),
             selection_background: Color32::from_rgb(0x3d, 0x39, 0x37),
             selection_text: Color32::from_rgb(0xeb, 0xdb, 0xb2),
-            preview_selection_background: Color32::from_rgb(0x26, 0x45, 0x77),
+            preview_selection_background: Color32::from_rgb(0x66, 0x5c, 0x54),
             match_highlight: Color32::from_rgb(0xfb, 0x49, 0x34),
             divider: Color32::from_rgb(0x92, 0x83, 0x74),
             error: Color32::from_rgb(251, 73, 52),
