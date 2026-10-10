@@ -21,6 +21,75 @@ mod yank_paint_tests {
     use crate::copy_mode::{VisualMode, YANK_HIGHLIGHT_DURATION};
 
     #[test]
+    fn preview_selection_preserves_syntax_colors_and_cursor_contrast() {
+        let red = egui::Color32::from_rgb(220, 80, 90);
+        let green = egui::Color32::from_rgb(120, 190, 100);
+        for visual in [
+            VisualMode::Characterwise,
+            VisualMode::Linewise,
+            VisualMode::Blockwise,
+        ] {
+            let ctx = Context::default();
+            let appearance = Appearance::default();
+            let preview = Preview::StyledText(vec![vec![
+                PreviewCell {
+                    text: "a".into(),
+                    foreground: red,
+                    bold: true,
+                    ..Default::default()
+                },
+                PreviewCell {
+                    text: "b".into(),
+                    foreground: egui::Color32::BLACK,
+                    background: green,
+                    inverse: true,
+                    ..Default::default()
+                },
+                PreviewCell {
+                    text: "c".into(),
+                    foreground: red,
+                    ..Default::default()
+                },
+            ]]);
+            let mut copy = PreviewCopyMode::text(&preview, 0, 4).unwrap();
+            copy.mode.toggle_visual(visual);
+            copy.mode.cursor = CellPosition { x: 2, y: 0 };
+            let output = paint(&ctx, &mut copy, &[]);
+            let glyph_color = |glyph: &str| {
+                output
+                    .shapes
+                    .iter()
+                    .find_map(|shape| match &shape.shape {
+                        egui::Shape::Text(text) if text.galley.text() == glyph => {
+                            Some(text.galley.job.sections[0].format.color)
+                        }
+                        _ => None,
+                    })
+                    .expect("glyph must render")
+            };
+            assert_eq!(glyph_color("a"), red);
+            assert_eq!(glyph_color("b"), green);
+            assert_eq!(glyph_color("c"), appearance.palette.background);
+            assert!(colored_cells(&output, appearance.palette.preview_selection_background) >= 2);
+            assert!(colored_cells(&output, appearance.palette.accent) >= 1);
+            let yanked = paint(&ctx, &mut copy, &[key(Key::Y)]);
+            assert!(
+                yanked
+                    .platform_output
+                    .commands
+                    .contains(&egui::OutputCommand::CopyText(
+                        if visual == VisualMode::Linewise {
+                            "abc\n"
+                        } else {
+                            "abc"
+                        }
+                        .into()
+                    ))
+            );
+        }
+    }
+
+    #[test]
     fn preview_motion_adapter_preserves_logical_columns_and_hard_line_breaks() {
         let ctx = Context::default();
         let preview = Preview::Text("abcd\nefgh\nij\nklmn\nopqr".into());
@@ -726,7 +795,7 @@ mod yank_paint_tests {
             output.textures_delta.clear();
             let full_rows = output.shapes.iter().filter(|shape| matches!(
                 &shape.shape,
-                egui::Shape::Rect(rect) if rect.fill == appearance.palette.selection_background
+                egui::Shape::Rect(rect) if rect.fill == appearance.palette.preview_selection_background
                     && (rect.rect.width() - viewport_width).abs() < 0.01
             )).count();
             assert_eq!(
@@ -786,7 +855,7 @@ mod yank_paint_tests {
             .iter()
             .filter_map(|shape| match &shape.shape {
                 egui::Shape::Rect(rect)
-                    if rect.fill == appearance.palette.selection_background
+                    if rect.fill == appearance.palette.preview_selection_background
                         && rect.rect.width() > width / 2.0 =>
                 {
                     Some(rect.rect)
@@ -1791,9 +1860,11 @@ impl PreviewCopyMode {
                         (hint.range.start.y, hint.range.start.x) <= (absolute, glyph_x as u32)
                             && (absolute, glyph_x as u32) <= (hint.range.end.y, hint.range.end.x)
                     }) {
-                        cell.inverse = false;
-                        cell.background = appearance.palette.selection_background;
-                        cell.foreground = appearance.palette.selection_text;
+                        if cell.inverse {
+                            std::mem::swap(&mut cell.foreground, &mut cell.background);
+                            cell.inverse = false;
+                        }
+                        cell.background = appearance.palette.preview_selection_background;
                     }
                 }
             }
@@ -1885,7 +1956,7 @@ impl PreviewCopyMode {
         // unused viewport space without extending the extracted text.
         for (selection, color) in selection
             .as_ref()
-            .map(|selection| (selection, appearance.palette.selection_background))
+            .map(|selection| (selection, appearance.palette.preview_selection_background))
             .into_iter()
             .chain(yank_selection.as_ref().map(|selection| {
                 (
@@ -1959,6 +2030,7 @@ impl PreviewCopyMode {
                     std::mem::swap(&mut cell.foreground, &mut cell.background);
                     cell.inverse = false;
                 }
+                let syntax_foreground = cell.foreground;
                 if cell.background == appearance.palette.background {
                     cell.background = egui::Color32::TRANSPARENT;
                 }
@@ -1980,8 +2052,8 @@ impl PreviewCopyMode {
                 if selected.is_some_and(|(range, rectangle)| {
                     contains(range, rectangle, glyph_x as u32, absolute)
                 }) {
-                    cell.background = appearance.palette.selection_background;
-                    cell.foreground = appearance.palette.selection_text;
+                    cell.background = appearance.palette.preview_selection_background;
+                    cell.foreground = syntax_foreground;
                 }
                 let yanked = yank.is_some_and(|(range, rectangle)| {
                     contains(range, rectangle, glyph_x as u32, absolute)

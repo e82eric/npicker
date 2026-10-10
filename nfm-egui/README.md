@@ -1,5 +1,10 @@
 # NFM embedded egui control
 
+Preview selections preserve syntax and ANSI foreground colors and use the muted
+blue `Appearance.palette.preview_selection_background` fill. This is separate
+from picker-row `selection_background`/`selection_text` styling. Copy cursors,
+active search matches, and yank feedback retain their contrasting overlays.
+
 See [API.md](API.md) for the public API reference, host contracts, and preview lifecycle.
 See [Using copy mode](docs/copy-mode/README.md) for preview controls, keybindings, configuration, and host integration.
 
