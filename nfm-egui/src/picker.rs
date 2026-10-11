@@ -1021,6 +1021,30 @@ where
         double_click: &mut bool,
     ) {
         let row_height = appearance.typography.preview_row_height(ui.ctx());
+        if let Some(error) = &self.error {
+            let height = self.visible_result_rows as f32 * row_height;
+            let (rect, _) = ui.allocate_exact_size(
+                egui::vec2(ui.available_width(), height),
+                egui::Sense::hover(),
+            );
+            ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
+                egui::ScrollArea::vertical()
+                    .id_salt(self.id.with("error_message"))
+                    .max_height(height)
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(error)
+                                    .font(appearance.typography.normal.clone())
+                                    .color(appearance.palette.error),
+                            )
+                            .wrap(),
+                        );
+                    });
+            });
+            return;
+        }
         let mut first_rect = None;
         for slot in 0..self.visible_result_rows {
             let index = if self.config.layout == Layout::QueryBottom {
@@ -1100,23 +1124,18 @@ where
                     .as_ref()
                     .is_none_or(|d| d.output.results.is_empty())
             {
-                let text = self.error.as_deref().unwrap_or(
+                let text =
                     if self.current_results() && self.displayed.as_ref().is_some_and(|d| d.done) {
                         "No matches"
                     } else {
                         " "
-                    },
-                );
+                    };
                 painter.text(
                     rect.left_center(),
                     egui::Align2::LEFT_CENTER,
                     text,
                     appearance.typography.normal.clone(),
-                    if self.error.is_some() {
-                        appearance.palette.error
-                    } else {
-                        appearance.palette.muted
-                    },
+                    appearance.palette.muted,
                 );
             }
         }
