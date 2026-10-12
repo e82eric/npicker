@@ -379,6 +379,54 @@ mod yank_paint_tests {
     }
 
     #[test]
+    fn quick_select_preserves_styled_foreground_background_and_inverse() {
+        let ctx = Context::default();
+        let appearance = Appearance::default();
+        let syntax = egui::Color32::from_rgb(220, 80, 90);
+        let preview = Preview::StyledText(vec![
+            "word"
+                .chars()
+                .map(|ch| PreviewCell {
+                    text: ch.to_string(),
+                    foreground: syntax,
+                    background: egui::Color32::BLACK,
+                    inverse: ch == 'r',
+                    ..Default::default()
+                })
+                .collect(),
+        ]);
+        let mut copy = PreviewCopyMode::text(&preview, 0, 4).unwrap();
+        let _ = paint(&ctx, &mut copy, &[]);
+        assert!(copy.open_quick_select(true, 4));
+        let output = paint(&ctx, &mut copy, &[]);
+        assert_eq!(
+            colored_cells(&output, appearance.palette.preview_selection_background),
+            0
+        );
+        assert!(colored_cells(&output, syntax) >= 1); // Inverse target's displayed background.
+        assert!(colored_cells(&output, egui::Color32::BLACK) >= 1);
+        for (glyph, expected) in [("r", egui::Color32::BLACK), ("d", syntax)] {
+            let color = output
+                .shapes
+                .iter()
+                .find_map(|shape| match &shape.shape {
+                    egui::Shape::Text(text) if text.galley.text() == glyph => {
+                        Some(text.galley.job.sections[0].format.color)
+                    }
+                    _ => None,
+                })
+                .expect("target glyph must render");
+            assert_eq!(color, expected);
+        }
+        copy.cancel_quick_select();
+        assert!(!copy.quick_select_active());
+        let restored = paint(&ctx, &mut copy, &[]);
+        assert!(restored.shapes.iter().any(|shape| matches!(&shape.shape,
+            egui::Shape::Text(text) if text.galley.text() == "d"
+                && text.galley.job.sections[0].format.color == syntax)));
+    }
+
+    #[test]
     fn quick_select_draws_labels_pages_without_cursor_snap_and_yanks_lines() {
         let ctx = Context::default();
         let appearance = Appearance::default();
@@ -393,8 +441,14 @@ mod yank_paint_tests {
         let output = paint(&ctx, &mut copy, &[]);
         assert!(output.shapes.iter().any(|shape| matches!(&shape.shape,
             egui::Shape::Text(text) if text.galley.text() == "A")));
-        // Hints use accent text; the copy cursor's accent background is absent.
+        // Labels stand out through text styling without adding background fills.
+        let hint_color = appearance.palette.match_highlight;
         assert_eq!(colored_cells(&output, appearance.palette.accent), 0);
+        assert!(output.shapes.iter().any(|shape| matches!(&shape.shape,
+            egui::Shape::Text(text) if text.galley.text() == "A"
+                && text.galley.job.sections[0].format.color == hint_color)));
+        assert!(output.shapes.iter().any(|shape| matches!(&shape.shape,
+            egui::Shape::LineSegment { stroke, .. } if stroke.color == hint_color)));
         let _ = paint(&ctx, &mut copy, &[key(Key::PageDown)]);
         assert_eq!(copy.top, 4);
         let _ = paint(&ctx, &mut copy, &[]);
@@ -1845,36 +1899,22 @@ impl PreviewCopyMode {
             }
         }
         if let Some(quick) = &self.quick_select {
-            let hints: Vec<_> = quick.visible_hints().collect();
-            for (y, row) in cells.chunks_mut(columns).enumerate() {
-                let absolute = self.top + y as u64;
-                let source = self.document.row(absolute);
-                for (x, cell) in row.iter_mut().enumerate() {
-                    let mut glyph_x = x;
-                    if let Some(source) = &source {
-                        while glyph_x > 0 && source.widths.get(glyph_x) == Some(&0) {
-                            glyph_x -= 1;
-                        }
-                    }
-                    if hints.iter().any(|hint| {
-                        (hint.range.start.y, hint.range.start.x) <= (absolute, glyph_x as u32)
-                            && (absolute, glyph_x as u32) <= (hint.range.end.y, hint.range.end.x)
-                    }) {
-                        if cell.inverse {
-                            std::mem::swap(&mut cell.foreground, &mut cell.background);
-                            cell.inverse = false;
-                        }
-                        cell.background = appearance.palette.preview_selection_background;
-                    }
-                }
-            }
             for hint in quick.cell_text() {
                 if let Some(y) = hint.cell.y.checked_sub(self.top) {
                     if let Some(cell) = cells.get_mut(y as usize * columns + hint.cell.x as usize) {
                         cell.text = char::from_u32(hint.codepoint).unwrap_or(' ').to_string();
-                        cell.foreground = appearance.palette.accent;
-                        cell.background = appearance.palette.background;
+                        if cell.inverse {
+                            // Preserve the displayed background before styling the label.
+                            std::mem::swap(&mut cell.foreground, &mut cell.background);
+                        }
+                        cell.foreground = appearance.palette.match_highlight;
                         cell.bold = true;
+                        cell.underline = true;
+                        cell.underline_color = cell.foreground;
+                        cell.italic = false;
+                        cell.strikethrough = false;
+                        cell.invisible = false;
+                        cell.faint = false;
                         cell.inverse = false;
                     }
                 }
