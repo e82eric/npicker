@@ -893,6 +893,10 @@ where
     pub fn set_bindings(&mut self, bindings: Vec<PickerBinding>) {
         self.config.bindings = resolved_bindings(bindings);
     }
+    /// Effective placement after built-in actions, for hosts that resize a native window.
+    pub fn effective_position(&self, configured: crate::Position) -> crate::Position {
+        self.placement_override.unwrap_or(configured)
+    }
     fn double_click_action(&self) -> Option<PickerAction> {
         self.config
             .bindings
@@ -1759,9 +1763,7 @@ where
                 });
             });
         }
-        if let Some(position) = self.placement_override {
-            placement.position = position;
-        }
+        placement.position = self.effective_position(placement.position);
         let row_height = appearance.typography.preview_row_height(ctx);
         let full_pane = placement.position == crate::Position::FullPane;
         let available = (placement.bounds.height()
@@ -2145,6 +2147,10 @@ mod query_parity_tests {
         );
         assert_eq!(picker.placement_override, Some(crate::Position::FullPane));
         assert_eq!(picker.query(), "a");
+        assert_eq!(
+            picker.effective_position(crate::Position::Center),
+            crate::Position::FullPane
+        );
         assert_eq!(picker.selection().unwrap().index, selected);
         assert!(!picker.preview_focused());
         assert!(picker.preview_viewport.is_none());
@@ -2162,6 +2168,10 @@ mod query_parity_tests {
         draw(&ctx, &mut picker, vec![shortcut()]);
         assert_eq!(picker.placement_override, None);
         assert_eq!(picker.selection().unwrap().index, selected);
+        assert_eq!(
+            picker.effective_position(crate::Position::Center),
+            crate::Position::Center
+        );
     }
 
     #[test]

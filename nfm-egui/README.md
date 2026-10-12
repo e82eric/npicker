@@ -188,6 +188,9 @@ Graphics resources can be recreated without recreating picker/search state.
   take precedence over this default shortcut.
   With the preview hidden, FullPane uses the remaining height for result rows;
   showing the preview restores the configured result count.
+  Native window hosts can read `picker.effective_position(configured_position)`
+  after `show` to resize their window when the placement changes. The host owns
+  monitor/work-area bounds and restores its popup geometry when FullPane ends.
   `PickerBinding.action` is `PickerAction::ToggleFullPane` or
   `PickerAction::Custom(id)`. Construction and `set_bindings` merge host bindings
   over the default chord; later entries replace earlier entries with the same
