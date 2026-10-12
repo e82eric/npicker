@@ -5,5 +5,8 @@ edition = "2024"
 links = "nfm_ghostty_vt"
 description = "Owned ANSI preview grids backed by standalone Ghostty VT"
 
+[dependencies]
+ghostty-vt-sys = { path = "../ghostty-vt-sys" }
+
 [build-dependencies]
 cc = "1.2"

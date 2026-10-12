@@ -6,9 +6,17 @@ Default parsing limits input to 20 MiB and output to 1,048,576 cells; scrollback
 8192-line limit, subject to native page pruning; the terminal byte limit is disabled. Providers should bound their input and check cancellation
 before and after parsing. The native parse call itself is not interruptible.
 
-Build the standalone VT library from a compatible Ghostty checkout using
+The `ghostty-vt-sys` dependency builds a pinned, bundled Ghostty VT source archive
+automatically. Install Zig 0.16.0 on PATH, or set `GHOSTTY_VT_ZIG` to its
+executable. A local Ghostty checkout and directory variables are unnecessary.
+Build artifacts and source extraction live under Cargo's target directory;
+Zig may download hash-pinned dependencies on the first build. Cargo's offline
+mode does not control those downloads. See [the native build crate](../ghostty-vt-sys/README.md)
+for source provenance and supported targets.
+
+To use a prebuilt library instead, build a compatible Ghostty checkout using
 `zig build -Demit-lib-vt -Doptimize=ReleaseFast -Dvt-features=-kitty-graphics --prefix zig-out/nfm-vt`, then provide matching headers
-and static library through these variables (paths below are placeholders):
+and static library through these optional overrides (paths are placeholders):
 
 Alternatively, set `GHOSTTY_ROOT` to the checkout; headers come from `include`.
 Libraries come from `zig-out/nfm-vt/lib` when present, otherwise `zig-out/lib`.
@@ -26,11 +34,10 @@ cargo test -p nfm-egui
 `NFM_GHOSTTY_VT_LIB_NAME` defaults to `ghostty-vt-static` (omit file extension,
 `lib` prefix, and directory). Adjust for the artifact produced on your platform.
 The host must use the same compatible headers/library and avoid linking a
-second incompatible copy. This crate does not invoke the terminal build.
+second incompatible copy. Overrides bypass the bundled native build.
 
 `nfm-egui` requires the standalone VT library in every build. Use `nfm_egui::preview::parse_ansi` for ANSI previews.
-Source acquisition/pinning or distributing prebuilt VT artifacts is a later
-packaging task; no machine-specific path is embedded in these manifests.
+No machine-specific path is embedded in these manifests.
 
 ## Retained ANSI documents
 

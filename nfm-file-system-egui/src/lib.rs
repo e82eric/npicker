@@ -203,8 +203,8 @@ where
             Some(PickerEvent::CopyRequested(selection)) => {
                 if let Some(path) = self.adapter.path(&selection.item) {
                     ctx.copy_text(path.to_owned());
+                    self.picker.notify_copied_value(ctx, path);
                 }
-                self.picker.notify_copied(ctx);
                 Ok(None)
             }
             Some(PickerEvent::CustomAction { .. }) | None => Ok(None),

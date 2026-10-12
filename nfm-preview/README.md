@@ -23,10 +23,11 @@ pickers expose this as `FileSystemPickerOptions::bat_theme` and retain it during
 navigation. Theme names must be available in `bat --list-themes`.
 
 All ANSI output is parsed by the standalone Ghostty VT library through
-`nfm-preview-vt`, including command and formatted previews. Build the library with
-`zig build -Demit-lib-vt -Doptimize=ReleaseFast -Dvt-features=-kitty-graphics --prefix zig-out/nfm-vt` in your Ghostty checkout, then set
-`GHOSTTY_ROOT` to that checkout before building NFM or its consumers. Explicit
-`NFM_GHOSTTY_VT_INCLUDE_DIR` and `NFM_GHOSTTY_VT_LIB_DIR` override the derived paths.
+`nfm-preview-vt`, including command and formatted previews. Cargo builds pinned,
+bundled Ghostty source automatically with Zig 0.16.0 on PATH. No local Ghostty
+checkout is required. `GHOSTTY_ROOT` or explicit `NFM_GHOSTTY_VT_INCLUDE_DIR`
+and `NFM_GHOSTTY_VT_LIB_DIR` remain optional prebuilt-library overrides.
+See [the VT build instructions](../nfm-preview-vt/README.md).
 The styled-line API remains available to both renderers. Stdout and stderr are
 parsed independently and displayed in that order, so terminal state cannot bleed
 between streams. Capture is bounded to 20 MiB and 4000 lines; native scrollback

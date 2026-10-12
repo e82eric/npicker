@@ -847,7 +847,25 @@ where
         }
     }
     pub fn notify_copied(&mut self, ctx: &Context) {
-        self.copy_notice = "Copied".into();
+        let value = self
+            .selection()
+            .map(|selection| selection.text)
+            .unwrap_or_default();
+        self.notify_copied_value(ctx, &value);
+    }
+    /// Confirm the actual clipboard value when it differs from the displayed candidate.
+    pub fn notify_copied_value(&mut self, ctx: &Context, value: &str) {
+        self.copy_notice = if value.is_empty() {
+            "Copied".into()
+        } else {
+            format!(
+                "Copied: {}",
+                value
+                    .replace('\r', "\\r")
+                    .replace('\n', "\\n")
+                    .replace('\t', "\\t")
+            )
+        };
         self.copied_until = Some(Instant::now() + Duration::from_secs(2));
         ctx.request_repaint();
         ctx.request_repaint_after(Duration::from_secs(2));
@@ -1304,18 +1322,25 @@ where
             .is_some_and(|until| until > Instant::now())
             && let Some(top) = first_rect
         {
-            let galley = ui.painter().layout_no_wrap(
+            let results_rect = egui::Rect::from_min_size(
+                top.min,
+                egui::vec2(top.width(), self.visible_result_rows as f32 * row_height),
+            );
+            let galley = ui.painter().layout(
                 self.copy_notice.clone(),
                 appearance.typography.normal.clone(),
                 appearance.palette.success,
+                (results_rect.width() - 32.0).max(1.0),
             );
-            let toast = egui::Rect::from_min_size(
-                egui::pos2(top.right() - galley.size().x - 20.0, top.top() + 2.0),
+            let toast = egui::Rect::from_center_size(
+                results_rect.center(),
                 galley.size() + egui::vec2(16.0, 6.0),
             );
-            ui.painter()
-                .rect_filled(toast, 3, appearance.palette.selection_background);
-            ui.painter().galley(
+            let painter = ui
+                .painter()
+                .with_clip_rect(results_rect.intersect(ui.clip_rect()));
+            painter.rect_filled(toast, 3, appearance.palette.selection_background);
+            painter.galley(
                 toast.min + egui::vec2(8.0, 3.0),
                 galley,
                 appearance.palette.success,

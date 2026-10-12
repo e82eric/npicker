@@ -154,8 +154,8 @@ where
                 .map(|item| WindowEvent::Selected(item.native_window)),
             Some(PickerEvent::Cancelled) => Some(WindowEvent::Cancelled),
             Some(PickerEvent::CopyRequested(selection)) => {
+                self.picker.notify_copied_value(ctx, &selection.text);
                 ctx.copy_text(selection.text);
-                self.picker.notify_copied(ctx);
                 None
             }
             Some(PickerEvent::CustomAction { .. }) | None => None,

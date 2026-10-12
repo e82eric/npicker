@@ -1,0 +1,11 @@
+[package]
+name = "ghostty-vt-sys"
+version = "0.1.0"
+edition = "2024"
+links = "ghostty_vt"
+license = "MIT"
+description = "Cargo-managed standalone Ghostty VT static library"
+
+[build-dependencies]
+flate2 = "1"
+tar = "0.4"

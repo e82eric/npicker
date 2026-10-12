@@ -223,8 +223,8 @@ where
         match output.event {
             Some(PickerEvent::Accepted(_)) | Some(PickerEvent::Cancelled) => true,
             Some(PickerEvent::CopyRequested(selection)) => {
+                self.picker.notify_copied_value(ctx, &selection.text);
                 ctx.copy_text(selection.text);
-                self.picker.notify_copied(ctx);
                 false
             }
             Some(PickerEvent::CustomAction { .. }) | None => false,
