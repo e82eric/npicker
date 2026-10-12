@@ -22,8 +22,8 @@ pub use egui;
 pub use nfm_search_core::search::SearchSortMode;
 pub use nfm_search_core::{fuzzy_search_session::SearchSnapshotProvider, store::ItemsSource};
 pub use picker::{
-    Layout, Picker, PickerBinding, PickerConfig, PickerEvent, PickerOutput, PickerTrigger,
-    Selection,
+    Layout, Picker, PickerAction, PickerBinding, PickerConfig, PickerEvent, PickerOutput,
+    PickerTrigger, Selection,
 };
 pub use placement::{Placement, Position};
 pub use preview::{Cancellation, Preview, PreviewCell, PreviewProvider, PreviewRequest};

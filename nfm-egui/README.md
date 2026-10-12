@@ -181,6 +181,22 @@ Graphics resources can be recreated without recreating picker/search state.
 - PageUp/PageDown move a result page; Ctrl+Home/End select first/last search rank.
 - Ctrl+C requests copying the selected candidate from the host.
 - Ctrl+P (as in Ghostty) or Ctrl+Space toggles the preview; Ctrl+PageUp/PageDown scroll its document.
+- Ctrl+Shift+F toggles full-pane placement for all pickers, retaining
+  the query and result selection. Toggle again to restore the host placement;
+  a picker configured as FullPane temporarily switches to Center. Preview copy
+  mode resets so the provider can rewrap and recenter. Custom picker bindings
+  take precedence over this default shortcut.
+  With the preview hidden, FullPane uses the remaining height for result rows;
+  showing the preview restores the configured result count.
+  `PickerBinding.action` is `PickerAction::ToggleFullPane` or
+  `PickerAction::Custom(id)`. Construction and `set_bindings` merge host bindings
+  over the default chord; later entries replace earlier entries with the same
+  trigger and modifiers. Toggle bindings can be remapped to another key. Their
+  effective shortcuts appear in help. Other built-in shortcuts remain separate.
+  Each binding carries an optional `description`; NFM generates its help entry
+  from the effective chord and description. `None` omits the entry. Hosts should
+  use `set_keybinding_help` only for additional hints, rather than repeating
+  descriptions already supplied on bindings.
 - Tab applies the first source completion at the query caret. The query displays
   no additional completion row, matching the Ghostty panel. Hosts can also use `completions` and `apply_completion`.
 

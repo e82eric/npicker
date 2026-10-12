@@ -14,7 +14,18 @@ use std::{
 };
 
 const PANEL_RADIUS: u8 = 8;
+const PANEL_MARGIN: egui::Margin = egui::Margin::symmetric(18, 10);
+const PANEL_BORDER: f32 = 1.0;
+const PANEL_INSET_BOTTOM: f32 = PANEL_MARGIN.bottom as f32 + PANEL_BORDER;
+const PANEL_FRAME_HEIGHT: f32 =
+    (PANEL_MARGIN.top as f32 + PANEL_MARGIN.bottom as f32) + 2.0 * PANEL_BORDER;
+const PANEL_FRAME_WIDTH: f32 =
+    (PANEL_MARGIN.left as f32 + PANEL_MARGIN.right as f32) + 2.0 * PANEL_BORDER;
 const DIVIDER_HEIGHT: f32 = 15.0;
+// Existing query sizing allowance, independent of the panel's margins.
+const QUERY_HEIGHT_ALLOWANCE: f32 = 4.0;
+const RESULTS_OVERHEAD: f32 = PANEL_FRAME_HEIGHT + DIVIDER_HEIGHT + QUERY_HEIGHT_ALLOWANCE;
+const PREVIEW_OVERHEAD: f32 = RESULTS_OVERHEAD + DIVIDER_HEIGHT;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Layout {
@@ -28,11 +39,63 @@ pub enum PickerTrigger {
     Key(Key),
     DoubleClick,
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PickerAction {
+    ToggleFullPane,
+    Custom(usize),
+}
 #[derive(Clone, Debug)]
 pub struct PickerBinding {
     pub trigger: PickerTrigger,
     pub modifiers: Modifiers,
-    pub action: usize,
+    pub action: PickerAction,
+    /// Omit to hide this binding from the help overlay.
+    pub description: Option<String>,
+}
+impl PickerBinding {
+    fn help_entry(&self) -> Option<(String, String)> {
+        Some((self.shortcut_label(), self.description.clone()?))
+    }
+    fn shortcut_label(&self) -> String {
+        let mut label = String::new();
+        for (enabled, prefix) in [
+            (self.modifiers.ctrl, "Ctrl+"),
+            (self.modifiers.shift, "Shift+"),
+            (self.modifiers.alt, "Alt+"),
+            (self.modifiers.mac_cmd, "Cmd+"),
+        ] {
+            if enabled {
+                label.push_str(prefix);
+            }
+        }
+        label.push_str(&match self.trigger {
+            PickerTrigger::Key(key) => format!("{key:?}"),
+            PickerTrigger::DoubleClick => "Double click".into(),
+        });
+        label
+    }
+}
+fn resolved_bindings(bindings: Vec<PickerBinding>) -> Vec<PickerBinding> {
+    let mut resolved = vec![PickerBinding {
+        trigger: PickerTrigger::Key(Key::F),
+        modifiers: Modifiers::CTRL | Modifiers::SHIFT,
+        action: PickerAction::ToggleFullPane,
+        description: Some("Toggle full-pane picker".into()),
+    }];
+    for binding in bindings {
+        if let Some(existing) = resolved.iter_mut().find(|existing| {
+            existing.trigger == binding.trigger
+                && same_binding_modifiers(existing.modifiers, binding.modifiers)
+        }) {
+            *existing = binding;
+        } else {
+            resolved.push(binding);
+        }
+    }
+    resolved
+}
+fn same_binding_modifiers(a: Modifiers, b: Modifiers) -> bool {
+    (a.ctrl, a.shift, a.alt, a.mac_cmd) == (b.ctrl, b.shift, b.alt, b.mac_cmd)
 }
 #[derive(Clone, Debug)]
 pub struct PickerConfig {
@@ -43,7 +106,7 @@ pub struct PickerConfig {
     pub result_rows: usize,
     /// Hosts can enable this for theme/action lists that accept a single click.
     pub accept_on_click: bool,
-    /// Custom interactions reported to the host without closing the picker.
+    /// Override shared defaults with built-in actions or host custom actions.
     pub bindings: Vec<PickerBinding>,
     pub preview_rows: usize,
     pub preview_visible: bool,
@@ -164,6 +227,7 @@ pub struct Picker<S: ItemsSource + Send + Sync + 'static> {
     copy_notice: String,
     preview_viewport: Option<crate::preview_copy::PreviewCopyMode>,
     preview_focus: bool,
+    placement_override: Option<crate::Position>,
     result_actions_enabled: bool,
     cursor_scroll_padding: u32,
 }
@@ -176,10 +240,11 @@ where
         id: impl egui::AsId,
         ctx: &Context,
         provider: Arc<P>,
-        config: PickerConfig,
+        mut config: PickerConfig,
     ) -> Self {
         let query = config.initial_query.clone();
         let query_cursor = query.len();
+        config.bindings = resolved_bindings(config.bindings);
         Self {
             id: Id::new(id),
             session: Session::new(provider, query.clone(), config.sort, ctx.clone()),
@@ -218,6 +283,7 @@ where
             copy_notice: "Copied".into(),
             preview_viewport: None,
             preview_focus: false,
+            placement_override: None,
             result_actions_enabled: true,
             cursor_scroll_padding: crate::copy_mode::SCROLL_PADDING_ROWS,
         }
@@ -503,7 +569,7 @@ where
                 ui.set_clip_rect(ui.clip_rect().intersect(bounds));
                 egui::Frame::new()
                     .fill(appearance.palette.background)
-                    .stroke(egui::Stroke::new(1.0, appearance.palette.divider))
+                    .stroke(egui::Stroke::new(PANEL_BORDER, appearance.palette.divider))
                     .corner_radius(8)
                     .inner_margin(egui::Margin::symmetric(12, 8))
                     .show(ui, |ui| {
@@ -705,6 +771,12 @@ where
         .into_iter()
         .map(|(key, description)| (key.into(), description.into()))
         .collect();
+        bindings.extend(
+            self.config
+                .bindings
+                .iter()
+                .filter_map(PickerBinding::help_entry),
+        );
         bindings.extend(self.additional_keybinding_help.clone());
         let row_height = appearance.typography.preview_row_height(ctx);
         let rect = bounds.intersect(ctx.content_rect()).shrink(12.0);
@@ -819,14 +891,37 @@ where
         self.session.set_wake_callback(callback);
     }
     pub fn set_bindings(&mut self, bindings: Vec<PickerBinding>) {
-        self.config.bindings = bindings;
+        self.config.bindings = resolved_bindings(bindings);
     }
-    fn double_click_action(&self) -> Option<usize> {
+    fn double_click_action(&self) -> Option<PickerAction> {
         self.config
             .bindings
             .iter()
             .find(|binding| binding.trigger == PickerTrigger::DoubleClick)
             .map(|binding| binding.action)
+    }
+    fn dispatch_binding(
+        &mut self,
+        action: PickerAction,
+        ctx: &Context,
+        configured: crate::Position,
+    ) -> Option<usize> {
+        match action {
+            PickerAction::Custom(id) => Some(id),
+            PickerAction::ToggleFullPane => {
+                self.placement_override = if self.placement_override.is_some() {
+                    None
+                } else {
+                    Some(if configured == crate::Position::FullPane {
+                        crate::Position::Center
+                    } else {
+                        crate::Position::FullPane
+                    })
+                };
+                self.reset_preview_layout(ctx);
+                None
+            }
+        }
     }
 
     pub fn selection(&self) -> Option<Selection<S::Item>> {
@@ -1376,7 +1471,7 @@ where
     fn show_mode(
         &mut self,
         ctx: &Context,
-        placement: Placement,
+        mut placement: Placement,
         appearance: &Appearance,
         interactive: bool,
     ) -> PickerOutput<S::Item> {
@@ -1423,7 +1518,7 @@ where
         } else {
             1
         };
-        let mut custom_action = None;
+        let mut binding_action = None;
         if interactive && !self.closed && focused && !self.keybinding_help_visible {
             ctx.input_mut(|input| {
                 let mut events = std::mem::take(&mut input.events).into_iter().peekable();
@@ -1431,17 +1526,7 @@ where
                     let binding = if let egui::Event::Key { key, modifiers, .. } = &event {
                         self.config.bindings.iter().find(|binding| {
                             binding.trigger == PickerTrigger::Key(*key)
-                                && (
-                                    binding.modifiers.ctrl,
-                                    binding.modifiers.shift,
-                                    binding.modifiers.alt,
-                                    binding.modifiers.mac_cmd,
-                                ) == (
-                                    modifiers.ctrl,
-                                    modifiers.shift,
-                                    modifiers.alt,
-                                    modifiers.mac_cmd,
-                                )
+                                && same_binding_modifiers(binding.modifiers, *modifiers)
                         })
                     } else {
                         None
@@ -1453,8 +1538,8 @@ where
                         else {
                             unreachable!()
                         };
-                        if pressed && !repeat && custom_action.is_none() {
-                            custom_action = Some(binding.action);
+                        if pressed && !repeat && binding_action.is_none() {
+                            binding_action = Some(binding.action);
                         }
                         if pressed && matches!(events.peek(), Some(egui::Event::Text(_))) {
                             events.next();
@@ -1465,6 +1550,8 @@ where
                 }
             });
         }
+        let custom_action = binding_action
+            .and_then(|action| self.dispatch_binding(action, ctx, placement.position));
         let mut preview_handled = false;
         if interactive && !self.closed && focused {
             if !self.keybinding_help_visible
@@ -1672,6 +1759,9 @@ where
                 });
             });
         }
+        if let Some(position) = self.placement_override {
+            placement.position = position;
+        }
         let row_height = appearance.typography.preview_row_height(ctx);
         let full_pane = placement.position == crate::Position::FullPane;
         let available = (placement.bounds.height()
@@ -1687,14 +1777,16 @@ where
             .and_then(|displayed| displayed.snapshot.header(&self.query));
         let header_height = if header.is_some() { row_height } else { 0.0 };
         self.visible_result_rows = self.config.result_rows.clamp(1, 256).min(
-            ((available - 56.0 - header_height) / row_height - 1.0)
+            ((available - PREVIEW_OVERHEAD - header_height) / row_height - 1.0)
                 .floor()
                 .max(1.0) as usize,
         );
         let preview_row_height = appearance.typography.preview_row_height(ctx);
-        let remaining =
-            (available - (self.visible_result_rows + 1) as f32 * row_height - 56.0 - header_height)
-                .max(0.0);
+        let remaining = (available
+            - (self.visible_result_rows + 1) as f32 * row_height
+            - PREVIEW_OVERHEAD
+            - header_height)
+            .max(0.0);
         self.preview_rect = None;
         self.preview_rendered = false;
         self.visible_preview_rows =
@@ -1708,6 +1800,15 @@ where
             } else {
                 0
             };
+        if full_pane && self.visible_preview_rows == 0 {
+            // The pane belongs to results when there is no visible preview.
+            // Reserve the query, divider, frame margins, and optional header.
+            self.visible_result_rows =
+                ((available - PANEL_FRAME_HEIGHT - DIVIDER_HEIGHT - header_height) / row_height
+                    - 1.0)
+                    .floor()
+                    .clamp(1.0, u16::MAX as f32) as usize;
+        }
         self.keep_selected_visible();
         let has_preview = self.visible_preview_rows > 0;
         if !has_preview {
@@ -1715,11 +1816,15 @@ where
         }
         let height = (self.visible_result_rows + 1) as f32 * row_height
             + self.visible_preview_rows as f32 * preview_row_height
-            + if has_preview { 56.0 } else { 41.0 }
+            + if has_preview {
+                PREVIEW_OVERHEAD
+            } else {
+                RESULTS_OVERHEAD
+            }
             + header_height;
         let rect = placement.rect(height);
         if has_preview {
-            self.refresh_preview((rect.width() - 38.0).max(1.0), appearance);
+            self.refresh_preview((rect.width() - PANEL_FRAME_WIDTH).max(1.0), appearance);
         }
         if !self.closed && rect.is_positive() {
             let previous_size =
@@ -1737,13 +1842,13 @@ where
                     ui.set_clip_rect(rect.intersect(placement.bounds).intersect(ui.clip_rect()));
                     egui::Frame::new()
                         .fill(appearance.palette.background)
-                        .stroke(egui::Stroke::new(1.0, appearance.palette.divider))
+                        .stroke(egui::Stroke::new(PANEL_BORDER, appearance.palette.divider))
                         .corner_radius(PANEL_RADIUS)
-                        .inner_margin(egui::Margin::symmetric(18, 10))
+                        .inner_margin(PANEL_MARGIN)
                         .show(ui, |ui| {
-                            ui.set_width((rect.width() - 38.0).max(1.0));
+                            ui.set_width((rect.width() - PANEL_FRAME_WIDTH).max(1.0));
                             if full_pane {
-                                ui.set_min_height((rect.height() - 22.0).max(0.0));
+                                ui.set_min_height((rect.height() - PANEL_FRAME_HEIGHT).max(0.0));
                             }
                             ui.spacing_mut().item_spacing.y = 0.0;
                             ui.visuals_mut().override_text_color = Some(appearance.palette.text);
@@ -1760,6 +1865,18 @@ where
                             if has_preview {
                                 self.preview_ui(ui, appearance);
                                 divider(ui, appearance);
+                            }
+                            if full_pane && self.config.layout == Layout::QueryBottom {
+                                // Keep results next to the bottom query. Any
+                                // unused pane height belongs above this block.
+                                let block_height = header_height
+                                    + (self.visible_result_rows + 1) as f32 * row_height
+                                    + DIVIDER_HEIGHT;
+                                let gap = rect.bottom()
+                                    - PANEL_INSET_BOTTOM
+                                    - ui.cursor().top()
+                                    - block_height;
+                                ui.add_space(gap.max(0.0));
                             }
                             if let Some(header) = &header {
                                 let (rect, _) = ui.allocate_exact_size(
@@ -1828,7 +1945,9 @@ where
         {
             if double_click {
                 if let Some(action) = self.double_click_action() {
-                    event = Some(PickerEvent::CustomAction { action, selection });
+                    if let Some(action) = self.dispatch_binding(action, ctx, placement.position) {
+                        event = Some(PickerEvent::CustomAction { action, selection });
+                    }
                 }
             } else if accept {
                 event = Some(PickerEvent::Accepted(selection));
@@ -2005,6 +2124,216 @@ mod query_parity_tests {
             assert!(Instant::now() < deadline);
             std::thread::sleep(Duration::from_millis(2));
         }
+    }
+
+    #[test]
+    fn full_pane_shortcut_retains_selection_restores_placement_and_resets_copy() {
+        let (ctx, mut picker) = make();
+        picker.set_query("a");
+        wait(&mut picker);
+        picker.config.preview_visible = true;
+        picker.set_external_preview(true);
+        picker.set_external_preview_document(Some(Ok(Preview::Text("preview".into()))), false);
+        draw(&ctx, &mut picker, vec![]);
+        picker.toggle_preview_focus(&ctx);
+        let selected = picker.selection().unwrap().index;
+        let shortcut = || modified_key(Key::F, Modifiers::CTRL | Modifiers::SHIFT);
+        draw(
+            &ctx,
+            &mut picker,
+            vec![shortcut(), egui::Event::Text("F".into())],
+        );
+        assert_eq!(picker.placement_override, Some(crate::Position::FullPane));
+        assert_eq!(picker.query(), "a");
+        assert_eq!(picker.selection().unwrap().index, selected);
+        assert!(!picker.preview_focused());
+        assert!(picker.preview_viewport.is_none());
+        let mut repeat = shortcut();
+        if let egui::Event::Key { repeat, .. } = &mut repeat {
+            *repeat = true;
+        }
+        draw(&ctx, &mut picker, vec![repeat]);
+        assert_eq!(picker.placement_override, Some(crate::Position::FullPane));
+        let mut release = shortcut();
+        if let egui::Event::Key { pressed, .. } = &mut release {
+            *pressed = false;
+        }
+        draw(&ctx, &mut picker, vec![release]);
+        draw(&ctx, &mut picker, vec![shortcut()]);
+        assert_eq!(picker.placement_override, None);
+        assert_eq!(picker.selection().unwrap().index, selected);
+    }
+
+    #[test]
+    fn full_pane_shortcut_restores_host_geometry_including_full_pane_default() {
+        for configured in [crate::Position::Cursor, crate::Position::FullPane] {
+            let (ctx, mut picker) = make();
+            wait(&mut picker);
+            picker.set_external_preview(true);
+            let bounds =
+                egui::Rect::from_min_size(egui::pos2(20.0, 30.0), egui::vec2(800.0, 700.0));
+            let mut placement = Placement::new(bounds);
+            placement.position = configured;
+            placement.width = 400.0;
+            placement.anchor = Some(egui::pos2(100.0, 150.0));
+            let mut original = None;
+            for step in 0..5 {
+                let events = if step == 1 || step == 3 {
+                    vec![modified_key(Key::F, Modifiers::CTRL | Modifiers::SHIFT)]
+                } else if step == 2 {
+                    let mut release = modified_key(Key::F, Modifiers::CTRL | Modifiers::SHIFT);
+                    if let egui::Event::Key { pressed, .. } = &mut release {
+                        *pressed = false;
+                    }
+                    vec![release]
+                } else {
+                    vec![]
+                };
+                ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(1000.0, 900.0),
+                        )),
+                        events,
+                        ..Default::default()
+                    },
+                    |ui| {
+                        let output =
+                            picker.show(ui.ctx(), placement, &Appearance::default(), false);
+                        if step == 0 {
+                            original = Some(output.rect);
+                        }
+                        if step == 1 {
+                            if configured == crate::Position::FullPane {
+                                assert_ne!(output.rect, bounds);
+                            } else {
+                                assert_eq!(output.rect, bounds);
+                            }
+                        }
+                        if step >= 3 {
+                            assert_eq!(output.rect, original.unwrap());
+                        }
+                    },
+                )
+                .drop_without_applying_deltas();
+            }
+        }
+    }
+
+    #[test]
+    fn binding_help_uses_effective_descriptions_for_builtin_and_custom_actions() {
+        let bindings = resolved_bindings(vec![
+            PickerBinding {
+                trigger: PickerTrigger::Key(Key::F),
+                modifiers: Modifiers::CTRL | Modifiers::SHIFT,
+                action: PickerAction::Custom(5),
+                description: Some("Custom command".into()),
+            },
+            PickerBinding {
+                trigger: PickerTrigger::DoubleClick,
+                modifiers: Modifiers::ALT,
+                action: PickerAction::Custom(6),
+                description: Some("Open clicked item".into()),
+            },
+            PickerBinding {
+                trigger: PickerTrigger::Key(Key::G),
+                modifiers: Modifiers::CTRL,
+                action: PickerAction::ToggleFullPane,
+                description: None,
+            },
+        ]);
+        let help: Vec<_> = bindings
+            .iter()
+            .filter_map(PickerBinding::help_entry)
+            .collect();
+        assert_eq!(
+            help,
+            vec![
+                ("Ctrl+Shift+F".into(), "Custom command".into()),
+                ("Alt+Double click".into(), "Open clicked item".into()),
+            ]
+        );
+        let default = resolved_bindings(Vec::new());
+        assert_eq!(
+            default[0].help_entry(),
+            Some(("Ctrl+Shift+F".into(), "Toggle full-pane picker".into()))
+        );
+    }
+
+    #[test]
+    fn binding_updates_merge_defaults_replace_chords_and_allow_builtin_remapping() {
+        let (ctx, mut picker) = make();
+        wait(&mut picker);
+        picker.set_external_preview(true);
+        for _ in 0..3 {
+            picker.set_bindings(Vec::new());
+        }
+        assert_eq!(picker.config.bindings.len(), 1);
+        assert_eq!(
+            picker.config.bindings[0].action,
+            PickerAction::ToggleFullPane
+        );
+        let mut modifiers = Modifiers::CTRL | Modifiers::SHIFT;
+        modifiers.command = true;
+        picker.set_bindings(vec![
+            PickerBinding {
+                trigger: PickerTrigger::Key(Key::F),
+                modifiers,
+                action: PickerAction::Custom(1),
+                description: None,
+            },
+            PickerBinding {
+                trigger: PickerTrigger::Key(Key::F),
+                modifiers,
+                action: PickerAction::Custom(2),
+                description: None,
+            },
+            PickerBinding {
+                trigger: PickerTrigger::Key(Key::G),
+                modifiers: Modifiers::CTRL,
+                action: PickerAction::ToggleFullPane,
+                description: None,
+            },
+        ]);
+        assert_eq!(picker.config.bindings.len(), 2);
+        assert_eq!(picker.config.bindings[0].action, PickerAction::Custom(2));
+        draw(
+            &ctx,
+            &mut picker,
+            vec![modified_key(Key::G, Modifiers::CTRL)],
+        );
+        assert_eq!(picker.placement_override, Some(crate::Position::FullPane));
+    }
+
+    #[test]
+    fn full_pane_shortcut_works_without_preview_and_respects_custom_binding() {
+        let (ctx, mut picker) = make();
+        wait(&mut picker);
+        let shortcut = || modified_key(Key::F, Modifiers::CTRL | Modifiers::SHIFT);
+        let selected = picker.selection().unwrap().index;
+        assert!(picker.preview.is_none() && !picker.external_preview);
+        draw(&ctx, &mut picker, vec![shortcut()]);
+        assert_eq!(picker.placement_override, Some(crate::Position::FullPane));
+        assert_eq!(picker.selection().unwrap().index, selected);
+        assert!(picker.visible_result_rows > picker.config.result_rows);
+        let mut release = shortcut();
+        if let egui::Event::Key { pressed, .. } = &mut release {
+            *pressed = false;
+        }
+        draw(&ctx, &mut picker, vec![release]);
+        picker.set_bindings(vec![PickerBinding {
+            trigger: PickerTrigger::Key(Key::F),
+            modifiers: Modifiers::CTRL | Modifiers::SHIFT,
+            action: PickerAction::Custom(42),
+            description: None,
+        }]);
+        let (_, event) = draw(&ctx, &mut picker, vec![shortcut()]);
+        assert!(matches!(
+            event,
+            Some(PickerEvent::CustomAction { action: 42, .. })
+        ));
+        assert_eq!(picker.placement_override, Some(crate::Position::FullPane));
     }
 
     #[test]
@@ -3715,7 +4044,13 @@ mod extension_tests {
         picker.set_external_preview(true);
         let appearance = Appearance::default();
         let mut previous_rows = 0;
-        for (height, visible) in [(600.0, true), (900.0, true), (900.0, false), (150.0, true)] {
+        for (height, visible) in [
+            (600.0, true),
+            (900.0, true),
+            (900.0, false),
+            (600.0, true),
+            (150.0, true),
+        ] {
             picker.config.preview_visible = visible;
             let bounds =
                 egui::Rect::from_min_size(egui::pos2(30.0, 40.0), egui::vec2(800.0, height));
@@ -3732,18 +4067,33 @@ mod extension_tests {
                 |ui| {
                     let result = picker.show(ui.ctx(), placement, &appearance, false);
                     assert_eq!(result.rect, bounds);
+                    assert!(
+                        (picker.query_rect.bottom() - (bounds.bottom() - PANEL_INSET_BOTTOM)).abs()
+                            < 1.0,
+                        "query must stay at the bottom with preview visible or hidden: {:?}",
+                        picker.query_rect
+                    );
                     if height >= 600.0 {
-                        assert_eq!(picker.visible_result_rows, 5);
                         if visible {
+                            assert_eq!(picker.visible_result_rows, 5);
                             let row_height = appearance.typography.preview_row_height(ui.ctx());
-                            let expected =
-                                ((height - 6.0 * row_height - 56.0) / row_height).floor() as usize;
+                            let expected = ((height - 6.0 * row_height - PREVIEW_OVERHEAD)
+                                / row_height)
+                                .floor() as usize;
                             assert_eq!(picker.visible_preview_rows, expected);
-                            assert!(picker.visible_preview_rows > previous_rows);
+                            if height == 900.0 {
+                                assert!(picker.visible_preview_rows > previous_rows);
+                            }
                             let preview = result.preview_rect.unwrap();
                             assert!(bounds.contains_rect(preview));
                             assert!((preview.height() - expected as f32 * row_height).abs() < 1.0);
                         } else {
+                            let row_height = appearance.typography.preview_row_height(ui.ctx());
+                            let expected =
+                                ((height - PANEL_FRAME_HEIGHT - DIVIDER_HEIGHT) / row_height - 1.0)
+                                    .floor() as usize;
+                            assert_eq!(picker.visible_result_rows, expected);
+                            assert!(picker.visible_result_rows > 5);
                             assert_eq!(picker.visible_preview_rows, 0);
                             assert!(result.preview_rect.is_none());
                         }
