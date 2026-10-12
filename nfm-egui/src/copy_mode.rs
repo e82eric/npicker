@@ -526,6 +526,15 @@ pub struct CopySelection {
     pub rectangle: bool,
 }
 
+/// A selection whose original text remains exact after layout changes.
+#[derive(Clone)]
+struct ReflowSelection {
+    ranges: Vec<CellRange>,
+    text: String,
+    cursor: CellPosition,
+    anchor: CellPosition,
+}
+
 #[derive(Clone, Default)]
 pub struct CopyMode {
     scroll_padding: Option<u32>,
@@ -548,6 +557,7 @@ pub struct CopyMode {
     yank_highlight: Option<YankHighlight>,
     pub last_jump: Option<Jump>,
     search: crate::document_search::SearchSession,
+    reflow_selection: Option<ReflowSelection>,
 }
 
 impl CopyMode {
@@ -579,6 +589,55 @@ impl CopyMode {
         self.yank_highlight = None;
         self.last_jump = None;
         self.search = crate::document_search::SearchSession::default();
+        self.reflow_selection = None;
+    }
+
+    /// Commit caller-translated positions after a document reflow.
+    /// Derived search, preferred columns, pending input, and yank flashes reset.
+    pub fn apply_reflow(
+        &mut self,
+        view: View,
+        cursor: CellPosition,
+        anchor: Option<CellPosition>,
+        ranges: Vec<CellRange>,
+        text: Option<String>,
+    ) {
+        self.cursor = cursor;
+        self.visual_anchor = anchor;
+        self.columns = view.columns;
+        self.rows = view.total_rows;
+        self.preferred_x = cursor.x;
+        self.preferred_logical_x = None;
+        self.pending_g = false;
+        self.pending_z = false;
+        self.pending_count = None;
+        self.pending_jump = None;
+        self.pending_yank = None;
+        self.pending_visual_object = None;
+        self.yank_highlight = None;
+        self.search = crate::document_search::SearchSession::default();
+        self.reflow_selection = anchor.zip(text).map(|(anchor, text)| ReflowSelection {
+            ranges,
+            text,
+            cursor,
+            anchor,
+        });
+    }
+
+    fn retained_selection(&self) -> Option<&ReflowSelection> {
+        self.reflow_selection.as_ref().filter(|selection| {
+            selection.cursor == self.cursor && Some(selection.anchor) == self.visual_anchor
+        })
+    }
+
+    pub fn reflow_selection_ranges(&self) -> Option<&[CellRange]> {
+        self.retained_selection()
+            .map(|selection| selection.ranges.as_slice())
+    }
+
+    pub fn reflow_selection_text(&self) -> Option<&str> {
+        self.retained_selection()
+            .map(|selection| selection.text.as_str())
     }
 
     /// Adopt existing newest-first ranges through [`crate::document_search::SearchSession::adopt_search`].
@@ -699,6 +758,26 @@ impl CopyMode {
         cursor: CellPosition,
         read: impl FnMut(u64) -> Option<TextRow>,
     ) -> Option<CopySelection> {
+        if cursor == self.cursor
+            && let Some(selection) = self.retained_selection()
+        {
+            let start = selection
+                .ranges
+                .iter()
+                .map(|r| r.start)
+                .min_by_key(|p| (p.y, p.x))?;
+            let end = selection
+                .ranges
+                .iter()
+                .map(|r| r.end)
+                .max_by_key(|p| (p.y, p.x))?;
+            return Some(CopySelection {
+                range: CellRange { start, end },
+                linewise: self.visual_mode == VisualMode::Linewise,
+                trim: self.visual_trim,
+                rectangle: false,
+            });
+        }
         let range = match self.visual_mode {
             VisualMode::Characterwise => self.visual_range_to(cursor),
             VisualMode::Linewise => self.linewise_visual_range_to(cursor, read),
@@ -851,6 +930,10 @@ impl CopyMode {
     }
 
     pub fn moved(&mut self, motion: Motion, cell: CellPosition) {
+        if cell != self.cursor && self.reflow_selection.take().is_some() {
+            // Further movement starts an ordinary selection in the new layout.
+            self.visual_mode = VisualMode::Characterwise;
+        }
         self.preferred_logical_x = None;
         self.cursor = cell;
         if matches!(motion, Motion::Left | Motion::Right | Motion::RowStart) || motion.needs_text()
@@ -898,6 +981,7 @@ impl CopyMode {
     }
 
     pub fn toggle_visual(&mut self, mode: VisualMode) {
+        self.reflow_selection = None;
         self.pending_visual_object = None;
         self.visual_trim = true;
         if self.visual_anchor.is_some() && self.visual_mode == mode {
@@ -918,11 +1002,15 @@ impl CopyMode {
         self.cursor = anchor;
         self.preferred_x = anchor.x;
         self.preferred_logical_x = None;
+        if let Some(selection) = &mut self.reflow_selection {
+            selection.cursor = self.cursor;
+            selection.anchor = self.visual_anchor.unwrap();
+        }
         true
     }
 
     pub fn swap_visual_horizontal_endpoint(&mut self) -> bool {
-        if self.visual_mode != VisualMode::Blockwise {
+        if self.reflow_selection.is_some() || self.visual_mode != VisualMode::Blockwise {
             return self.swap_visual_endpoint();
         }
         let Some(anchor) = self.visual_anchor.as_mut() else {
@@ -2415,6 +2503,7 @@ impl CopyMode {
             if !self.search.matches.is_empty() {
                 let cancel_pending = self.search.waiting;
                 self.search = crate::document_search::SearchSession::default();
+                self.reflow_selection = None;
                 return CopyAction::ClearSearch { cancel_pending };
             }
             return CopyAction::Exit;

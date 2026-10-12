@@ -69,6 +69,9 @@ pub struct CopyUpdate {
     /// An explicit physical row offset. Hosts should publish this together with
     /// decorations so movement cannot briefly expose an undecorated viewport.
     pub viewport_top: Option<u64>,
+    /// Cursor-driven reveal. Reflowing hosts translate the full document cell
+    /// instead of using viewport_top, which assumes the document's row layout.
+    pub reveal: Option<CellPosition>,
     pub effects: Vec<CopyEffect>,
     pub repaint_after: Option<Duration>,
 }
@@ -184,7 +187,11 @@ impl<'a, D: CopyNavigationDocument + ?Sized> CopyController<'a, D> {
                     .visual_selection_to(self.mode.cursor, |y| self.row(y));
                 check(&self.error)?;
                 if let Some(selection) = selection {
-                    self.yank(selection, &mut update)?;
+                    if let Some(text) = self.mode.reflow_selection_text().map(str::to_owned) {
+                        self.yank_text(selection, text, &mut update);
+                    } else {
+                        self.yank(selection, &mut update)?;
+                    }
                     self.mode.visual_anchor = None;
                 }
             }
@@ -339,6 +346,7 @@ impl<'a, D: CopyNavigationDocument + ?Sized> CopyController<'a, D> {
     }
     fn reveal(&self, update: &mut CopyUpdate) {
         update.changed = true;
+        update.reveal = Some(self.mode.cursor);
         update.viewport_top = Some(revealed_viewport_top(
             self.mode.cursor,
             self.view,
@@ -417,6 +425,10 @@ impl<'a, D: CopyNavigationDocument + ?Sized> CopyController<'a, D> {
     }
     fn yank(&mut self, selection: CopySelection, update: &mut CopyUpdate) -> Result<(), String> {
         let text = self.document.selection_text(&selection)?;
+        self.yank_text(selection, text, update);
+        Ok(())
+    }
+    fn yank_text(&mut self, selection: CopySelection, text: String, update: &mut CopyUpdate) {
         if selection.rectangle {
             self.mode
                 .highlight_rectangle_yank(selection.range, Instant::now());
@@ -428,7 +440,6 @@ impl<'a, D: CopyNavigationDocument + ?Sized> CopyController<'a, D> {
         update
             .effects
             .push(CopyEffect::CopyText { text, selection });
-        Ok(())
     }
 }
 
@@ -562,7 +573,27 @@ mod tests {
         let update = controller.input(&key(egui::Key::J)).unwrap();
         assert!(update.changed);
         assert_eq!(update.viewport_top, Some(1));
+        assert_eq!(update.reveal, Some(CellPosition { x: 1, y: 2 }));
         assert_eq!(mode.cursor, CellPosition { x: 1, y: 2 });
+    }
+    #[test]
+    fn horizontal_navigation_reveals_full_cell_but_positioning_remains_row_only() {
+        let doc = document(&[("abcdefgh", false)]);
+        let (mut mode, view) = start(1, CellPosition { x: 0, y: 0 });
+        let mut controller = CopyController::new(&mut mode, &doc, view);
+        let update = controller
+            .execute(CopyAction::Motion {
+                motion: Motion::LastNonblank,
+                count: 1,
+                explicit_count: false,
+            })
+            .unwrap();
+        assert_eq!(update.reveal, Some(CellPosition { x: 7, y: 0 }));
+        let update = controller
+            .execute(CopyAction::Position(ViewportPosition::Center))
+            .unwrap();
+        assert!(update.viewport_top.is_some());
+        assert!(update.reveal.is_none());
     }
     #[test]
     fn visual_yank_copies_before_clearing_selection_and_retains_flash() {
@@ -581,6 +612,87 @@ mod tests {
         assert!(mode.visual_anchor.is_none());
         assert_eq!(mode.yank_highlight_range(), Some(selection.range));
         assert_eq!(update.repaint_after, Some(YANK_HIGHLIGHT_DURATION));
+    }
+
+    #[test]
+    fn reflowed_visual_selections_keep_exact_text_through_repeated_resize_and_yank() {
+        for visual_mode in [
+            VisualMode::Characterwise,
+            VisualMode::Linewise,
+            VisualMode::Blockwise,
+        ] {
+            let (mut mode, mut view) = start(4, CellPosition { x: 1, y: 0 });
+            mode.toggle_visual(visual_mode);
+            let original = "界e\u{301}  \nkl  \n";
+            for columns in [4, 16, 6] {
+                view.columns = columns;
+                view.total_rows = 8;
+                let ranges = vec![
+                    CellRange {
+                        start: CellPosition { x: 0, y: 1 },
+                        end: CellPosition { x: 2, y: 2 },
+                    },
+                    CellRange {
+                        start: CellPosition { x: 1, y: 4 },
+                        end: CellPosition { x: 3, y: 4 },
+                    },
+                ];
+                let text = mode.reflow_selection_text().unwrap_or(original).to_owned();
+                mode.apply_reflow(
+                    view,
+                    ranges[1].end,
+                    Some(ranges[0].start),
+                    ranges.clone(),
+                    Some(text),
+                );
+                assert_eq!(mode.reflow_selection_text(), Some(original));
+                assert_eq!(mode.reflow_selection_ranges(), Some(ranges.as_slice()));
+                assert_eq!(mode.total_rows(), 8);
+            }
+            assert!(mode.swap_visual_endpoint());
+            assert_eq!(mode.reflow_selection_text(), Some(original));
+            // The old rectangle is no longer expressible by two corners. Copy
+            // must use the captured selection text rather than its bounding box.
+            let mut doc = document(&[("unrelated", false); 8]);
+            doc.fail_copy = true;
+            let update = CopyController::new(&mut mode, &doc, view)
+                .execute(CopyAction::YankVisual)
+                .unwrap();
+            let CopyEffect::CopyText { text, .. } = &update.effects[0] else {
+                panic!("expected copy");
+            };
+            assert_eq!(text, original);
+            assert!(mode.reflow_selection_text().is_none());
+        }
+    }
+
+    #[test]
+    fn motion_after_reflow_updates_selection_in_the_new_layout() {
+        let (mut mode, view) = start(2, CellPosition { x: 1, y: 0 });
+        mode.toggle_visual(VisualMode::Blockwise);
+        mode.apply_reflow(
+            view,
+            CellPosition { x: 3, y: 0 },
+            Some(CellPosition { x: 1, y: 0 }),
+            vec![CellRange {
+                start: CellPosition { x: 1, y: 0 },
+                end: CellPosition { x: 3, y: 0 },
+            }],
+            Some("old text".into()),
+        );
+        mode.moved(Motion::Right, mode.cursor);
+        assert_eq!(mode.reflow_selection_text(), Some("old text"));
+        mode.moved(Motion::Right, CellPosition { x: 4, y: 0 });
+        assert!(mode.reflow_selection_text().is_none());
+        assert_eq!(mode.visual_mode, VisualMode::Characterwise);
+        let doc = document(&[("abcdefgh", false), ("next", false)]);
+        let update = CopyController::new(&mut mode, &doc, view)
+            .execute(CopyAction::YankVisual)
+            .unwrap();
+        let CopyEffect::CopyText { text, .. } = &update.effects[0] else {
+            panic!("expected copy");
+        };
+        assert_eq!(text, "bcde");
     }
     #[test]
     fn failed_reads_and_copy_do_not_become_successful_empty_yanks() {

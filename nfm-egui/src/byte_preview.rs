@@ -20,8 +20,43 @@ pub struct BytePage {
 }
 pub type PageReader = dyn Fn(PageRequest, Cancellation) -> Result<BytePage, String> + Send + Sync;
 
+/// Provider-defined immutable document coordinates, independent of layout width.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StablePosition {
+    pub row_id: u64,
+    pub cell_offset: u32,
+}
+#[derive(Clone, Copy, Debug)]
+pub enum PageOrigin {
+    Row(usize),
+    /// A row in the provider's previous layout (e.g. scrolled in copy mode).
+    PreviousRow(usize),
+    Anchor(StablePosition),
+    Center(StablePosition),
+}
+#[derive(Clone, Copy, Debug)]
+pub struct ReflowRequest {
+    pub origin: PageOrigin,
+    pub columns: u16,
+    pub rows: u16,
+}
+pub struct ReflowPage {
+    pub page: BytePage,
+    pub total_rows: usize,
+    pub top: StablePosition,
+    /// Highlight translated into the returned layout's physical coordinates.
+    pub highlight: Option<Highlight>,
+}
+pub type ReflowReader =
+    dyn Fn(ReflowRequest, Cancellation) -> Result<ReflowPage, String> + Send + Sync;
+
 pub enum ByteSource {
     Complete(Arc<[u8]>),
+    /// A width-aware document; each response contains only the requested page.
+    Reflowable {
+        center: Option<StablePosition>,
+        read: Arc<ReflowReader>,
+    },
     /// Immutable snapshot metadata. The callback owns its data or an explicitly
     /// closable host lease; cancellation alone does not extend pointer lifetime.
     Paged {
@@ -65,6 +100,7 @@ struct Cached {
     initialized: bool,
     ansi: Option<Arc<Mutex<nfm_preview_vt::AnsiDocument>>>,
     frozen_columns: Option<u16>,
+    reflow_top: Option<(u16, usize, StablePosition)>,
 }
 
 /// Install with `Picker::set_preview_provider`. The resolver runs on the NFM
@@ -212,6 +248,7 @@ impl<T: Clone + Send + 'static> PreviewProvider<T> for BytePreviewProvider<T> {
                 initialized: false,
                 ansi: None,
                 frozen_columns: None,
+                reflow_top: None,
             });
         }
         let cached = cache.as_mut().unwrap();
@@ -223,7 +260,47 @@ impl<T: Clone + Send + 'static> PreviewProvider<T> for BytePreviewProvider<T> {
         };
         let requested = center.map_or(request.scroll_offset, |row| row.saturating_sub(rows / 2));
         let display_columns = request.columns;
+        let mut highlight = cached.document.highlight;
+        let mut reflow_top = None;
         let (mut document, first_row) = match &cached.document.source {
+            ByteSource::Reflowable { center, read } => {
+                let origin = if !cached.initialized || request.initial_page {
+                    center.map_or(PageOrigin::Row(request.scroll_offset), PageOrigin::Center)
+                } else if let Some((columns, first, top)) = cached.reflow_top {
+                    if columns != request.columns && first == request.scroll_offset {
+                        PageOrigin::Anchor(top)
+                    } else if columns != request.columns {
+                        PageOrigin::PreviousRow(request.scroll_offset)
+                    } else {
+                        PageOrigin::Row(request.scroll_offset)
+                    }
+                } else {
+                    PageOrigin::Row(request.scroll_offset)
+                };
+                let page = read(
+                    ReflowRequest {
+                        origin,
+                        columns: request.columns,
+                        rows: request.rows,
+                    },
+                    cancel.clone(),
+                )?;
+                if cancel.is_cancelled() {
+                    return Err("preview cancelled".into());
+                }
+                if page.total_rows == 0 || page.page.first_row >= page.total_rows {
+                    return Err("Invalid reflow page bounds".into());
+                }
+                highlight = page.highlight;
+                reflow_top = Some((request.columns, page.page.first_row, page.top));
+                request.scroll_offset = 0;
+                let mut document =
+                    parse_ansi(&normalize(&page.page.bytes, self.max_bytes)?, &request)?;
+                if let Preview::Grid { total_rows, .. } = &mut document {
+                    *total_rows = page.total_rows;
+                }
+                (document, page.page.first_row)
+            }
             ByteSource::Complete(bytes) => {
                 let columns = cached.frozen_columns.unwrap_or(request.columns);
                 if cached
@@ -310,7 +387,6 @@ impl<T: Clone + Send + 'static> PreviewProvider<T> for BytePreviewProvider<T> {
         if let Preview::Grid { columns, cells, .. } = &mut document {
             let source_width = *columns;
             let width = source_width.min(usize::from(display_columns));
-            let highlight = cached.document.highlight;
             *cells = cells
                 .chunks(source_width)
                 .enumerate()
@@ -337,6 +413,7 @@ impl<T: Clone + Send + 'static> PreviewProvider<T> for BytePreviewProvider<T> {
             *columns = width;
         }
         cached.initialized = true;
+        cached.reflow_top = reflow_top;
         Ok(PreviewViewport {
             document,
             first_row,
@@ -348,6 +425,137 @@ impl<T: Clone + Send + 'static> PreviewProvider<T> for BytePreviewProvider<T> {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    #[test]
+    fn reflow_pages_preserve_stable_top_highlights_and_scroll_after_resize() {
+        let origins = Arc::new(Mutex::new(Vec::new()));
+        let seen = origins.clone();
+        let provider = BytePreviewProvider::new(move |_: &Selection<()>, _| {
+            let seen = seen.clone();
+            Ok(ByteDocument {
+                source: ByteSource::Reflowable {
+                    center: Some(StablePosition {
+                        row_id: 42,
+                        cell_offset: 3,
+                    }),
+                    read: Arc::new(move |request, _| {
+                        seen.lock().unwrap().push(request.origin);
+                        let first = match request.origin {
+                            PageOrigin::Center(p) => {
+                                assert_eq!(p.row_id, 42);
+                                40
+                            }
+                            PageOrigin::Anchor(p) => {
+                                assert_eq!(p.row_id, 39);
+                                20
+                            }
+                            PageOrigin::Row(row) | PageOrigin::PreviousRow(row) => row,
+                        };
+                        Ok(ReflowPage {
+                            page: BytePage {
+                                bytes: b"\x1b[31mabcd\r\nefgh".to_vec(),
+                                first_row: first,
+                            },
+                            total_rows: if request.columns == 4 { 100 } else { 50 },
+                            top: StablePosition {
+                                row_id: 39,
+                                cell_offset: 0,
+                            },
+                            highlight: Some(Highlight {
+                                start: CellPosition {
+                                    row: first,
+                                    column: 1,
+                                },
+                                end: CellPosition {
+                                    row: first + 1,
+                                    column: 2,
+                                },
+                                background: Color32::BLUE,
+                            }),
+                        })
+                    }),
+                },
+                center_row: None,
+                highlight: None,
+            })
+        });
+        let page = provider
+            .preview_viewport(request(0, 0, 4, 2), Cancellation::test())
+            .unwrap();
+        assert_eq!(page.first_row, 40);
+        let Preview::Grid {
+            columns,
+            cells,
+            total_rows,
+        } = page.document
+        else {
+            panic!("expected grid")
+        };
+        assert_eq!((columns, total_rows), (4, 100));
+        assert_eq!(cells[1].background, Color32::BLUE);
+        assert_eq!(cells[0].foreground, cells[1].foreground);
+        let page = provider
+            .preview_viewport(request(0, 40, 8, 2), Cancellation::test())
+            .unwrap();
+        assert_eq!(page.first_row, 20);
+        provider
+            .preview_viewport(request(0, 23, 8, 2), Cancellation::test())
+            .unwrap();
+        provider
+            .preview_viewport(request(0, 30, 4, 2), Cancellation::test())
+            .unwrap();
+        let origins = origins.lock().unwrap();
+        assert!(matches!(origins[0], PageOrigin::Center(_)));
+        assert!(matches!(origins[1], PageOrigin::Anchor(_)));
+        assert!(matches!(origins[2], PageOrigin::Row(23)));
+        assert!(matches!(origins[3], PageOrigin::PreviousRow(30)));
+    }
+
+    #[test]
+    fn cancelled_reflow_page_does_not_replace_stable_anchor() {
+        let provider = BytePreviewProvider::new(|_: &Selection<()>, _| {
+            Ok(ByteDocument {
+                source: ByteSource::Reflowable {
+                    center: None,
+                    read: Arc::new(|request, cancel| {
+                        if request.columns == 8 {
+                            cancel.cancel_for_test();
+                        }
+                        if request.columns == 12 {
+                            assert!(matches!(
+                                request.origin,
+                                PageOrigin::Anchor(StablePosition { row_id: 7, .. })
+                            ));
+                        }
+                        Ok(ReflowPage {
+                            page: BytePage {
+                                bytes: b"abc".to_vec(),
+                                first_row: 4,
+                            },
+                            total_rows: 30,
+                            top: StablePosition {
+                                row_id: if request.columns == 8 { 99 } else { 7 },
+                                cell_offset: 0,
+                            },
+                            highlight: None,
+                        })
+                    }),
+                },
+                center_row: None,
+                highlight: None,
+            })
+        });
+        provider
+            .preview_viewport(request(0, 4, 4, 2), Cancellation::test())
+            .unwrap();
+        assert!(
+            provider
+                .preview_viewport(request(0, 4, 8, 2), Cancellation::test())
+                .is_err()
+        );
+        provider
+            .preview_viewport(request(0, 4, 12, 2), Cancellation::test())
+            .unwrap();
+    }
     #[test]
     fn normalization_uses_configured_input_limit_and_allows_crlf_expansion() {
         assert_eq!(normalize(b"a\nb\n", 4).unwrap(), b"a\r\nb\r\n");

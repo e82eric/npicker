@@ -263,6 +263,15 @@ Install `byte_preview::BytePreviewProvider` with
   for only the requested physical rows. Return `BytePage { bytes, first_row }`;
   the actual origin may differ from the request. Each page must establish its
   own ANSI styles and preserve the source's physical row boundaries.
+- `ByteSource::Reflowable { center, read }` supports width-dependent host
+  layouts. `read(ReflowRequest, Cancellation)` returns a `ReflowPage` containing
+  bounded ANSI bytes, the actual first row and total layout rows, a stable top
+  position, and an optional highlight in the new layout's coordinates.
+  `StablePosition { row_id, cell_offset }` has provider-defined meaning and must
+  survive width changes. `PageOrigin` requests a physical row, stable anchor,
+  centered stable position, or a row in the previous layout. NFM preserves the
+  top anchor on resize; providers translate previous rows before reflowing.
+  Keep soft wraps distinct from hard newlines when building the layout.
 
 `ByteDocument.center_row` centers the initial page on a selected row.
 `highlight` uses inclusive document row/column coordinates. NFM owns half-page
@@ -426,3 +435,24 @@ constructors. Pass `into_picker()` from the previous workflow to switch types;
 the specialized components supply their own shared adapters, previews, and actions.
 Native windows, event loops, focus policy, and selection actions remain host-owned.
 The generic sharing layer adds no native-enumeration or specialized-picker dependency.
+
+## Compact styled document previews
+
+`styled_document::DocumentBuilder` stores source text in NFM's shared chunked
+byte storage, coalesces styles into runs, and records hard versus soft line
+boundaries. Source column maps are compact runs, preserving the host's original
+cell coordinates. `DocumentItemStore<T>` publishes search candidates as ranges
+into those same bytes, with generic copyable payloads; it does not duplicate
+candidate text. Hosts publish its snapshots through `SnapshotStore` as usual.
+
+Install `DocumentPreviewProvider<T>` with a resolver returning the shared
+`StyledDocument` and optional `DocumentRange` in logical-line byte coordinates.
+The worker builds a row-layout map for the requested width and reuses it across
+selections. Viewport painting expands only visible text/styles into grid cells.
+The provider supplies an immutable `CopyDocument` for navigation, search,
+selections, and yank, including text outside the displayed viewport. Old copy
+documents retain their width and highlights when another result is selected.
+
+No terminal or host callback is needed after loading. The UI's copy-document
+lookup uses a short publication lock; worker layout and resolver work run outside
+that lock. Hosts replace the provider and source to reload changed content.

@@ -9,6 +9,8 @@ pub enum Position {
     /// Leave a margin below the anchor when the picker fits; otherwise anchor
     /// to the bottom of the viewport.
     Cursor,
+    /// Cover the host pane and allocate remaining height to the preview.
+    FullPane,
 }
 
 /// All coordinates are logical egui points in the host viewport.
@@ -31,6 +33,9 @@ impl Placement {
         }
     }
     pub(crate) fn rect(self, requested_height: f32) -> Rect {
+        if self.position == Position::FullPane {
+            return self.bounds;
+        }
         let margin = self
             .margin
             .max(0.0)
@@ -42,7 +47,7 @@ impl Placement {
         );
         let x = bounds.center().x - size.x / 2.0;
         let y = match self.position {
-            Position::Top => bounds.top(),
+            Position::Top | Position::FullPane => bounds.top(),
             Position::Center => bounds.center().y - size.y / 2.0,
             Position::Bottom => bounds.bottom() - size.y,
             Position::Cursor => self
@@ -59,6 +64,16 @@ impl Placement {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn full_pane_ignores_popup_width_height_margin_and_anchor() {
+        let bounds = Rect::from_min_size(Pos2::new(100.0, 200.0), Vec2::new(400.0, 300.0));
+        let mut placement = Placement::new(bounds);
+        placement.position = Position::FullPane;
+        placement.width = 50.0;
+        placement.margin = 100.0;
+        placement.anchor = Some(Pos2::ZERO);
+        assert_eq!(placement.rect(10.0), bounds);
+    }
     #[test]
     fn cursor_placement_leaves_gap_or_anchors_to_viewport_bottom() {
         let bounds = Rect::from_min_size(Pos2::new(100.0, 200.0), Vec2::new(400.0, 300.0));

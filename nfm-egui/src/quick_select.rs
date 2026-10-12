@@ -106,7 +106,19 @@ impl QuickSelect {
         generation: u64,
         from_copy: bool,
         view: SnapshotView,
+        read: impl FnMut(u64) -> Option<TextRow>,
+    ) -> Option<Self> {
+        Self::new_visible(generation, from_copy, view, read, |_| true)
+    }
+
+    /// Filter document positions against the host's current presentation before
+    /// assigning labels. A captured row can be only partly visible after reflow.
+    pub fn new_visible(
+        generation: u64,
+        from_copy: bool,
+        view: SnapshotView,
         mut read: impl FnMut(u64) -> Option<TextRow>,
+        mut visible: impl FnMut(SnapshotCell) -> bool,
     ) -> Option<Self> {
         static MATCHER: OnceLock<Regex> = OnceLock::new();
         let matcher = MATCHER.get_or_init(|| Regex::new(r"\S+").expect("valid big-word regex"));
@@ -138,7 +150,7 @@ impl QuickSelect {
                 for found in matcher.find_iter(&text) {
                     let start = points[found.start()];
                     let end = points[found.end() - 1];
-                    if start.y >= view.viewport_top && start.y < bottom {
+                    if start.y >= view.viewport_top && start.y < bottom && visible(start) {
                         if ranges.len() >= 200_000 {
                             return None;
                         }
@@ -304,6 +316,36 @@ mod tests {
         assert_eq!(paged.hints.len(), 3);
         assert_eq!(paged.hints[0].range.start.y, 3);
         assert_eq!(paged.hints[2].range.start.y, 1);
+    }
+    #[test]
+    fn rebuilding_hints_filters_partial_rows_and_exposes_new_words() {
+        let view = SnapshotView {
+            viewport_rows: 1,
+            total_rows: 1,
+            columns: 32,
+            ..Default::default()
+        };
+        let read = |_| Some(row("one two three four", false));
+        let mut initial =
+            QuickSelect::new_visible(42, true, view, read, |cell| cell.x < 8).unwrap();
+        assert_eq!(initial.hints.len(), 2);
+        initial.prefix = "a".into();
+        let enlarged = QuickSelect::new_visible(42, true, view, read, |_| true).unwrap();
+        assert_eq!(enlarged.hints.len(), 4);
+        assert!(enlarged.prefix.is_empty());
+        let mut narrowed =
+            QuickSelect::new_visible(42, true, view, read, |cell| cell.x >= 8).unwrap();
+        assert_eq!(narrowed.hints.len(), 2);
+        assert!(narrowed.hints.iter().all(|hint| hint.range.start.x >= 8));
+        let labels: Vec<_> = narrowed
+            .hints
+            .iter()
+            .map(|hint| (hint.label.clone(), hint.range.start))
+            .collect();
+        for (label, expected) in labels {
+            narrowed.prefix.clear();
+            assert_eq!(narrowed.type_text(&label), Some(expected));
+        }
     }
 
     #[test]

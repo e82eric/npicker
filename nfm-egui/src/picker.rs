@@ -164,6 +164,7 @@ pub struct Picker<S: ItemsSource + Send + Sync + 'static> {
     copy_notice: String,
     preview_viewport: Option<crate::preview_copy::PreviewCopyMode>,
     preview_focus: bool,
+    result_actions_enabled: bool,
     cursor_scroll_padding: u32,
 }
 impl<S> Picker<S>
@@ -217,6 +218,7 @@ where
             copy_notice: "Copied".into(),
             preview_viewport: None,
             preview_focus: false,
+            result_actions_enabled: true,
             cursor_scroll_padding: crate::copy_mode::SCROLL_PADDING_ROWS,
         }
     }
@@ -255,6 +257,49 @@ where
         self.closed = false;
         self.focus_query = true;
         self.copied_until = None;
+        self.store_query_cursor(ctx);
+        ctx.request_repaint();
+    }
+
+    /// Release a retained copy layout so the provider can wrap at the new size.
+    pub fn reset_preview_layout(&mut self, ctx: &Context) {
+        self.leave_preview_focus();
+        self.preview_viewport = None;
+        self.preview_key = None;
+        self.external_document = None;
+        self.scroll_offset = 0;
+        if let Some(preview) = &mut self.preview {
+            // Row offsets belong to the old layout. Request an initial page
+            // around the same candidate rather than reusing that offset.
+            preview.clear();
+        }
+        ctx.request_repaint();
+    }
+
+    /// Discard old results, selection and preview copy state before a source
+    /// reload. The query is retained; call replace_source to restart searching.
+    pub fn clear_for_source_reload(&mut self, ctx: &Context) {
+        self.leave_preview_focus();
+        self.session.stop();
+        if let Some(preview) = self.preview.take() {
+            preview.stop();
+        }
+        self.displayed = None;
+        self.revision = self.revision.wrapping_add(1);
+        self.selected = 0;
+        self.visible_start = 0;
+        self.preview_key = None;
+        self.scroll_offset = 0;
+        self.external_document = None;
+        self.external_loading = false;
+        self.preview_rect = None;
+        self.completion_snapshot = None;
+        self.suggestions.clear();
+        self.suggestion_selected = 0;
+        self.dismissed_completion = None;
+        self.copied_until = None;
+        self.transition_pending = true;
+        self.result_actions_enabled = false;
         self.store_query_cursor(ctx);
         ctx.request_repaint();
     }
@@ -518,6 +563,12 @@ where
         if let Some(viewport) = &mut self.preview_viewport {
             viewport.set_scroll_padding(rows);
         }
+    }
+
+    /// Suspend result acceptance while a host is rebuilding positional payloads.
+    /// Preview navigation and copying remain available.
+    pub fn set_result_actions_enabled(&mut self, enabled: bool) {
+        self.result_actions_enabled = enabled;
     }
 
     pub fn preview_focused(&self) -> bool {
@@ -899,8 +950,22 @@ where
             .min(total.saturating_sub(rows));
     }
     fn refresh_preview(&mut self, width: f32, appearance: &Appearance) {
+        let columns = (width / appearance.typography.cell_width.max(1.0))
+            .floor()
+            .clamp(1.0, 4096.0) as u16;
+        let rows = self.visible_preview_rows.clamp(1, u16::MAX as usize) as u16;
         if self.preview_viewport.is_some() {
-            return;
+            // Passive previews also cache a copy viewport for scrolling. That
+            // cache must not suppress width-aware provider requests on resize.
+            if self.preview_focus
+                || self.preview.is_none()
+                || self
+                    .preview_key
+                    .is_some_and(|key| key.2 == columns && key.3 == rows)
+            {
+                return;
+            }
+            self.preview_viewport = None;
         }
         if !self.current_results() {
             return;
@@ -916,10 +981,6 @@ where
         let Some(preview) = &mut self.preview else {
             return;
         };
-        let columns = (width / appearance.typography.cell_width.max(1.0))
-            .floor()
-            .clamp(1.0, 4096.0) as u16;
-        let rows = self.visible_preview_rows.clamp(1, 256) as u16;
         let foreground = appearance.palette.text;
         let background = appearance.palette.background;
         // Append-only publications do not change an existing selected item's
@@ -1612,13 +1673,20 @@ where
             });
         }
         let row_height = appearance.typography.preview_row_height(ctx);
-        let available = (placement.bounds.height() - 2.0 * placement.margin.max(0.0)).max(0.0);
+        let full_pane = placement.position == crate::Position::FullPane;
+        let available = (placement.bounds.height()
+            - if full_pane {
+                0.0
+            } else {
+                2.0 * placement.margin.max(0.0)
+            })
+        .max(0.0);
         let header = self
             .displayed
             .as_ref()
             .and_then(|displayed| displayed.snapshot.header(&self.query));
         let header_height = if header.is_some() { row_height } else { 0.0 };
-        self.visible_result_rows = self.config.result_rows.clamp(1, 100).min(
+        self.visible_result_rows = self.config.result_rows.clamp(1, 256).min(
             ((available - 56.0 - header_height) / row_height - 1.0)
                 .floor()
                 .max(1.0) as usize,
@@ -1631,10 +1699,12 @@ where
         self.preview_rendered = false;
         self.visible_preview_rows =
             if (self.preview.is_some() || self.external_preview) && self.config.preview_visible {
-                self.config
-                    .preview_rows
-                    .clamp(1, 256)
-                    .min((remaining / preview_row_height).floor() as usize)
+                let capacity = (remaining / preview_row_height).floor() as usize;
+                if full_pane {
+                    capacity.min(u16::MAX as usize)
+                } else {
+                    self.config.preview_rows.clamp(1, 256).min(capacity)
+                }
             } else {
                 0
             };
@@ -1672,6 +1742,9 @@ where
                         .inner_margin(egui::Margin::symmetric(18, 10))
                         .show(ui, |ui| {
                             ui.set_width((rect.width() - 38.0).max(1.0));
+                            if full_pane {
+                                ui.set_min_height((rect.height() - 22.0).max(0.0));
+                            }
                             ui.spacing_mut().item_spacing.y = 0.0;
                             ui.visuals_mut().override_text_color = Some(appearance.palette.text);
                             ui.visuals_mut().text_cursor.stroke =
@@ -1750,6 +1823,7 @@ where
             self.completion_ui(ctx, placement.bounds, appearance);
         }
         if event.is_none()
+            && self.result_actions_enabled
             && let Some(selection) = self.selection()
         {
             if double_click {
@@ -1932,6 +2006,83 @@ mod query_parity_tests {
             std::thread::sleep(Duration::from_millis(2));
         }
     }
+
+    #[test]
+    fn preview_layout_reset_retains_results_and_exits_copy_focus() {
+        let (ctx, mut picker) = make();
+        picker.set_query("a");
+        wait(&mut picker);
+        picker.selected = 1;
+        picker.config.preview_visible = true;
+        picker.set_external_preview(true);
+        picker.set_external_preview_document(
+            Some(Ok(Preview::Text("one\ntwo\nthree".into()))),
+            false,
+        );
+        draw(&ctx, &mut picker, vec![]);
+        picker.toggle_preview_focus(&ctx);
+        assert!(picker.preview_focused());
+        let selected = picker.selection().unwrap().index;
+
+        picker.reset_preview_layout(&ctx);
+        assert_eq!(picker.query(), "a");
+        assert_eq!(picker.selection().unwrap().index, selected);
+        assert!(!picker.preview_focused());
+        assert!(picker.preview_viewport.is_none());
+        assert!(picker.external_document.is_none());
+        assert!(picker.preview_key.is_none());
+        assert!(picker.result_actions_enabled);
+    }
+
+    #[test]
+    fn source_reload_discards_selection_and_focused_preview_but_keeps_query() {
+        let (ctx, mut picker) = make();
+        picker.set_query("a");
+        wait(&mut picker);
+        picker.selected = 1;
+        picker.config.preview_visible = true;
+        picker.set_external_preview(true);
+        picker.set_external_preview_document(
+            Some(Ok(Preview::Text("one\ntwo\nthree".into()))),
+            false,
+        );
+        draw(&ctx, &mut picker, vec![]);
+        picker.toggle_preview_focus(&ctx);
+        assert!(picker.preview_focused());
+        assert!(picker.selection().is_some());
+
+        picker.clear_for_source_reload(&ctx);
+        assert_eq!(picker.query(), "a");
+        assert!(picker.selection().is_none());
+        assert!(!picker.preview_focused());
+        assert!(picker.preview_viewport.is_none());
+        assert!(picker.external_document.is_none());
+        assert!(picker.preview.is_none());
+        assert!(!picker.result_actions_enabled);
+        assert_eq!(picker.selected, 0);
+        assert_eq!(picker.scroll_offset, 0);
+        picker.poll();
+        assert!(picker.selection().is_none());
+
+        let mut rows = StructuredStreamingStore::new(
+            StructuredSchema::new(vec!["Name".into(), "Status".into(), "CPU".into()]).unwrap(),
+        );
+        rows.add_record(&csv::StringRecord::from(vec![
+            "alpha reset",
+            "Running",
+            "1",
+        ]))
+        .unwrap();
+        let store = Arc::new(SnapshotStore::new());
+        store.publish(rows.snapshot());
+        store.complete();
+        picker.replace_source(&ctx, store, picker.query().to_owned());
+        picker.set_result_actions_enabled(true);
+        wait(&mut picker);
+        assert_eq!(picker.query(), "a");
+        assert_eq!(picker.selected, 0);
+        assert_eq!(picker.selection().unwrap().index, 0);
+    }
     fn draw(
         ctx: &Context,
         picker: &mut Picker<StructuredStreamingSnapshot>,
@@ -2076,6 +2227,19 @@ mod query_parity_tests {
             vec![modified_key(Key::Space, Modifiers::ALT)],
         );
         assert!(!picker.preview_focused());
+    }
+
+    #[test]
+    fn host_can_suspend_result_acceptance_without_closing_the_picker() {
+        let (ctx, mut picker) = make();
+        wait(&mut picker);
+        picker.set_result_actions_enabled(false);
+        let (_, event) = draw(&ctx, &mut picker, vec![key(Key::Enter)]);
+        assert!(event.is_none());
+        assert!(!picker.is_closed());
+        picker.set_result_actions_enabled(true);
+        let (_, event) = draw(&ctx, &mut picker, vec![key(Key::Enter)]);
+        assert!(matches!(event, Some(PickerEvent::Accepted(_))));
     }
 
     #[test]
@@ -2405,6 +2569,76 @@ mod query_parity_tests {
             "query edits reran the selected item's preview source"
         );
     }
+    #[test]
+    fn passive_copy_viewport_does_not_block_resize_for_current_selection() {
+        let (ctx, mut picker) = make();
+        wait(&mut picker);
+        picker.config.preview_visible = true;
+        picker.visible_preview_rows = 4;
+        let provider = Arc::new(crate::byte_preview::BytePreviewProvider::new(
+            |_: &Selection<nfm_picker_sources::structured::StructuredPickerItem>, _| {
+                Ok(crate::byte_preview::ByteDocument::complete(
+                    "a".repeat(200).into_bytes(),
+                ))
+            },
+        ));
+        picker.set_preview_provider(&ctx, provider.clone());
+        let appearance = Appearance::default();
+        picker.refresh_preview(400.0, &appearance);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while picker.preview.as_ref().unwrap().loading {
+            picker.poll();
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        picker.ensure_preview_viewport();
+        assert!(picker.preview_viewport.is_some());
+        assert!(!picker.preview_focused());
+        let selection = picker.preview.as_ref().unwrap().document_selection.unwrap();
+        let old_columns = picker.preview_key.unwrap().2;
+        picker.toggle_preview_focus(&ctx);
+        assert!(picker.preview_focused());
+        picker.scroll_offset = 40;
+        picker.reset_preview_layout(&ctx);
+        assert!(!picker.preview_focused());
+        assert_eq!(picker.scroll_offset, 0);
+        assert!(
+            picker
+                .preview
+                .as_ref()
+                .unwrap()
+                .document_selection
+                .is_none()
+        );
+        assert!(picker.preview.as_ref().unwrap().document.is_none());
+        picker.refresh_preview(800.0, &appearance);
+        assert!(picker.preview_viewport.is_none());
+        assert!(picker.preview.as_ref().unwrap().loading);
+        let new_columns = picker.preview_key.unwrap().2;
+        assert!(new_columns > old_columns);
+        while picker.preview.as_ref().unwrap().loading {
+            picker.poll();
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(
+            picker.preview.as_ref().unwrap().document_selection,
+            Some(selection)
+        );
+        assert_eq!(
+            provider
+                .with_ansi_document(selection.0, selection.1, |doc| doc.columns())
+                .unwrap(),
+            Some(new_columns)
+        );
+        picker.ensure_preview_viewport();
+        assert!(picker.preview_viewport.is_some());
+        picker.toggle_preview_focus(&ctx);
+        picker.refresh_preview(400.0, &appearance);
+        assert!(picker.preview_viewport.is_some());
+        assert!(!picker.preview.as_ref().unwrap().loading);
+    }
+
     #[test]
     fn ansi_preview_copy_focus_pins_document_yanks_soft_wraps_and_survives_resize() {
         let (ctx, mut picker) = make();
@@ -3460,6 +3694,70 @@ mod extension_tests {
         output.drop_without_applying_deltas();
         assert_eq!(picker.visible_preview_rows, 0);
         assert!(picker.visible_result_rows < 7);
+    }
+
+    #[test]
+    fn full_pane_reserves_result_rows_and_fills_preview_on_resize_and_toggle() {
+        let ctx = Context::default();
+        let store = Arc::new(SnapshotStore::new());
+        store.publish(Arc::new(FlatSnapshot::from_items([("alpha", 42u64)])));
+        store.complete();
+        let mut picker = Picker::new(
+            "full-pane",
+            &ctx,
+            store,
+            PickerConfig {
+                result_rows: 5,
+                preview_rows: 1,
+                ..Default::default()
+            },
+        );
+        picker.set_external_preview(true);
+        let appearance = Appearance::default();
+        let mut previous_rows = 0;
+        for (height, visible) in [(600.0, true), (900.0, true), (900.0, false), (150.0, true)] {
+            picker.config.preview_visible = visible;
+            let bounds =
+                egui::Rect::from_min_size(egui::pos2(30.0, 40.0), egui::vec2(800.0, height));
+            let mut placement = Placement::new(bounds);
+            placement.position = crate::Position::FullPane;
+            let output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1000.0, 1100.0),
+                    )),
+                    ..Default::default()
+                },
+                |ui| {
+                    let result = picker.show(ui.ctx(), placement, &appearance, false);
+                    assert_eq!(result.rect, bounds);
+                    if height >= 600.0 {
+                        assert_eq!(picker.visible_result_rows, 5);
+                        if visible {
+                            let row_height = appearance.typography.preview_row_height(ui.ctx());
+                            let expected =
+                                ((height - 6.0 * row_height - 56.0) / row_height).floor() as usize;
+                            assert_eq!(picker.visible_preview_rows, expected);
+                            assert!(picker.visible_preview_rows > previous_rows);
+                            let preview = result.preview_rect.unwrap();
+                            assert!(bounds.contains_rect(preview));
+                            assert!((preview.height() - expected as f32 * row_height).abs() < 1.0);
+                        } else {
+                            assert_eq!(picker.visible_preview_rows, 0);
+                            assert!(result.preview_rect.is_none());
+                        }
+                    } else {
+                        assert!(picker.visible_result_rows < 5);
+                        assert_eq!(picker.visible_preview_rows, 0);
+                    }
+                },
+            );
+            output.drop_without_applying_deltas();
+            if visible && height >= 600.0 {
+                previous_rows = picker.visible_preview_rows;
+            }
+        }
     }
 }
 

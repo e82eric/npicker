@@ -29,3 +29,4 @@ pub use placement::{Placement, Position};
 pub use preview::{Cancellation, Preview, PreviewCell, PreviewProvider, PreviewRequest};
 pub use session::SearchTimings;
 pub mod byte_preview;
+pub mod styled_document;
