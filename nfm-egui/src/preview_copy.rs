@@ -442,7 +442,7 @@ mod yank_paint_tests {
         assert!(output.shapes.iter().any(|shape| matches!(&shape.shape,
             egui::Shape::Text(text) if text.galley.text() == "A")));
         // Labels stand out through text styling without adding background fills.
-        let hint_color = appearance.palette.match_highlight;
+        let hint_color = egui::Color32::from_rgb(0xfa, 0xbd, 0x2f);
         assert_eq!(colored_cells(&output, appearance.palette.accent), 0);
         assert!(output.shapes.iter().any(|shape| matches!(&shape.shape,
             egui::Shape::Text(text) if text.galley.text() == "A"
@@ -1907,7 +1907,8 @@ impl PreviewCopyMode {
                             // Preserve the displayed background before styling the label.
                             std::mem::swap(&mut cell.foreground, &mut cell.background);
                         }
-                        cell.foreground = appearance.palette.match_highlight;
+                        // Match Ghostty's Gruvbox yellow for Quick Select labels.
+                        cell.foreground = egui::Color32::from_rgb(0xfa, 0xbd, 0x2f);
                         cell.bold = true;
                         cell.underline = true;
                         cell.underline_color = cell.foreground;
