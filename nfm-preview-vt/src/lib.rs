@@ -1,6 +1,4 @@
 //! Standalone Ghostty VT preview parsing; no terminal host, PTY or GPU dependency.
-// Keep the native library dependency in the link graph.
-use ghostty_vt_sys as _;
 use std::{error::Error, fmt};
 
 #[repr(C)]

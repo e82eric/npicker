@@ -10,7 +10,6 @@ members = [
     "nfm-egui",
     "nfm-egui-demo",
     "nfm-preview-vt",
-    "ghostty-vt-sys",
     "nfm-preview-command",
     "nfm-preview-file",
     "nfm-preview-text",

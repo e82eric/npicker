@@ -901,14 +901,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "ghostty-vt-sys"
-version = "0.1.0"
-dependencies = [
- "flate2",
- "tar",
-]
-
-[[package]]
 name = "gif"
 version = "0.14.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1514,7 +1506,6 @@ name = "nfm-preview-vt"
 version = "0.1.0"
 dependencies = [
  "cc",
- "ghostty-vt-sys",
 ]
 
 [[package]]

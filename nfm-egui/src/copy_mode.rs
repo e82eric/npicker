@@ -930,9 +930,10 @@ impl CopyMode {
     }
 
     pub fn moved(&mut self, motion: Motion, cell: CellPosition) {
-        if cell != self.cursor && self.reflow_selection.take().is_some() {
-            // Further movement starts an ordinary selection in the new layout.
-            self.visual_mode = VisualMode::Characterwise;
+        if cell != self.cursor {
+            // Movement recomputes the selection in the new layout while
+            // preserving the user's characterwise, linewise, or block mode.
+            self.reflow_selection = None;
         }
         self.preferred_logical_x = None;
         self.cursor = cell;
@@ -2763,6 +2764,49 @@ impl CopyMode {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn reflow_movement_preserves_visual_mode_and_noop_retains_selection() {
+        for visual_mode in [
+            VisualMode::Characterwise,
+            VisualMode::Linewise,
+            VisualMode::Blockwise,
+        ] {
+            let mut mode = CopyMode::default();
+            let cursor = CellPosition { x: 3, y: 1 };
+            let anchor = CellPosition { x: 1, y: 0 };
+            let range = CellRange {
+                start: anchor,
+                end: cursor,
+            };
+            let view = View {
+                cursor,
+                columns: 8,
+                total_rows: 3,
+                viewport_rows: 3,
+                viewport_top: 0,
+            };
+            mode.start(1, view);
+            mode.toggle_visual(visual_mode);
+            mode.apply_reflow(
+                view,
+                cursor,
+                Some(anchor),
+                vec![range],
+                Some("selected text".into()),
+            );
+            mode.moved(Motion::Down, cursor);
+            assert_eq!(mode.reflow_selection_ranges(), Some([range].as_slice()));
+            assert_eq!(mode.reflow_selection_text(), Some("selected text"));
+            let moved = CellPosition { x: 3, y: 2 };
+            mode.moved(Motion::Down, moved);
+            assert_eq!(mode.visual_mode, visual_mode);
+            assert_eq!(mode.visual_anchor, Some(anchor));
+            assert_eq!(mode.cursor, moved);
+            assert_eq!(mode.reflow_selection_ranges(), None);
+            assert_eq!(mode.reflow_selection_text(), None);
+        }
+    }
+
     #[test]
     fn application_command_navigation_uses_counts_without_a_hardcoded_shortcut() {
         let anchor = CellPosition { x: 3, y: 9 };
