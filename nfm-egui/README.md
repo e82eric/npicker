@@ -180,7 +180,7 @@ Graphics resources can be recreated without recreating picker/search state.
 - Up/Down navigate in visual order; Ctrl+N advances search rank.
 - PageUp/PageDown move a result page; Ctrl+Home/End select first/last search rank.
 - Ctrl+C requests copying the selected candidate from the host.
-- Ctrl+P (as in Ghostty) or Ctrl+Space toggles the preview; Ctrl+PageUp/PageDown scroll its document.
+- Ctrl+P (as in Ghostty) or Ctrl+Space toggles the preview; Ctrl+PageUp/PageDown scroll its document by a page and Ctrl+Up/Down by a line.
 - Ctrl+Shift+F toggles full-pane placement for all pickers, retaining
   the query and result selection. Toggle again to restore the host placement;
   a picker configured as FullPane temporarily switches to Center. Preview copy

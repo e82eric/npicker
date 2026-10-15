@@ -766,6 +766,7 @@ where
             ("Ctrl+R (search)", "Toggle literal / regex search"),
             ("Ctrl+N / Ctrl+P (search)", "Next / previous match"),
             ("Ctrl+Page Up / Down", "Scroll preview"),
+            ("Ctrl+Up / Down", "Scroll preview by line"),
             ("Ctrl+Shift+/", "Toggle key bindings"),
         ]
         .into_iter()
@@ -1041,11 +1042,17 @@ where
             }
         }
     }
+    /// Scroll the preview by one page in `direction`.
     fn scroll_preview(&mut self, direction: isize) {
         let rows = self.visible_preview_rows.max(1);
+        let step = self.preview.as_ref().map_or(rows, |p| p.page_step(rows));
+        self.scroll_preview_rows(direction.saturating_mul(step as isize));
+    }
+    /// Scroll the preview by `delta` rows, stopping at either end.
+    fn scroll_preview_rows(&mut self, delta: isize) {
+        let rows = self.visible_preview_rows.max(1);
         if let Some(viewport) = &mut self.preview_viewport {
-            let step = self.preview.as_ref().map_or(rows, |p| p.page_step(rows));
-            viewport.scroll(direction.saturating_mul(step as isize), rows);
+            viewport.scroll(delta, rows);
             self.scroll_offset = viewport.top as usize;
             return;
         }
@@ -1061,9 +1068,7 @@ where
         };
         self.scroll_offset = self
             .scroll_offset
-            .saturating_add_signed(
-                direction * self.preview.as_ref().unwrap().page_step(rows) as isize,
-            )
+            .saturating_add_signed(delta)
             .min(total.saturating_sub(rows));
     }
     fn refresh_preview(&mut self, width: f32, appearance: &Appearance) {
@@ -1757,6 +1762,12 @@ where
                 }
                 if input.consume_key(Modifiers::CTRL, Key::PageDown) {
                     self.scroll_preview(1);
+                }
+                // Every press counts, including key repeats arriving in one frame.
+                let lines = input.count_and_consume_key(Modifiers::CTRL, Key::ArrowDown) as isize
+                    - input.count_and_consume_key(Modifiers::CTRL, Key::ArrowUp) as isize;
+                if lines != 0 {
+                    self.scroll_preview_rows(lines);
                 }
                 for (key, modifiers, delta) in [
                     (Key::N, Modifiers::CTRL, 1),
@@ -3574,6 +3585,27 @@ mod query_parity_tests {
             &ctx,
             &mut picker,
             vec![modified_key(Key::PageUp, Modifiers::CTRL)],
+        );
+        assert_eq!(picker.scroll_offset, 0);
+        let selected = picker.selection().map(|s| s.index);
+        draw(
+            &ctx,
+            &mut picker,
+            vec![
+                modified_key(Key::ArrowDown, Modifiers::CTRL),
+                modified_key(Key::ArrowDown, Modifiers::CTRL),
+            ],
+        );
+        assert_eq!(picker.scroll_offset, 2);
+        assert_eq!(picker.selection().map(|s| s.index), selected);
+        draw(
+            &ctx,
+            &mut picker,
+            vec![
+                modified_key(Key::ArrowUp, Modifiers::CTRL),
+                modified_key(Key::ArrowUp, Modifiers::CTRL),
+                modified_key(Key::ArrowUp, Modifiers::CTRL),
+            ],
         );
         assert_eq!(picker.scroll_offset, 0);
         draw(
