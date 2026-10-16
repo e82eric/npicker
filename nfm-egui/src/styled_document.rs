@@ -664,6 +664,9 @@ impl CopyDocument for SelectedDocument {
             self.highlight,
         ))
     }
+    fn anchor(&self) -> Option<CellPosition> {
+        self.highlight.map(|(start, _, _)| start)
+    }
 }
 type Resolver<T> = dyn Fn(&crate::Selection<T>) -> Result<(Arc<StyledDocument>, Option<DocumentRange>), String>
     + Send

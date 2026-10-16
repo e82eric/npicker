@@ -28,4 +28,9 @@ pub trait CopyDocument: Send + Sync + 'static {
         rows: usize,
         appearance: &Appearance,
     ) -> Result<Preview, String>;
+    /// Where copy mode starts its cursor while it is visible, such as the start of
+    /// a highlighted range. None starts it at the viewport's top-left.
+    fn anchor(&self) -> Option<CellPosition> {
+        None
+    }
 }

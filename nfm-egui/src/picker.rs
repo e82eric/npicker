@@ -641,6 +641,16 @@ where
         self.preview_focus
     }
 
+    /// Enter copy mode on the preview, as Ctrl+W does, unless it is already
+    /// focused. Its cursor starts at the document's anchor when one is visible.
+    /// Returns whether the preview is focused: not while it has nothing to show.
+    pub fn focus_preview(&mut self, ctx: &Context) -> bool {
+        if !self.preview_focus {
+            self.toggle_preview_focus(ctx);
+        }
+        self.preview_focus
+    }
+
     // Document changes discard the viewport; focus changes keep it in place.
     fn leave_preview_focus(&mut self) {
         self.deactivate_preview_focus();
@@ -2162,6 +2172,21 @@ mod query_parity_tests {
             assert!(Instant::now() < deadline);
             std::thread::sleep(Duration::from_millis(2));
         }
+    }
+
+    #[test]
+    fn hosts_focus_the_preview_without_toggling_it_back_off() {
+        let (ctx, mut picker) = make();
+        picker.set_query("a");
+        wait(&mut picker);
+        picker.config.preview_visible = true;
+        picker.set_external_preview(true);
+        picker.set_external_preview_document(Some(Ok(Preview::Text("preview".into()))), false);
+        draw(&ctx, &mut picker, vec![]);
+        assert!(!picker.preview_focused());
+        assert!(picker.focus_preview(&ctx));
+        assert!(picker.focus_preview(&ctx));
+        assert!(picker.preview_focused());
     }
 
     #[test]

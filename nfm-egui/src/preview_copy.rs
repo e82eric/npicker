@@ -115,6 +115,60 @@ mod yank_paint_tests {
     }
 
     #[test]
+    fn host_documents_start_the_cursor_on_their_anchor_while_it_is_visible() {
+        use crate::copy_document::{CopyDocument, DocumentMetadata, DocumentRow};
+        use std::sync::Arc;
+        struct Anchored(Document, CellPosition);
+        impl CopyDocument for Anchored {
+            fn metadata(&self) -> Result<DocumentMetadata, String> {
+                Ok(DocumentMetadata {
+                    revision: 1,
+                    columns: self.0.columns(),
+                    total_rows: self.0.rows(),
+                })
+            }
+            fn text_row(&self, y: u64) -> Result<Option<DocumentRow>, String> {
+                Ok(self.0.row(y).map(|row| DocumentRow {
+                    text: row.text,
+                    widths: row.widths,
+                }))
+            }
+            fn resolve_cell(
+                &self,
+                cell: CellPosition,
+                right: bool,
+            ) -> Result<CellPosition, String> {
+                self.0.resolve(cell, right).ok_or("cell".into())
+            }
+            fn selection_text(&self, selection: &CopySelection) -> Result<String, String> {
+                self.0.selection_text(selection).ok_or("selection".into())
+            }
+            fn viewport(
+                &self,
+                top: u64,
+                rows: usize,
+                appearance: &Appearance,
+            ) -> Result<Preview, String> {
+                self.0.grid(top, rows, appearance).ok_or("viewport".into())
+            }
+            fn anchor(&self) -> Option<CellPosition> {
+                Some(self.1)
+            }
+        }
+        let text = Preview::Text(vec!["line"; 40].join("\n"));
+        let anchored = |anchor| {
+            let document = PreviewCopyMode::text(&text, 0, 4).unwrap().document;
+            Arc::new(Anchored(document, anchor)) as Arc<dyn CopyDocument>
+        };
+        let anchor = CellPosition { x: 2, y: 12 };
+        let copy = PreviewCopyMode::host(anchored(anchor), 10, 5).unwrap();
+        assert_eq!(copy.mode.cursor, anchor);
+        // Scrolled away from the anchor, the cursor starts at the viewport's top.
+        let copy = PreviewCopyMode::host(anchored(anchor), 20, 5).unwrap();
+        assert_eq!(copy.mode.cursor, CellPosition { x: 0, y: 20 });
+    }
+
+    #[test]
     fn host_document_navigates_searches_and_yanks_beyond_the_visible_page() {
         use crate::copy_document::{CopyDocument, DocumentMetadata, DocumentRow};
         use std::sync::{
@@ -1315,12 +1369,24 @@ impl PreviewCopyMode {
         if metadata.columns == 0 || metadata.total_rows == 0 {
             return None;
         }
-        Some(Self::new(
+        let anchor = handle.anchor();
+        let mut copy = Self::new(
             Document::Host { handle, metadata },
             metadata.revision,
             top,
             rows,
-        ))
+        );
+        // An anchor the viewport has scrolled away from leaves the cursor at its top.
+        let visible = copy.top..copy.top + rows.max(1) as u64;
+        if let Some(anchor) = anchor.filter(|anchor| visible.contains(&anchor.y)) {
+            let anchor = CellPosition {
+                x: anchor.x.min(metadata.columns - 1),
+                y: anchor.y,
+            };
+            copy.mode.cursor = anchor;
+            copy.search_anchor = anchor;
+        }
+        Some(copy)
     }
 
     pub(crate) fn text_grid(
