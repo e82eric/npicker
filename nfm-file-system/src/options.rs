@@ -25,6 +25,25 @@ impl Default for FileSystemPickerOptions {
     }
 }
 
+/// Roots to scan when none are configured, and the top of parent navigation:
+/// the logical drives on Windows, `/` elsewhere.
+#[cfg(windows)]
+pub fn default_roots() -> Vec<String> {
+    use windows::Win32::Storage::FileSystem::GetLogicalDrives;
+    let mask = unsafe { GetLogicalDrives() };
+    (0..26)
+        .filter(|index| mask & (1 << index) != 0)
+        .map(|index| format!("{}:\\", (b'A' + index as u8) as char))
+        .collect()
+}
+
+/// Roots to scan when none are configured, and the top of parent navigation:
+/// the logical drives on Windows, `/` elsewhere.
+#[cfg(not(windows))]
+pub fn default_roots() -> Vec<String> {
+    vec!["/".into()]
+}
+
 /// Return a single root's parent, or the supplied drive list at a root.
 pub fn parent_roots(roots: &[String], drive_roots: Vec<String>) -> Vec<String> {
     if roots.len() == 1 {
@@ -52,6 +71,7 @@ impl FileSystemPickerOptions {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(windows)]
     #[test]
     fn parent_navigation_returns_parent_or_drives() {
         let drives = vec![r"C:\".into(), r"D:\".into()];
@@ -61,6 +81,18 @@ mod tests {
         );
         assert_eq!(parent_roots(&[r"C:\".into()], drives.clone()), drives);
         assert_eq!(parent_roots(&drives, drives.clone()), drives);
+    }
+    #[cfg(not(windows))]
+    #[test]
+    fn parent_navigation_returns_parent_or_root() {
+        let roots = default_roots();
+        assert_eq!(roots, vec!["/".to_owned()]);
+        assert_eq!(
+            parent_roots(&["/home/user".into()], roots.clone()),
+            vec!["/home".to_owned()]
+        );
+        assert_eq!(parent_roots(&["/home".into()], roots.clone()), roots);
+        assert_eq!(parent_roots(&["/".into()], roots.clone()), roots);
     }
     #[test]
     fn subtree_navigation_resets_filters_and_preserves_live_preview() {

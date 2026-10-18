@@ -12,11 +12,11 @@ required-features = ["scan-bench"]
 
 [dependencies]
 crossbeam-channel = "0.5.15"
+hashbrown = { version = "0.17.1", default-features = false }
+nfm_search_core = { path = "../nfm-search-core" }
 
 [target.'cfg(windows)'.dependencies]
-hashbrown = { version = "0.17.1", default-features = false }
 windows = { version = "0.62.2", features = [
     "Win32_Foundation",
     "Win32_Storage_FileSystem",
 ] }
-nfm_search_core = { path = "../nfm-search-core" }

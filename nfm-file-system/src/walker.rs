@@ -1,17 +1,10 @@
 use hashbrown::HashTable;
-use std::ffi::c_void;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use crossbeam_channel::{unbounded, Receiver, Sender};
-use windows::core::PCWSTR;
-use windows::Win32::Foundation::{HANDLE, INVALID_HANDLE_VALUE};
-use windows::Win32::Storage::FileSystem::{
-    FindClose, FindExInfoBasic, FindExSearchNameMatch, FindFirstFileExW, FindNextFileW,
-    FILE_ATTRIBUTE_DIRECTORY, FINDEX_SEARCH_OPS, FIND_FIRST_EX_LARGE_FETCH, WIN32_FIND_DATAW,
-};
 
 use nfm_search_core::store::{ChunkedSnapshot, ChunkedStorage, ItemsSource};
 use nfm_search_core::timing;
@@ -21,8 +14,30 @@ const NAME_CHUNK_SIZE: usize = 64 * 1024;
 const PUBLISH_NODE_INTERVAL: usize = 1_000;
 const BYTE_CHUNK_SIZE: usize = 1024 * 1024;
 
-#[cfg(feature = "scan-bench")]
+#[cfg(all(windows, feature = "scan-bench"))]
 pub mod benchmark;
+
+// Directory enumeration is the only OS-specific part of a scan.
+#[cfg(unix)]
+mod unix;
+#[cfg(unix)]
+use unix as platform;
+#[cfg(windows)]
+mod win32;
+#[cfg(windows)]
+use win32 as platform;
+
+use platform::PATH_SEPARATOR;
+
+/// One directory entry reported by the platform enumerator.
+struct DirectoryEntry<'a> {
+    /// Display name stored in the snapshot.
+    name: String,
+    /// Native name bytes when they differ from `name`, used to build the
+    /// path of a child directory.
+    path_name: Option<&'a [u8]>,
+    is_dir: bool,
+}
 
 pub struct ScanOptions {
     pub roots: Vec<PathBuf>,
@@ -235,7 +250,9 @@ impl PublishedSnapshot {
             let node = self.node(current as usize);
             let name = self.name(node.name as usize);
             len += name.len as usize;
-            if name.len > 0 && self.byte_at(name.offset as usize + name.len as usize - 1) != b'\\' {
+            if name.len > 0
+                && self.byte_at(name.offset as usize + name.len as usize - 1) != PATH_SEPARATOR
+            {
                 len += 1;
             }
             current = node.parent;
@@ -255,8 +272,10 @@ impl PublishedSnapshot {
         while current >= 0 {
             let node = self.node(current as usize);
             let name = self.name(node.name as usize);
-            if name.len > 0 && self.byte_at(name.offset as usize + name.len as usize - 1) != b'\\' {
-                out[position] = b'\\';
+            if name.len > 0
+                && self.byte_at(name.offset as usize + name.len as usize - 1) != PATH_SEPARATOR
+            {
+                out[position] = PATH_SEPARATOR;
                 position = position.saturating_sub(1);
             }
 
@@ -494,7 +513,8 @@ where
         .max(1);
     timing::write_lazy(|| {
         format!(
-        "source_start mode=rust_win32 workers={worker_count} roots={} max_depth={} directories_only={} files_only={}",
+        "source_start mode={} workers={worker_count} roots={} max_depth={} directories_only={} files_only={}",
+        platform::SCAN_MODE,
         options.roots.len(),
         options.max_depth,
         options.directories_only,
@@ -522,13 +542,12 @@ where
             break;
         }
 
-        let root_text = root.to_string_lossy().into_owned();
         add_node(
             &writer_tx,
             &pending,
             -1,
-            root_text.clone(),
-            Some((0, root_text.into_bytes())),
+            root.to_string_lossy().into_owned(),
+            Some((0, platform::path_bytes(root))),
         );
     }
 
@@ -610,18 +629,19 @@ mod scheduling_tests {
         };
         let root = directory_rx.recv_timeout(Duration::from_secs(5)).unwrap();
         assert_eq!(root.node_index, 0);
+        let child_path = make_child_path(b"root", b"child");
         add_node(
             &writer_tx,
             &pending,
             root.node_index,
             "child".into(),
-            Some((1, b"root\\child".to_vec())),
+            Some((1, child_path.clone())),
         );
         pending.fetch_sub(1, Ordering::AcqRel);
         let child = directory_rx.recv_timeout(Duration::from_secs(5)).unwrap();
         assert_eq!(child.node_index, 1);
         assert_eq!(child.depth, 1);
-        assert_eq!(child.path, b"root\\child");
+        assert_eq!(child.path, child_path);
         add_node(&writer_tx, &pending, child.node_index, "file".into(), None);
         pending.fetch_sub(1, Ordering::AcqRel);
         drop(writer_tx);
@@ -633,7 +653,7 @@ mod scheduling_tests {
         );
         assert_eq!(
             sink.0.lock().unwrap().as_ref().unwrap().item(2).unwrap(),
-            "root\\child\\file"
+            format!("root{0}child{0}file", PATH_SEPARATOR as char)
         );
         assert!(directory_rx.try_recv().is_err());
     }
@@ -718,57 +738,25 @@ fn scan_directory(
         return;
     }
 
-    let search_path = make_search_path(&work.path);
     let effective_max_depth = options.effective_max_depth();
+    platform::read_directory(&work.path, cancelled, |entry| {
+        let directory = (entry.is_dir && work.depth + 1 < effective_max_depth)
+            .then(|| {
+                let name = entry.path_name.unwrap_or(entry.name.as_bytes());
+                make_child_path(&work.path, name)
+            })
+            .filter(|path| platform::should_descend(path))
+            .map(|path| (work.depth + 1, path));
 
-    unsafe {
-        let mut find_data = WIN32_FIND_DATAW::default();
-        let handle = FindFirstFileExW(
-            PCWSTR(search_path.as_ptr()),
-            FindExInfoBasic,
-            &mut find_data as *mut WIN32_FIND_DATAW as *mut c_void,
-            FINDEX_SEARCH_OPS(FindExSearchNameMatch.0),
-            None,
-            FIND_FIRST_EX_LARGE_FETCH,
-        )
-        .unwrap_or(INVALID_HANDLE_VALUE);
-
-        if handle == INVALID_HANDLE_VALUE {
-            return;
+        let included = if entry.is_dir {
+            !options.files_only
+        } else {
+            !options.directories_only
+        };
+        if included || directory.is_some() {
+            add_node(writer_tx, pending, work.node_index, entry.name, directory);
         }
-
-        let find_handle = FindHandle(handle);
-        loop {
-            if cancelled.load(Ordering::Acquire) {
-                break;
-            }
-
-            if let Some(name) = file_name(&find_data) {
-                if name != "." && name != ".." {
-                    let is_dir = (find_data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY.0) != 0;
-                    let will_recurse = is_dir && work.depth + 1 < effective_max_depth;
-
-                    let included = if is_dir {
-                        !options.files_only
-                    } else {
-                        !options.directories_only
-                    };
-                    if included || will_recurse {
-                        let directory = will_recurse.then(|| {
-                            (work.depth + 1, make_child_path(&work.path, name.as_bytes()))
-                        });
-                        add_node(writer_tx, pending, work.node_index, name, directory);
-                    }
-                }
-            } else {
-            }
-
-            let next = FindNextFileW(find_handle.0, &mut find_data);
-            if next.is_err() {
-                break;
-            }
-        }
-    }
+    });
 }
 
 fn store_writer_loop<S>(
@@ -847,45 +835,11 @@ fn add_node(
         pending.fetch_sub(1, Ordering::AcqRel);
     }
 }
-struct FindHandle(HANDLE);
-
-impl Drop for FindHandle {
-    fn drop(&mut self) {
-        unsafe {
-            let _ = FindClose(self.0);
-        }
-    }
-}
-
-fn file_name(find_data: &WIN32_FIND_DATAW) -> Option<String> {
-    let len = find_data
-        .cFileName
-        .iter()
-        .position(|ch| *ch == 0)
-        .unwrap_or(find_data.cFileName.len());
-    if len == 0 {
-        None
-    } else {
-        Some(String::from_utf16_lossy(&find_data.cFileName[..len]))
-    }
-}
-
-fn make_search_path(path: &[u8]) -> Vec<u16> {
-    let path = String::from_utf8_lossy(path);
-    let mut value: Vec<u16> = path.encode_utf16().collect();
-    if !path.ends_with('\\') {
-        value.push('\\' as u16);
-    }
-    value.push('*' as u16);
-    value.push(0);
-    value
-}
-
 fn make_child_path(parent: &[u8], name: &[u8]) -> Vec<u8> {
     let mut path = Vec::with_capacity(parent.len() + name.len() + 1);
     path.extend_from_slice(parent);
-    if !path.is_empty() && !path.ends_with(b"\\") {
-        path.push(b'\\');
+    if !path.is_empty() && !path.ends_with(&[PATH_SEPARATOR]) {
+        path.push(PATH_SEPARATOR);
     }
     path.extend_from_slice(name);
     path
@@ -905,5 +859,142 @@ mod ownership_tests {
         assert!(!cancelled.load(Ordering::Acquire));
         drop(owner);
         assert!(cancelled.load(Ordering::Acquire));
+    }
+}
+
+#[cfg(test)]
+mod scan_tests {
+    use super::*;
+    use std::collections::BTreeSet;
+    use std::path::Path;
+    use std::sync::Mutex;
+
+    #[derive(Default)]
+    struct Sink(Mutex<Option<Arc<PublishedSnapshot>>>);
+
+    impl ScanEventSink for Sink {
+        fn snapshot(&self, snapshot: Arc<PublishedSnapshot>) {
+            *self.0.lock().unwrap() = Some(snapshot);
+        }
+        fn complete(&self, _: ScanStatus) {}
+    }
+
+    fn scan_paths(
+        root: &Path,
+        max_depth: i32,
+        directories_only: bool,
+        files_only: bool,
+    ) -> BTreeSet<String> {
+        let sink = Arc::new(Sink::default());
+        let scan = start_scan(
+            ScanOptions {
+                roots: vec![root.to_path_buf()],
+                max_depth,
+                directories_only,
+                files_only,
+            },
+            Arc::clone(&sink),
+        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !scan.is_done() {
+            assert!(std::time::Instant::now() < deadline, "scan did not finish");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(scan.status(), ScanStatus::Completed);
+        let snapshot = sink.0.lock().unwrap().clone().unwrap();
+        (0..snapshot.len())
+            .map(|index| snapshot.item(index).unwrap())
+            .collect()
+    }
+
+    fn join(parts: &[&str]) -> String {
+        parts.join(&(PATH_SEPARATOR as char).to_string())
+    }
+
+    #[test]
+    fn scans_nested_directories_with_native_separators_and_filters() {
+        let root = std::env::temp_dir().join(format!("nfm-scan-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("sub").join("deeper")).unwrap();
+        std::fs::write(root.join("a.txt"), "").unwrap();
+        std::fs::write(root.join("sub").join("b.txt"), "").unwrap();
+        std::fs::write(root.join("sub").join("deeper").join("c.txt"), "").unwrap();
+        let r = root.to_string_lossy().into_owned();
+        let r = r.as_str();
+
+        let all = [
+            r.to_owned(),
+            join(&[r, "a.txt"]),
+            join(&[r, "sub"]),
+            join(&[r, "sub", "b.txt"]),
+            join(&[r, "sub", "deeper"]),
+            join(&[r, "sub", "deeper", "c.txt"]),
+        ];
+        assert_eq!(
+            scan_paths(&root, i32::MAX, false, false),
+            all.iter().cloned().collect()
+        );
+        // The root node is always present; filters apply to scanned entries.
+        assert_eq!(
+            scan_paths(&root, i32::MAX, true, false),
+            [&all[0], &all[2], &all[4]].into_iter().cloned().collect()
+        );
+        // Scanned directories stay as parents of their entries, so only
+        // directories that are not descended into are removed.
+        assert_eq!(
+            scan_paths(&root, i32::MAX, false, true),
+            all.iter().cloned().collect()
+        );
+        assert_eq!(
+            scan_paths(&root, 1, false, true),
+            [&all[0], &all[1]].into_iter().cloned().collect()
+        );
+        assert_eq!(
+            scan_paths(&root, 1, false, false),
+            [&all[0], &all[1], &all[2]].into_iter().cloned().collect()
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_scan_skips_symlinks_and_opens_non_utf8_directories() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let root = std::env::temp_dir().join(format!("nfm-scan-unix-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let odd = root.join(OsStr::from_bytes(b"odd\xff"));
+        std::fs::create_dir_all(root.join("target")).unwrap();
+        std::fs::create_dir_all(&odd).unwrap();
+        std::fs::write(root.join("target").join("t.txt"), "").unwrap();
+        std::fs::write(odd.join("inner.txt"), "").unwrap();
+        std::os::unix::fs::symlink(root.join("target"), root.join("link")).unwrap();
+        // A link back to the root would loop forever if links were followed.
+        std::os::unix::fs::symlink(&root, root.join("loop")).unwrap();
+        let r = root.to_string_lossy().into_owned();
+
+        let paths = scan_paths(&root, i32::MAX, false, false);
+        let expected: BTreeSet<String> = [
+            r.clone(),
+            format!("{r}/target"),
+            format!("{r}/target/t.txt"),
+            format!("{r}/link"),
+            format!("{r}/loop"),
+            format!("{r}/odd\u{FFFD}"),
+            format!("{r}/odd\u{FFFD}/inner.txt"),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(paths, expected);
+        assert!(should_skip_virtual());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[cfg(unix)]
+    fn should_skip_virtual() -> bool {
+        !platform::should_descend(b"/proc")
+            && !platform::should_descend(b"/sys")
+            && platform::should_descend(b"/home/proc")
     }
 }

@@ -1450,7 +1450,6 @@ version = "0.1.0"
 dependencies = [
  "nfm-egui",
  "nfm-preview",
- "nfm-win32",
  "nfm_file_system",
 ]
 
