@@ -1,5 +1,4 @@
 //! Host-owned filesystem picker. NFM owns scanning, navigation and previews.
-#![cfg(windows)]
 use nfm_egui::{
     Appearance, Cancellation, ItemsSource, Picker, PickerConfig, PickerEvent, Placement, Preview,
     PreviewRequest, SearchSnapshotProvider, egui,
@@ -13,6 +12,11 @@ use std::{
     path::{Path, PathBuf},
     sync::Arc,
 };
+
+#[cfg(windows)]
+const PARENT_HELP: &str = "Parent directory / drive list";
+#[cfg(not(windows))]
+const PARENT_HELP: &str = "Parent directory";
 
 /// Adapt filesystem snapshots to a host's shared picker item type.
 /// Navigation and preview behavior remain inside NFM.
@@ -89,7 +93,7 @@ where
         previous: Option<Picker<S>>,
     ) -> Result<Self, String> {
         if options.roots.is_empty() {
-            options.roots = nfm_win32::logical_drive_roots();
+            options.roots = nfm_file_system::default_roots();
         }
         if options.roots.is_empty() {
             return Err("no file-system roots are available".into());
@@ -112,10 +116,7 @@ where
         };
         picker.set_external_preview(false);
         picker.set_bindings(Vec::new());
-        picker.set_keybinding_help(vec![(
-            "Ctrl+U".into(),
-            "Parent directory / drive list".into(),
-        )]);
+        picker.set_keybinding_help(vec![("Ctrl+U".into(), PARENT_HELP.into())]);
         let native_provider =
             nfm_preview::egui::file_preview_provider_with_bat_theme(options.bat_theme.clone());
         let preview_adapter = adapter.clone();
@@ -181,7 +182,7 @@ where
         {
             let roots = nfm_file_system::parent_roots(
                 &self.options.roots,
-                nfm_win32::logical_drive_roots(),
+                nfm_file_system::default_roots(),
             );
             self.navigate(ctx, roots)?;
         }
