@@ -228,6 +228,9 @@ pub struct Picker<S: ItemsSource + Send + Sync + 'static> {
     preview_viewport: Option<crate::preview_copy::PreviewCopyMode>,
     preview_focus: bool,
     placement_override: Option<crate::Position>,
+    /// The full-pane toggle showed a hidden preview; leaving full pane hides
+    /// it again unless the user or host changed its visibility meanwhile.
+    full_pane_preview: bool,
     result_actions_enabled: bool,
     cursor_scroll_padding: u32,
 }
@@ -284,6 +287,7 @@ where
             preview_viewport: None,
             preview_focus: false,
             placement_override: None,
+            full_pane_preview: false,
             result_actions_enabled: true,
             cursor_scroll_padding: crate::copy_mode::SCROLL_PADDING_ROWS,
         }
@@ -744,6 +748,7 @@ where
             self.leave_preview_focus();
         }
         self.config.preview_visible = preview_visible;
+        self.full_pane_preview = false;
     }
     pub fn set_keybinding_help(&mut self, bindings: Vec<(String, String)>) {
         self.additional_keybinding_help = bindings;
@@ -951,6 +956,17 @@ where
                         crate::Position::FullPane
                     })
                 };
+                // Full pane gives its extra height to the preview, so show an
+                // available preview that is hidden, and hide it again on exit.
+                let has_preview = self.preview.is_some() || self.external_preview;
+                if self.effective_position(configured) == crate::Position::FullPane {
+                    if has_preview && !self.config.preview_visible {
+                        self.config.preview_visible = true;
+                        self.full_pane_preview = true;
+                    }
+                } else if std::mem::take(&mut self.full_pane_preview) {
+                    self.config.preview_visible = false;
+                }
                 self.reset_preview_layout(ctx);
                 None
             }
@@ -1641,6 +1657,7 @@ where
                     });
                     if hide {
                         self.config.preview_visible = false;
+                        self.full_pane_preview = false;
                         self.leave_preview_focus();
                         if let Some(preview) = &mut self.preview {
                             preview.clear();
@@ -1760,6 +1777,7 @@ where
                     || input.consume_key(Modifiers::CTRL, Key::Space)
                 {
                     self.config.preview_visible = !self.config.preview_visible;
+                    self.full_pane_preview = false;
                     if !self.config.preview_visible {
                         if let Some(preview) = &mut self.preview {
                             preview.clear();
@@ -2405,6 +2423,77 @@ mod query_parity_tests {
             Some(PickerEvent::CustomAction { action: 42, .. })
         ));
         assert_eq!(picker.placement_override, Some(crate::Position::FullPane));
+    }
+
+    /// Press and release the default full-pane chord.
+    fn toggle_full_pane(ctx: &Context, picker: &mut Picker<StructuredStreamingSnapshot>) {
+        let shortcut = modified_key(Key::F, Modifiers::CTRL | Modifiers::SHIFT);
+        let mut release = shortcut.clone();
+        if let egui::Event::Key { pressed, .. } = &mut release {
+            *pressed = false;
+        }
+        draw(ctx, picker, vec![shortcut]);
+        draw(ctx, picker, vec![release]);
+    }
+
+    #[test]
+    fn full_pane_shows_a_hidden_preview_and_hides_it_again_on_exit() {
+        let (ctx, mut picker) = make();
+        wait(&mut picker);
+        picker.set_external_preview(true);
+        picker.config.preview_visible = false;
+        draw(&ctx, &mut picker, vec![]);
+        assert_eq!(picker.visible_preview_rows, 0);
+
+        toggle_full_pane(&ctx, &mut picker);
+        assert_eq!(picker.placement_override, Some(crate::Position::FullPane));
+        assert!(picker.preview_visible());
+        assert!(picker.visible_preview_rows > 0);
+
+        toggle_full_pane(&ctx, &mut picker);
+        assert_eq!(picker.placement_override, None);
+        assert!(!picker.preview_visible());
+        assert_eq!(picker.visible_preview_rows, 0);
+    }
+
+    #[test]
+    fn full_pane_keeps_preview_visibility_chosen_outside_the_toggle() {
+        // Ctrl+P inside full pane is the user's choice; leaving keeps it.
+        for presses in [1, 2] {
+            let (ctx, mut picker) = make();
+            wait(&mut picker);
+            picker.set_external_preview(true);
+            picker.config.preview_visible = false;
+            toggle_full_pane(&ctx, &mut picker);
+            for _ in 0..presses {
+                draw(
+                    &ctx,
+                    &mut picker,
+                    vec![modified_key(Key::P, Modifiers::CTRL)],
+                );
+            }
+            let chosen = presses == 2;
+            assert_eq!(picker.preview_visible(), chosen);
+            toggle_full_pane(&ctx, &mut picker);
+            assert_eq!(picker.placement_override, None);
+            assert_eq!(picker.preview_visible(), chosen, "after {presses} Ctrl+P");
+        }
+
+        // A preview that was already visible stays visible after full pane.
+        let (ctx, mut picker) = make();
+        wait(&mut picker);
+        picker.set_external_preview(true);
+        picker.config.preview_visible = true;
+        toggle_full_pane(&ctx, &mut picker);
+        toggle_full_pane(&ctx, &mut picker);
+        assert!(picker.preview_visible());
+
+        // Without a preview there is nothing to show.
+        let (ctx, mut picker) = make();
+        wait(&mut picker);
+        picker.config.preview_visible = false;
+        toggle_full_pane(&ctx, &mut picker);
+        assert!(!picker.preview_visible());
     }
 
     #[test]
