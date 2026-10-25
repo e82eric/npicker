@@ -29,6 +29,9 @@ use win32 as platform;
 
 use platform::PATH_SEPARATOR;
 
+/// How a relative scan writes its unnamed root entry.
+const CURRENT_DIRECTORY: &[u8] = b".";
+
 /// One directory entry reported by the platform enumerator.
 struct DirectoryEntry<'a> {
     /// Display name stored in the snapshot.
@@ -44,6 +47,10 @@ pub struct ScanOptions {
     pub max_depth: i32,
     pub directories_only: bool,
     pub files_only: bool,
+    /// Write paths relative to their root, like `fd` run from that root. The
+    /// root entry itself is written as `.`; `PublishedSnapshot::absolute_path`
+    /// still returns full paths. Ambiguous when several roots share names.
+    pub relative: bool,
 }
 
 impl ScanOptions {
@@ -161,6 +168,8 @@ pub struct PublishedSnapshot {
     name_bytes: ChunkedSnapshot<u8>,
     byte_count: usize,
     version: u64,
+    /// Root paths by root node index when roots are stored with empty names.
+    relative_roots: Option<Arc<[PathBuf]>>,
 }
 
 impl ItemsSource for PublishedSnapshot {
@@ -183,6 +192,9 @@ impl ItemsSource for PublishedSnapshot {
     ) -> &'a [u8] {
         let full_len = self.path_utf8_full_len(index);
         let len = full_len.saturating_sub(1);
+        if full_len == 0 {
+            return CURRENT_DIRECTORY;
+        }
         if full_len <= stack_buffer.len() {
             self.write_path_utf8_backwards(index, &mut stack_buffer[..full_len]);
             &stack_buffer[..len]
@@ -213,12 +225,40 @@ impl PublishedSnapshot {
             name_bytes: ChunkedSnapshot::empty(),
             byte_count: 0,
             version: 0,
+            relative_roots: None,
         }
+    }
+
+    /// The full path of an entry, including its root in relative scans.
+    pub fn absolute_path(&self, node_index: usize) -> Option<PathBuf> {
+        if node_index >= self.node_count {
+            return None;
+        }
+        let path = self.get_string_lossy(node_index, &mut Vec::new());
+        let Some(roots) = &self.relative_roots else {
+            return Some(PathBuf::from(path));
+        };
+        let mut root = node_index;
+        while self.node(root).parent >= 0 {
+            root = self.node(root).parent as usize;
+        }
+        // Roots are inserted before any of their entries, in scan order.
+        let root = roots.get(root)?;
+        Some(if self.path_utf8_full_len(node_index) == 0 {
+            root.clone()
+        } else {
+            root.join(path)
+        })
     }
 
     fn path_utf8(&self, node_index: usize, out: &mut Vec<u8>) {
         let full_len = self.path_utf8_full_len(node_index);
         let len = full_len.saturating_sub(1);
+        if full_len == 0 {
+            out.clear();
+            out.extend_from_slice(CURRENT_DIRECTORY);
+            return;
+        }
         out.resize(full_len, 0);
         self.write_path_utf8_backwards(node_index, out);
         out.truncate(len);
@@ -305,6 +345,7 @@ pub struct CompactUtf8FileStore {
     interned_names: Option<HashTable<InternEntry>>,
     published: Arc<PublishedSnapshot>,
     snapshot_version: AtomicU64,
+    relative_roots: Option<Arc<[PathBuf]>>,
 }
 
 fn hash_bytes(bytes: &[u8]) -> u64 {
@@ -328,6 +369,15 @@ impl CompactUtf8FileStore {
             interned_names: Some(HashTable::new()),
             published: Arc::new(PublishedSnapshot::empty()),
             snapshot_version: AtomicU64::new(0),
+            relative_roots: None,
+        }
+    }
+
+    /// Store roots with empty names, keeping their paths for `absolute_path`.
+    pub fn with_relative_roots(roots: Arc<[PathBuf]>) -> Self {
+        Self {
+            relative_roots: Some(roots),
+            ..Self::new()
         }
     }
 
@@ -365,6 +415,7 @@ impl CompactUtf8FileStore {
             byte_count: self.name_bytes.len(),
             name_bytes: self.name_bytes.snapshot(),
             version,
+            relative_roots: self.relative_roots.clone(),
         });
     }
 
@@ -526,8 +577,14 @@ where
     let writer_cancelled = Arc::clone(&cancelled);
     let writer_pending = Arc::clone(&pending);
     let directory_tx = tx.clone();
+    let store = if options.relative {
+        CompactUtf8FileStore::with_relative_roots(options.roots.clone().into())
+    } else {
+        CompactUtf8FileStore::new()
+    };
     let writer = std::thread::spawn(move || {
         store_writer_loop(
+            store,
             writer_rx,
             directory_tx,
             writer_pending,
@@ -542,11 +599,16 @@ where
             break;
         }
 
+        let name = if options.relative {
+            String::new()
+        } else {
+            root.to_string_lossy().into_owned()
+        };
         add_node(
             &writer_tx,
             &pending,
             -1,
-            root.to_string_lossy().into_owned(),
+            name,
             Some((0, platform::path_bytes(root))),
         );
     }
@@ -618,6 +680,7 @@ mod scheduling_tests {
             let status = Arc::clone(&status);
             std::thread::spawn(move || {
                 store_writer_loop(
+                    CompactUtf8FileStore::new(),
                     writer_rx,
                     directory_tx,
                     pending,
@@ -680,6 +743,7 @@ mod scheduling_tests {
             }
             let status = Arc::new(AtomicU8::new(ScanStatus::Scanning.as_u8()));
             store_writer_loop(
+                CompactUtf8FileStore::new(),
                 rx,
                 directory_tx,
                 Arc::clone(&pending),
@@ -760,6 +824,7 @@ fn scan_directory(
 }
 
 fn store_writer_loop<S>(
+    mut store: CompactUtf8FileStore,
     rx: Receiver<WriterCommand>,
     directory_tx: Sender<DirectoryWork>,
     pending: Arc<AtomicUsize>,
@@ -769,7 +834,6 @@ fn store_writer_loop<S>(
 ) where
     S: ScanEventSink,
 {
-    let mut store = CompactUtf8FileStore::new();
     while let Ok(command) = rx.recv() {
         match command {
             WriterCommand::Add {
@@ -885,6 +949,19 @@ mod scan_tests {
         directories_only: bool,
         files_only: bool,
     ) -> BTreeSet<String> {
+        let snapshot = scan_snapshot(root, max_depth, directories_only, files_only, false);
+        (0..snapshot.len())
+            .map(|index| snapshot.item(index).unwrap())
+            .collect()
+    }
+
+    fn scan_snapshot(
+        root: &Path,
+        max_depth: i32,
+        directories_only: bool,
+        files_only: bool,
+        relative: bool,
+    ) -> Arc<PublishedSnapshot> {
         let sink = Arc::new(Sink::default());
         let scan = start_scan(
             ScanOptions {
@@ -892,6 +969,7 @@ mod scan_tests {
                 max_depth,
                 directories_only,
                 files_only,
+                relative,
             },
             Arc::clone(&sink),
         );
@@ -901,10 +979,42 @@ mod scan_tests {
             std::thread::sleep(Duration::from_millis(5));
         }
         assert_eq!(scan.status(), ScanStatus::Completed);
-        let snapshot = sink.0.lock().unwrap().clone().unwrap();
-        (0..snapshot.len())
-            .map(|index| snapshot.item(index).unwrap())
-            .collect()
+        let snapshot = sink.0.lock().unwrap().clone();
+        snapshot.unwrap()
+    }
+
+    #[test]
+    fn relative_scan_omits_root_and_resolves_absolute_paths() {
+        let root = std::env::temp_dir().join(format!("nfm-scan-relative-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::write(root.join("a.txt"), "").unwrap();
+        std::fs::write(root.join("sub").join("b.txt"), "").unwrap();
+
+        let snapshot = scan_snapshot(&root, i32::MAX, false, false, true);
+        let mut rows: Vec<_> = (0..snapshot.len())
+            .map(|index| {
+                let mut stack = [0u8; 64];
+                let mut heap = Vec::new();
+                let matched = snapshot.get_string(index, &mut stack, &mut heap).to_vec();
+                let item = snapshot.item(index).unwrap();
+                // Matching and accepted values use the same relative text.
+                assert_eq!(matched, item.as_bytes());
+                (item, snapshot.absolute_path(index).unwrap())
+            })
+            .collect();
+        rows.sort();
+        assert_eq!(
+            rows,
+            vec![
+                (".".to_owned(), root.clone()),
+                ("a.txt".to_owned(), root.join("a.txt")),
+                ("sub".to_owned(), root.join("sub")),
+                (join(&["sub", "b.txt"]), root.join("sub").join("b.txt")),
+            ]
+        );
+        assert_eq!(snapshot.absolute_path(snapshot.len()), None);
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     fn join(parts: &[&str]) -> String {

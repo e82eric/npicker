@@ -238,6 +238,7 @@ fn scan_source(
             max_depth: options.max_depth,
             directories_only: options.directories_only,
             files_only: options.files_only,
+            relative: false,
         },
         store.clone(),
     )

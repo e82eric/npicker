@@ -83,6 +83,7 @@ impl PickerRequest for FileSystemPickerRequest {
                 max_depth: self.max_depth,
                 directories_only: self.directories_only,
                 files_only: self.files_only,
+                relative: false,
             },
             Arc::clone(&shared),
         );

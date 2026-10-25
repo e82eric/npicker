@@ -328,6 +328,7 @@ fn scan_once(roots: &[PathBuf]) -> Result<(Duration, Arc<PublishedSnapshot>)> {
             max_depth: 0,
             directories_only: false,
             files_only: false,
+            relative: false,
         },
         Arc::clone(&sink),
     );
