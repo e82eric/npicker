@@ -1,20 +1,9 @@
 //! Command stdout as incrementally published picker candidates.
+use crate::records::{spawn, Records, StreamControl, StreamSink};
 use nfm_preview_command::Stream;
 pub use nfm_preview_command::{no_match_exit, CommandEvent, CommandObserver, CommandSpec};
-use nfm_search_core::{
-    snapshot_store::SnapshotStore,
-    store::{PublishingStreamingItemStoreWithPayload, StreamingItemSnapshotWithPayload},
-};
-use std::{
-    collections::{HashMap, HashSet},
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc, Mutex,
-    },
-    thread::JoinHandle,
-};
+use std::{sync::atomic::Ordering, thread::JoinHandle};
 
-pub type CommandValues = Arc<Mutex<HashMap<usize, String>>>;
 pub struct CommandSourceOptions {
     pub command: CommandSpec,
     pub line_continuation: Option<String>,
@@ -39,179 +28,6 @@ impl CommandSourceOptions {
         }
     }
 }
-pub struct CommandSink<T: Copy + Default> {
-    pub store: Arc<SnapshotStore<StreamingItemSnapshotWithPayload<T>>>,
-    pub payload: T,
-    /// Changed accepted values are installed before their searchable rows appear.
-    pub values: Option<CommandValues>,
-    pub error: Arc<Mutex<Option<String>>>,
-}
-#[derive(Clone)]
-pub struct CommandControl {
-    pub cancelled: Arc<AtomicBool>,
-    pub changed: Arc<dyn Fn() + Send + Sync>,
-    pub failed: Arc<dyn Fn(&str) + Send + Sync>,
-}
-impl Default for CommandControl {
-    fn default() -> Self {
-        Self {
-            cancelled: Arc::new(AtomicBool::new(false)),
-            changed: Arc::new(|| {}),
-            failed: Arc::new(|_| {}),
-        }
-    }
-}
-struct CommandItem {
-    display: String,
-    value: String,
-}
-fn finish_item(lines: &mut Vec<String>, continuation: Option<&str>) -> Option<CommandItem> {
-    if lines.is_empty() {
-        return None;
-    }
-    let display = lines.join(" ");
-    let mut value = String::new();
-    for line in lines.drain(..) {
-        if let Some(stripped) = continuation.and_then(|suffix| line.strip_suffix(suffix)) {
-            value.push_str(stripped);
-            value.push('\n');
-        } else {
-            value.push_str(&line);
-        }
-    }
-    Some(CommandItem { display, value })
-}
-/// Groups lines into records, joining continuations, and publishes them. Shared
-/// by the command and file sources so both treat lines identically.
-pub(crate) struct Records<T: Copy + Default> {
-    publisher: PublishingStreamingItemStoreWithPayload<T>,
-    payload: T,
-    values: Option<CommandValues>,
-    continuation: Option<String>,
-    seen: Option<HashSet<String>>,
-    line: Vec<u8>,
-    lines: Vec<String>,
-    record_bytes: usize,
-    limit: usize,
-    next_index: usize,
-    dirty: bool,
-}
-impl<T: Copy + Default> Records<T> {
-    fn new(options: &CommandSourceOptions, sink: &CommandSink<T>) -> Self {
-        Self::with(
-            options.line_continuation.clone(),
-            options.unique,
-            options.max_record_bytes,
-            sink,
-        )
-    }
-    pub(crate) fn with(
-        line_continuation: Option<String>,
-        unique: bool,
-        max_record_bytes: usize,
-        sink: &CommandSink<T>,
-    ) -> Self {
-        Self {
-            publisher: PublishingStreamingItemStoreWithPayload::new(sink.store.clone()),
-            payload: sink.payload,
-            values: sink.values.clone(),
-            continuation: line_continuation.filter(|s| !s.is_empty()),
-            seen: unique.then(HashSet::new),
-            line: Vec::new(),
-            lines: Vec::new(),
-            record_bytes: 0,
-            limit: max_record_bytes,
-            next_index: 0,
-            dirty: false,
-        }
-    }
-    pub(crate) fn continuation(&self) -> Option<&str> {
-        self.continuation.as_deref()
-    }
-    pub(crate) fn limit(&self) -> usize {
-        self.limit
-    }
-    fn publish_item(&mut self) {
-        let Some(item) = finish_item(&mut self.lines, self.continuation.as_deref()) else {
-            return;
-        };
-        self.record_bytes = 0;
-        if self
-            .seen
-            .as_mut()
-            .is_some_and(|seen| !seen.insert(item.value.clone()))
-        {
-            return;
-        }
-        if item.value != item.display {
-            if let Some(values) = &self.values {
-                values.lock().unwrap().insert(self.next_index, item.value);
-            }
-        }
-        let index = self
-            .publisher
-            .add_item(item.display.as_bytes(), self.payload);
-        debug_assert_eq!(index as usize, self.next_index);
-        self.next_index += 1;
-        self.dirty = true;
-    }
-    fn finish_line(&mut self) -> Result<(), String> {
-        let raw = std::mem::take(&mut self.line);
-        let text = String::from_utf8_lossy(&raw);
-        let text = text.trim_end_matches(['\r', '\n']);
-        if self.lines.is_empty() && text.is_empty() {
-            return Ok(());
-        }
-        self.record_bytes = self
-            .record_bytes
-            .saturating_add(text.len())
-            .saturating_add(1);
-        if self.record_bytes > self.limit {
-            return Err("Picker continuation record exceeds its byte limit".into());
-        }
-        let continued = self
-            .continuation
-            .as_ref()
-            .is_some_and(|suffix| text.ends_with(suffix));
-        self.lines.push(text.to_owned());
-        if !continued {
-            self.publish_item();
-        }
-        Ok(())
-    }
-    pub(crate) fn push(&mut self, bytes: &[u8]) -> Result<(), String> {
-        let mut remaining = bytes;
-        while !remaining.is_empty() {
-            let count = remaining
-                .iter()
-                .position(|&b| b == b'\n')
-                .map_or(remaining.len(), |i| i + 1);
-            if self.line.len().saturating_add(count) > self.limit {
-                return Err("Picker line exceeds its byte limit".into());
-            }
-            self.line.extend_from_slice(&remaining[..count]);
-            if remaining[count - 1] == b'\n' {
-                self.finish_line()?;
-            }
-            remaining = &remaining[count..];
-        }
-        Ok(())
-    }
-    pub(crate) fn flush(&mut self, changed: &dyn Fn()) {
-        if self.dirty {
-            self.publisher.publish();
-            self.dirty = false;
-            changed();
-        }
-    }
-    pub(crate) fn finish(&mut self) -> Result<(), String> {
-        if !self.line.is_empty() {
-            self.finish_line()?;
-        }
-        self.publish_item();
-        Ok(())
-    }
-}
 
 /// Starts an owned worker. Signal `control.cancelled` before discarding its
 /// handle. Completion, failure and cancellation all complete the source; normal
@@ -219,10 +35,15 @@ impl<T: Copy + Default> Records<T> {
 /// No UI context or terminal payload type is required by this module.
 pub fn start<T: Copy + Default + Send + Sync + 'static>(
     options: CommandSourceOptions,
-    sink: CommandSink<T>,
-    control: CommandControl,
+    sink: StreamSink<T>,
+    control: StreamControl,
 ) -> Result<JoinHandle<()>, String> {
-    let records = Records::new(&options, &sink);
+    let records = Records::with(
+        options.line_continuation.clone(),
+        options.unique,
+        options.max_record_bytes,
+        &sink,
+    );
     spawn(
         "command",
         records,
@@ -269,70 +90,20 @@ pub fn start<T: Copy + Default + Send + Sync + 'static>(
     )
 }
 
-/// Runs `work` on a named worker thread with the shared completion contract: a
-/// pre-cancelled source does no work, errors and panics are recorded unless
-/// cancelled, and the store always completes.
-pub(crate) fn spawn<T, F>(
-    kind: &'static str,
-    mut records: Records<T>,
-    sink: CommandSink<T>,
-    control: CommandControl,
-    work: F,
-) -> Result<JoinHandle<()>, String>
-where
-    T: Copy + Default + Send + Sync + 'static,
-    F: FnOnce(&mut Records<T>, &CommandControl) -> Result<(), String> + Send + 'static,
-{
-    let failure_store = sink.store.clone();
-    let failure_error = sink.error.clone();
-    let failure_control = control.clone();
-    let worker = std::thread::Builder::new()
-        .name(format!("nfm-{kind}-source"))
-        .spawn(move || {
-            let result =
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<(), String> {
-                    if control.cancelled.load(Ordering::Acquire) {
-                        return Ok(());
-                    }
-                    work(&mut records, &control)
-                }));
-            let result = result.unwrap_or_else(|panic| {
-                let detail = panic
-                    .downcast_ref::<String>()
-                    .map(String::as_str)
-                    .or_else(|| panic.downcast_ref::<&str>().copied())
-                    .unwrap_or("unknown panic");
-                Err(format!("{kind} picker worker failed: {detail}"))
-            });
-            if let Err(error) = result {
-                if !control.cancelled.load(Ordering::Acquire) {
-                    *sink.error.lock().unwrap_or_else(|e| e.into_inner()) = Some(error.clone());
-                    // A host reporting callback cannot prevent source completion.
-                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        (control.failed)(&error)
-                    }));
-                }
-            }
-            records.publisher.complete();
-            (control.changed)();
-        });
-    worker.map_err(|error| {
-        let message = format!("Unable to start {kind} source worker: {error}");
-        *failure_error.lock().unwrap_or_else(|e| e.into_inner()) = Some(message.clone());
-        PublishingStreamingItemStoreWithPayload::new(failure_store).complete();
-        (failure_control.changed)();
-        message
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nfm_search_core::store::ItemsSource;
-    use std::time::{Duration, Instant};
+    use nfm_search_core::{
+        snapshot_store::SnapshotStore,
+        store::{ItemsSource, StreamingItemSnapshotWithPayload},
+    };
+    use std::{
+        sync::{Arc, Mutex},
+        time::{Duration, Instant},
+    };
     type Items = StreamingItemSnapshotWithPayload<u64>;
-    fn new_sink() -> CommandSink<u64> {
-        CommandSink {
+    fn new_sink() -> StreamSink<u64> {
+        StreamSink {
             store: Arc::new(SnapshotStore::new_append_only()),
             payload: 77,
             values: Some(Arc::default()),
@@ -356,57 +127,6 @@ mod tests {
         spec.output_limit = 16 * 1024;
         spec
     }
-    #[test]
-    fn chunk_boundaries_unicode_crlf_duplicates_and_final_continuation_preserve_values() {
-        let sink = new_sink();
-        let mut options = CommandSourceOptions::new(shell(""));
-        options.line_continuation = Some("`".into());
-        options.unique = true;
-        let mut records = Records::new(&options, &sink);
-        let bytes = "猫`\r\nsecond\r\n猫`\nsecond\n\nlast`".as_bytes();
-        for byte in bytes {
-            records.push(&[*byte]).unwrap();
-            records.flush(&|| {});
-        }
-        records.finish().unwrap();
-        records.publisher.complete();
-        assert_eq!(text(&sink.store), ["猫` second", "last`"]);
-        assert_eq!(
-            sink.values
-                .as_ref()
-                .unwrap()
-                .lock()
-                .unwrap()
-                .get(&0)
-                .unwrap(),
-            "猫\nsecond"
-        );
-        assert_eq!(
-            sink.values
-                .as_ref()
-                .unwrap()
-                .lock()
-                .unwrap()
-                .get(&1)
-                .unwrap(),
-            "last\n"
-        );
-        assert_eq!(*sink.store.snapshot().unwrap().payload(0), 77);
-    }
-    #[test]
-    fn record_limit_stops_a_long_line_or_continuation_without_losing_old_items() {
-        let sink = new_sink();
-        let mut options = CommandSourceOptions::new(shell(""));
-        options.max_record_bytes = 8;
-        options.line_continuation = Some("`".into());
-        let mut records = Records::new(&options, &sink);
-        records.push(b"ok\n").unwrap();
-        records.flush(&|| {});
-        assert!(records.push(b"123456789").is_err());
-        assert_eq!(text(&sink.store), ["ok"]);
-        let mut records = Records::new(&options, &sink);
-        assert!(records.push(b"abc`\nabc`\n").is_err());
-    }
     #[cfg(windows)]
     #[test]
     fn process_failures_retain_partial_results_and_stderr_and_success_codes_work() {
@@ -416,7 +136,7 @@ mod tests {
         start(
             CommandSourceOptions::new(shell("echo partial& echo diagnostic 1>&2 & exit /b 1")),
             sink,
-            CommandControl::default(),
+            StreamControl::default(),
         )
         .unwrap()
         .join()
@@ -430,7 +150,7 @@ mod tests {
         let error = sink.error.clone();
         let mut options = CommandSourceOptions::new(shell("exit /b 1"));
         options.success_exit_codes = vec![0, 1];
-        start(options, sink, CommandControl::default())
+        start(options, sink, StreamControl::default())
             .unwrap()
             .join()
             .unwrap();
@@ -465,7 +185,7 @@ mod tests {
         let sink = new_sink();
         let store = sink.store.clone();
         let error = sink.error.clone();
-        let control = CommandControl::default();
+        let control = StreamControl::default();
         let cancelled = control.cancelled.clone();
         let worker = start(CommandSourceOptions::new(command), sink, control).unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -489,7 +209,7 @@ mod tests {
         let sink = new_sink();
         let store = sink.store.clone();
         let error = sink.error.clone();
-        let control = CommandControl {
+        let control = StreamControl {
             changed: Arc::new(|| {}),
             failed: Arc::new(|_| panic!("reporting callback")),
             ..Default::default()
@@ -515,7 +235,7 @@ mod tests {
         let sink = new_sink();
         let store = sink.store.clone();
         let error = sink.error.clone();
-        let control = CommandControl::default();
+        let control = StreamControl::default();
         control.cancelled.store(true, Ordering::Release);
         start(
             CommandSourceOptions::new(CommandSpec::new("nfm-nonexistent-fixture")),

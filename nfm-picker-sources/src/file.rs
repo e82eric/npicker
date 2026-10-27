@@ -1,6 +1,6 @@
 //! A text file as incrementally published picker candidates, optionally read
 //! from the end so the newest lines of a log or history file arrive first.
-use crate::command::{spawn, CommandControl, CommandSink, Records};
+use crate::records::{spawn, Records, StreamControl, StreamSink};
 use std::{
     collections::VecDeque,
     io::{Read, Seek, SeekFrom},
@@ -39,8 +39,8 @@ impl FileSourceOptions {
 /// lines appended while it is read are not included.
 pub fn start<T: Copy + Default + Send + Sync + 'static>(
     options: FileSourceOptions,
-    sink: CommandSink<T>,
-    control: CommandControl,
+    sink: StreamSink<T>,
+    control: StreamControl,
 ) -> Result<JoinHandle<()>, String> {
     let records = Records::with(
         options.line_continuation.clone(),
@@ -60,7 +60,7 @@ pub fn start<T: Copy + Default + Send + Sync + 'static>(
     })
 }
 
-fn cancelled(control: &CommandControl) -> bool {
+fn cancelled(control: &StreamControl) -> bool {
     control.cancelled.load(Ordering::Acquire)
 }
 
@@ -68,7 +68,7 @@ fn read_forward<T: Copy + Default>(
     file: &mut impl Read,
     chunk: usize,
     records: &mut Records<T>,
-    control: &CommandControl,
+    control: &StreamControl,
 ) -> Result<(), String> {
     let mut buffer = vec![0; chunk];
     let mut first = true;
@@ -102,7 +102,7 @@ fn read_reverse<T: Copy + Default>(
     file: &mut (impl Read + Seek),
     chunk: usize,
     records: &mut Records<T>,
-    control: &CommandControl,
+    control: &StreamControl,
 ) -> Result<(), String> {
     let mut grouper = Grouper {
         marker: records.continuation().map(|s| s.as_bytes().to_vec()),
@@ -201,8 +201,8 @@ mod tests {
         sync::{Arc, Mutex},
     };
     type Items = StreamingItemSnapshotWithPayload<u64>;
-    fn new_sink() -> CommandSink<u64> {
-        CommandSink {
+    fn new_sink() -> StreamSink<u64> {
+        StreamSink {
             store: Arc::new(SnapshotStore::new_append_only()),
             payload: 7,
             values: Some(Arc::default()),
@@ -226,7 +226,7 @@ mod tests {
     ) -> Vec<(String, String)> {
         let sink = new_sink();
         let mut records = Records::with(continuation.map(Into::into), unique, 1 << 20, &sink);
-        let control = CommandControl::default();
+        let control = StreamControl::default();
         let mut file = Cursor::new(input.as_bytes().to_vec());
         if reverse {
             read_reverse(&mut file, chunk, &mut records, &control).unwrap();
@@ -292,7 +292,7 @@ mod tests {
     #[test]
     fn record_limits_apply_in_reverse() {
         let sink = new_sink();
-        let control = CommandControl::default();
+        let control = StreamControl::default();
         let mut records = Records::with(None, false, 8, &sink);
         let mut file = Cursor::new(b"ok\n123456789012\n".to_vec());
         assert!(read_reverse(&mut file, 4, &mut records, &control).is_err());
@@ -308,7 +308,7 @@ mod tests {
         let store = sink.store.clone();
         let mut options = FileSourceOptions::new(&path);
         options.reverse = true;
-        start(options, sink, CommandControl::default())
+        start(options, sink, StreamControl::default())
             .unwrap()
             .join()
             .unwrap();
@@ -322,7 +322,7 @@ mod tests {
         start(
             FileSourceOptions::new(&path),
             sink,
-            CommandControl::default(),
+            StreamControl::default(),
         )
         .unwrap()
         .join()
