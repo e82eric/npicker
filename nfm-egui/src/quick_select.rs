@@ -33,7 +33,8 @@ pub struct QuickSelect {
     pub hints: Vec<Hint>,
     pub prefix: String,
     pub view: SnapshotView,
-    pub purpose: Purpose,
+    /// Set through `set_purpose`, which relabels the hints to match.
+    purpose: Purpose,
 }
 
 pub enum InputAction {
@@ -79,16 +80,55 @@ impl QuickSelect {
         }
     }
 
+    pub fn purpose(&self) -> Purpose {
+        self.purpose
+    }
+
+    /// A linewise yank's hints mark rows, not words. Hints on the origin row
+    /// are dropped, since that target is the same as `yy`; hosts mark the row
+    /// itself instead (see `origin_row`). Every hint on a row yanks the same
+    /// lines, so each row gets one label, repeated at every word so it stays
+    /// near the reader's eye, with the shortest labels nearest the origin.
+    pub fn set_purpose(&mut self, purpose: Purpose) {
+        if let Purpose::YankLines { origin } = purpose {
+            self.hints.retain(|hint| hint.range.start.y != origin.y);
+            let mut rows: Vec<u64> = self.hints.iter().map(|hint| hint.range.start.y).collect();
+            rows.sort_unstable_by_key(|&y| (y.abs_diff(origin.y), y));
+            rows.dedup();
+            let labels: std::collections::HashMap<_, _> =
+                rows.iter().copied().zip(row_labels(rows.len())).collect();
+            for hint in &mut self.hints {
+                hint.label = labels[&hint.range.start.y].clone();
+            }
+        }
+        self.purpose = purpose;
+    }
+
+    /// The row a linewise yank starts from, for hosts to highlight.
+    pub fn origin_row(&self) -> Option<u64> {
+        match self.purpose {
+            Purpose::YankLines { origin } => Some(origin.y),
+            Purpose::Navigate => None,
+        }
+    }
+
     pub fn status_text(&self) -> String {
         if self.hints.is_empty() {
-            "NO MATCHES · Esc".to_owned()
-        } else {
-            format!(
-                "{}  ·  {} hints",
-                self.prefix.to_ascii_uppercase(),
-                self.visible_hints().count()
-            )
+            return "NO MATCHES · Esc".to_owned();
         }
+        let prefix = self.prefix.to_ascii_uppercase();
+        if let Purpose::YankLines { .. } = self.purpose {
+            // Linewise targets are rows, so count rows rather than hints.
+            let mut rows: Vec<_> = self
+                .visible_hints()
+                .map(|hint| hint.range.start.y)
+                .collect();
+            rows.sort_unstable();
+            rows.dedup();
+            let unit = if rows.len() == 1 { "line" } else { "lines" };
+            return format!("{prefix}  ·  {} {unit}", rows.len());
+        }
+        format!("{prefix}  ·  {} hints", self.visible_hints().count())
     }
 
     pub fn paged_view(mut view: SnapshotView, down: bool) -> SnapshotView {
@@ -251,6 +291,34 @@ fn labels(count: usize) -> Vec<String> {
         .collect()
 }
 
+/// Prefix-free labels where earlier entries get the shortest labels: as many
+/// single letters as possible, the remaining letters prefix two-letter labels.
+fn row_labels(count: usize) -> Vec<String> {
+    let base = ALPHABET.len();
+    let letter = |index: usize| char::from(ALPHABET[index]);
+    if count <= base {
+        return (0..count).map(|index| letter(index).to_string()).collect();
+    }
+    if count > base * base {
+        // Beyond two letters, fall back to uniform-width labels.
+        return labels(count);
+    }
+    // Turning a single letter into a prefix trades one label for `base`.
+    let singles = (base * base - count) / (base - 1);
+    let mut result: Vec<String> = (0..singles)
+        .map(|index| letter(index).to_string())
+        .collect();
+    'outer: for prefix in singles..base {
+        for suffix in 0..base {
+            if result.len() == count {
+                break 'outer;
+            }
+            result.push(format!("{}{}", letter(prefix), letter(suffix)));
+        }
+    }
+    result
+}
+
 /// Use the physical modifier from the paired key, not uppercase text (Caps Lock).
 pub fn shifted_hint(events: &[egui::Event], text_index: usize) -> bool {
     matches!(text_index.checked_sub(1).and_then(|i| events.get(i)),
@@ -396,6 +464,62 @@ mod tests {
                 assert!(result.iter().all(|label| label.len() == first.len()));
             }
         }
+    }
+
+    #[test]
+    fn row_labels_are_prefix_free_and_shortest_first() {
+        for count in [1, 26, 27, 37, 200, 676, 677, 1000] {
+            let labels = row_labels(count);
+            assert_eq!(labels.len(), count);
+            assert!(labels.windows(2).all(|pair| pair[0].len() <= pair[1].len()));
+            for (index, label) in labels.iter().enumerate() {
+                for (other_index, other) in labels.iter().enumerate() {
+                    assert!(index == other_index || !other.starts_with(label.as_str()));
+                }
+            }
+        }
+        // 37 rows leave room for 25 single-letter labels.
+        assert_eq!(
+            row_labels(37)
+                .iter()
+                .filter(|label| label.len() == 1)
+                .count(),
+            25
+        );
+    }
+
+    #[test]
+    fn yank_lines_labels_rows_nearest_first_and_skips_the_origin() {
+        let rows: Vec<_> = (0..6).map(|_| row("one two", false)).collect();
+        let view = SnapshotView {
+            viewport_rows: 6,
+            total_rows: 6,
+            columns: 10,
+            ..Default::default()
+        };
+        let mut state = QuickSelect::new(1, true, view, |y| rows.get(y as usize).cloned()).unwrap();
+        let origin = SnapshotCell { x: 4, y: 3 };
+        state.set_purpose(Purpose::YankLines { origin });
+        assert_eq!(state.origin_row(), Some(3));
+        assert!(state.hints.iter().all(|hint| hint.range.start.y != 3));
+        let label = |y| {
+            let mut labels: Vec<_> = state
+                .hints
+                .iter()
+                .filter(|hint| hint.range.start.y == y)
+                .map(|hint| hint.label.as_str())
+                .collect();
+            labels.dedup();
+            assert_eq!(labels.len(), 1, "one label per row");
+            labels[0].to_owned()
+        };
+        // Distance 1 above wins the tie with distance 1 below.
+        assert_eq!(
+            [2, 4, 1, 5, 0].map(label),
+            ["a", "s", "d", "f", "g"].map(String::from)
+        );
+        assert_eq!(state.status_text(), "  ·  5 lines");
+        assert_eq!(state.type_text("s").map(|cell| cell.y), Some(4));
     }
 
     #[test]

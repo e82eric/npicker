@@ -508,14 +508,46 @@ mod yank_paint_tests {
         let _ = paint(&ctx, &mut copy, &[]);
         assert_eq!(copy.top, 4);
         let origin = copy.mode.cursor;
-        copy.quick_select.as_mut().unwrap().purpose =
-            crate::quick_select::Purpose::YankLines { origin };
+        copy.quick_select
+            .as_mut()
+            .unwrap()
+            .set_purpose(crate::quick_select::Purpose::YankLines { origin });
         let label = copy.first_quick_hint().unwrap().0;
         let output = paint(&ctx, &mut copy, &[Event::Text(label)]);
         assert!(!copy.quick_select_active());
         assert!(output.platform_output.commands.iter().any(|command| matches!(command,
             egui::OutputCommand::CopyText(text) if text.contains("word0") && text.contains("word7"))));
         assert_eq!(copy.mode.cursor, origin);
+    }
+
+    #[test]
+    fn quick_line_yank_tints_the_origin_row_and_labels_rows() {
+        let ctx = Context::default();
+        let appearance = Appearance::default();
+        let mut copy = PreviewCopyMode::text(
+            &Preview::Text((0..20).map(|row| format!("word{row} tail\n")).collect()),
+            0,
+            4,
+        )
+        .unwrap();
+        let _ = paint(&ctx, &mut copy, &[]);
+        assert!(copy.open_quick_select(true, 4));
+        let tint = blend(
+            appearance.palette.background,
+            appearance.palette.accent,
+            0.15,
+        );
+        assert_eq!(colored_cells(&paint(&ctx, &mut copy, &[]), tint), 0);
+        let origin = copy.mode.cursor;
+        copy.quick_select
+            .as_mut()
+            .unwrap()
+            .set_purpose(crate::quick_select::Purpose::YankLines { origin });
+        assert!(colored_cells(&paint(&ctx, &mut copy, &[]), tint) >= 1);
+        // The nearest row below the origin gets the first label.
+        let quick = copy.quick_select.as_ref().unwrap();
+        let nearest = quick.hints.iter().find(|hint| hint.label == "a").unwrap();
+        assert_eq!(nearest.range.start.y, origin.y + 1);
     }
 
     #[test]
@@ -1630,13 +1662,13 @@ impl PreviewCopyMode {
                     crate::quick_select::InputAction::Page(down) => {
                         let quick = self.quick_select.as_ref().unwrap();
                         let from_copy = quick.from_copy;
-                        let purpose = quick.purpose;
+                        let purpose = quick.purpose();
                         self.top = crate::quick_select::QuickSelect::paged_view(quick.view, down)
                             .viewport_top;
                         if !self.rebuild_quick_select(from_copy, rows) {
                             return !from_copy;
                         }
-                        self.quick_select.as_mut().unwrap().purpose = purpose;
+                        self.quick_select.as_mut().unwrap().set_purpose(purpose);
                     }
                     crate::quick_select::InputAction::Select { cell, .. } => {
                         let quick = self.quick_select.take().unwrap();
@@ -1647,7 +1679,7 @@ impl PreviewCopyMode {
                             &self.document,
                             view,
                         )
-                        .select_quick(quick.purpose, cell)
+                        .select_quick(quick.purpose(), cell)
                         {
                             Ok(update) => update,
                             Err(error) => {
@@ -1861,8 +1893,10 @@ impl PreviewCopyMode {
                     }
                     CopyEffect::QuickSelect { origin } => {
                         if self.open_quick_select(true, rows) {
-                            self.quick_select.as_mut().unwrap().purpose =
-                                crate::quick_select::Purpose::YankLines { origin };
+                            self.quick_select
+                                .as_mut()
+                                .unwrap()
+                                .set_purpose(crate::quick_select::Purpose::YankLines { origin });
                         }
                         return false;
                     }
@@ -1958,13 +1992,30 @@ impl PreviewCopyMode {
                 || previous_columns != self.viewport_columns
             {
                 let from_copy = quick.from_copy;
-                let purpose = quick.purpose;
+                let purpose = quick.purpose();
                 if self.rebuild_quick_select(from_copy, rows) {
-                    self.quick_select.as_mut().unwrap().purpose = purpose;
+                    self.quick_select.as_mut().unwrap().set_purpose(purpose);
                 }
             }
         }
         if let Some(quick) = &self.quick_select {
+            // Linewise yanks start from the origin row, so tint its background
+            // like a cursorline; the text keeps its own colors.
+            if let Some(y) = quick.origin_row().and_then(|y| y.checked_sub(self.top)) {
+                let tint = blend(
+                    appearance.palette.background,
+                    appearance.palette.accent,
+                    0.15,
+                );
+                let start = y as usize * columns;
+                for cell in cells.iter_mut().skip(start).take(columns) {
+                    if cell.inverse {
+                        std::mem::swap(&mut cell.foreground, &mut cell.background);
+                        cell.inverse = false;
+                    }
+                    cell.background = tint;
+                }
+            }
             for hint in quick.cell_text() {
                 if let Some(y) = hint.cell.y.checked_sub(self.top) {
                     if let Some(cell) = cells.get_mut(y as usize * columns + hint.cell.x as usize) {
@@ -2363,6 +2414,11 @@ impl crate::search_service::SearchDocument for Document {
         Ok(())
     }
 }
+fn blend(a: egui::Color32, b: egui::Color32, amount: f32) -> egui::Color32 {
+    let mix = |a: u8, b: u8| (f32::from(a) * (1.0 - amount) + f32::from(b) * amount).round() as u8;
+    egui::Color32::from_rgb(mix(a.r(), b.r()), mix(a.g(), b.g()), mix(a.b(), b.b()))
+}
+
 fn search_matches(
     document: &Document,
     pattern: &str,
