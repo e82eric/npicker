@@ -13,6 +13,45 @@ use std::sync::OnceLock;
 
 const ALPHABET: &[u8] = b"asdfghjklqwertyuiopzxcvbnm";
 
+/// The letters hint labels are made of, in the order they are handed out.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Alphabet(Vec<u8>);
+
+impl Alphabet {
+    /// At least two distinct ASCII letters. Labels are typed in lowercase,
+    /// since Shift on the last letter is reserved for pasting.
+    pub fn new(letters: &str) -> Result<Self, String> {
+        let letters = letters.to_ascii_lowercase().into_bytes();
+        if let Some(&invalid) = letters.iter().find(|ch| !ch.is_ascii_lowercase()) {
+            return Err(format!(
+                "alphabet may contain only letters, found {:?}",
+                char::from(invalid)
+            ));
+        }
+        for (index, ch) in letters.iter().enumerate() {
+            if letters[..index].contains(ch) {
+                return Err(format!("alphabet repeats {:?}", char::from(*ch)));
+            }
+        }
+        if letters.len() < 2 {
+            return Err("alphabet needs at least two letters".into());
+        }
+        Ok(Self(letters))
+    }
+}
+
+impl Default for Alphabet {
+    fn default() -> Self {
+        Self(ALPHABET.to_vec())
+    }
+}
+
+/// The big-word pattern the default quick select hints.
+pub fn big_words() -> &'static Regex {
+    static MATCHER: OnceLock<Regex> = OnceLock::new();
+    MATCHER.get_or_init(|| Regex::new(r"\S+").expect("valid big-word regex"))
+}
+
 pub struct Hint {
     pub range: SnapshotCellRange,
     pub label: String,
@@ -35,6 +74,7 @@ pub struct QuickSelect {
     pub view: SnapshotView,
     /// Set through `set_purpose`, which relabels the hints to match.
     purpose: Purpose,
+    alphabet: Alphabet,
 }
 
 pub enum InputAction {
@@ -95,8 +135,11 @@ impl QuickSelect {
             let mut rows: Vec<u64> = self.hints.iter().map(|hint| hint.range.start.y).collect();
             rows.sort_unstable_by_key(|&y| (y.abs_diff(origin.y), y));
             rows.dedup();
-            let labels: std::collections::HashMap<_, _> =
-                rows.iter().copied().zip(row_labels(rows.len())).collect();
+            let labels: std::collections::HashMap<_, _> = rows
+                .iter()
+                .copied()
+                .zip(row_labels(&self.alphabet.0, rows.len()))
+                .collect();
             for hint in &mut self.hints {
                 hint.label = labels[&hint.range.start.y].clone();
             }
@@ -157,11 +200,33 @@ impl QuickSelect {
         generation: u64,
         from_copy: bool,
         view: SnapshotView,
+        read: impl FnMut(u64) -> Option<TextRow>,
+        visible: impl FnMut(SnapshotCell) -> bool,
+    ) -> Option<Self> {
+        Self::new_matching(
+            generation,
+            from_copy,
+            view,
+            std::slice::from_ref(big_words()),
+            &Alphabet::default(),
+            read,
+            visible,
+        )
+    }
+
+    /// Hint every match of `patterns` instead of big words. A pattern with a
+    /// capture group hints only the first group that participates, so context
+    /// can be required without being selected. Empty matches are skipped, and
+    /// where matches of different patterns overlap the earliest one wins.
+    pub fn new_matching(
+        generation: u64,
+        from_copy: bool,
+        view: SnapshotView,
+        patterns: &[Regex],
+        alphabet: &Alphabet,
         mut read: impl FnMut(u64) -> Option<TextRow>,
         mut visible: impl FnMut(SnapshotCell) -> bool,
     ) -> Option<Self> {
-        static MATCHER: OnceLock<Regex> = OnceLock::new();
-        let matcher = MATCHER.get_or_init(|| Regex::new(r"\S+").expect("valid big-word regex"));
         let bottom = view
             .viewport_top
             .saturating_add(u64::from(view.viewport_rows))
@@ -187,9 +252,9 @@ impl QuickSelect {
             points.extend(line.columns.iter().map(|&x| SnapshotCell { x, y: row }));
             row += 1;
             if !line.wraps_to_next || row == view.total_rows {
-                for found in matcher.find_iter(&text) {
-                    let start = points[found.start()];
-                    let end = points[found.end() - 1];
+                for (found_start, found_end) in matches(patterns, &text) {
+                    let start = points[found_start];
+                    let end = points[found_end - 1];
                     if start.y >= view.viewport_top && start.y < bottom && visible(start) {
                         if ranges.len() >= 200_000 {
                             return None;
@@ -206,13 +271,14 @@ impl QuickSelect {
         }
         // Prefer the most recent output. Decorations expect newest first.
         ranges.reverse();
-        let labels = labels(ranges.len());
+        let labels = labels(&alphabet.0, ranges.len());
         Some(Self {
             generation,
             from_copy,
             view,
             prefix: String::new(),
             purpose: Purpose::Navigate,
+            alphabet: alphabet.clone(),
             hints: ranges
                 .into_iter()
                 .zip(labels)
@@ -272,19 +338,48 @@ impl QuickSelect {
     }
 }
 
-fn labels(count: usize) -> Vec<String> {
+/// Byte ranges of the non-empty, non-overlapping matches in text order.
+fn matches(patterns: &[Regex], text: &str) -> Vec<(usize, usize)> {
+    let mut found: Vec<(usize, usize)> = Vec::new();
+    for pattern in patterns {
+        for captures in pattern.captures_iter(text) {
+            let target = (1..captures.len())
+                .find_map(|group| captures.get(group))
+                .or_else(|| captures.get(0))
+                .expect("a match has group 0");
+            if !target.is_empty() {
+                found.push((target.start(), target.end()));
+            }
+        }
+    }
+    if patterns.len() > 1 {
+        // Earliest first; at the same start, the longer match.
+        found.sort_unstable_by_key(|&(start, end)| (start, std::cmp::Reverse(end)));
+        let mut end_of_last = 0;
+        found.retain(|&(start, end)| {
+            let keep = start >= end_of_last;
+            if keep {
+                end_of_last = end;
+            }
+            keep
+        });
+    }
+    found
+}
+
+fn labels(alphabet: &[u8], count: usize) -> Vec<String> {
     let mut width = 1;
-    let mut capacity = ALPHABET.len();
+    let mut capacity = alphabet.len();
     while capacity < count {
         width += 1;
-        capacity = capacity.saturating_mul(ALPHABET.len());
+        capacity = capacity.saturating_mul(alphabet.len());
     }
     (0..count)
         .map(|mut index| {
-            let mut label = vec![ALPHABET[0]; width];
+            let mut label = vec![alphabet[0]; width];
             for ch in label.iter_mut().rev() {
-                *ch = ALPHABET[index % ALPHABET.len()];
-                index /= ALPHABET.len();
+                *ch = alphabet[index % alphabet.len()];
+                index /= alphabet.len();
             }
             String::from_utf8(label).expect("ASCII hint alphabet")
         })
@@ -293,15 +388,15 @@ fn labels(count: usize) -> Vec<String> {
 
 /// Prefix-free labels where earlier entries get the shortest labels: as many
 /// single letters as possible, the remaining letters prefix two-letter labels.
-fn row_labels(count: usize) -> Vec<String> {
-    let base = ALPHABET.len();
-    let letter = |index: usize| char::from(ALPHABET[index]);
+fn row_labels(alphabet: &[u8], count: usize) -> Vec<String> {
+    let base = alphabet.len();
+    let letter = |index: usize| char::from(alphabet[index]);
     if count <= base {
         return (0..count).map(|index| letter(index).to_string()).collect();
     }
     if count > base * base {
         // Beyond two letters, fall back to uniform-width labels.
-        return labels(count);
+        return labels(alphabet, count);
     }
     // Turning a single letter into a prefix trades one label for `base`.
     let singles = (base * base - count) / (base - 1);
@@ -457,7 +552,7 @@ mod tests {
     #[test]
     fn labels_are_unique_and_prefix_free_at_each_size() {
         for count in [0, 1, 26, 27, 676, 677, 2000] {
-            let result = labels(count);
+            let result = labels(ALPHABET, count);
             let unique: std::collections::HashSet<_> = result.iter().collect();
             assert_eq!(unique.len(), count);
             if let Some(first) = result.first() {
@@ -469,7 +564,7 @@ mod tests {
     #[test]
     fn row_labels_are_prefix_free_and_shortest_first() {
         for count in [1, 26, 27, 37, 200, 676, 677, 1000] {
-            let labels = row_labels(count);
+            let labels = row_labels(ALPHABET, count);
             assert_eq!(labels.len(), count);
             assert!(labels.windows(2).all(|pair| pair[0].len() <= pair[1].len()));
             for (index, label) in labels.iter().enumerate() {
@@ -480,7 +575,7 @@ mod tests {
         }
         // 37 rows leave room for 25 single-letter labels.
         assert_eq!(
-            row_labels(37)
+            row_labels(ALPHABET, 37)
                 .iter()
                 .filter(|label| label.len() == 1)
                 .count(),
@@ -549,6 +644,94 @@ mod tests {
         };
         let state = QuickSelect::new(7, true, view, |y| rows.get(y as usize).cloned()).unwrap();
         assert_eq!(state.hints.len(), 1); // exclude the word starting above the viewport
+    }
+
+    #[test]
+    fn custom_patterns_hint_capture_groups_skip_empty_matches_and_drop_overlaps() {
+        let rows = [row("rip=0x7ff6a2 rsp=0x00ab x", false)];
+        let view = SnapshotView {
+            viewport_rows: 1,
+            total_rows: 1,
+            columns: 30,
+            ..Default::default()
+        };
+        let read = |y: u64| rows.get(y as usize).cloned();
+        let ranges = |state: &QuickSelect| {
+            let mut ranges: Vec<_> = state
+                .hints
+                .iter()
+                .map(|hint| (hint.range.start.x, hint.range.end.x))
+                .collect();
+            ranges.sort_unstable();
+            ranges
+        };
+        let group = [Regex::new(r"r[is]p=(0x[0-9a-f]+)").unwrap()];
+        let state =
+            QuickSelect::new_matching(1, false, view, &group, &Alphabet::default(), read, |_| true)
+                .unwrap();
+        assert_eq!(ranges(&state), [(4, 11), (17, 22)]);
+
+        let empty = [Regex::new(r"x*").unwrap()];
+        let state =
+            QuickSelect::new_matching(1, false, view, &empty, &Alphabet::default(), read, |_| true)
+                .unwrap();
+        // Only the three x characters; no zero-width hints.
+        assert_eq!(ranges(&state), [(5, 5), (18, 18), (24, 24)]);
+
+        let overlapping = [
+            Regex::new(r"0x[0-9a-f]+").unwrap(),
+            Regex::new(r"[a-z]+=0x[0-9a-f]+").unwrap(),
+        ];
+        let state = QuickSelect::new_matching(
+            1,
+            false,
+            view,
+            &overlapping,
+            &Alphabet::default(),
+            read,
+            |_| true,
+        )
+        .unwrap();
+        assert_eq!(ranges(&state), [(0, 11), (13, 22)]);
+    }
+
+    #[test]
+    fn custom_alphabet_labels_hints_and_yank_rows() {
+        let rows: Vec<_> = (0..3).map(|_| row("a b c", false)).collect();
+        let view = SnapshotView {
+            viewport_rows: 3,
+            total_rows: 3,
+            columns: 10,
+            ..Default::default()
+        };
+        let read = |y: u64| rows.get(y as usize).cloned();
+        let alphabet = Alphabet::new("JK").unwrap();
+        let words = [big_words().clone()];
+        let mut state =
+            QuickSelect::new_matching(1, true, view, &words, &alphabet, read, |_| true).unwrap();
+        // Nine hints from two letters need four-letter labels.
+        let labels: Vec<_> = state.hints.iter().map(|hint| hint.label.as_str()).collect();
+        assert_eq!(labels[..3], ["jjjj", "jjjk", "jjkj"]);
+        assert!(
+            state
+                .hints
+                .iter()
+                .all(|hint| hint.label.bytes().all(|ch| b"jk".contains(&ch)))
+        );
+        state.set_purpose(Purpose::YankLines {
+            origin: SnapshotCell { x: 0, y: 1 },
+        });
+        let mut labels: Vec<_> = state.hints.iter().map(|hint| hint.label.clone()).collect();
+        labels.sort_unstable();
+        labels.dedup();
+        assert_eq!(labels, ["j", "k"]);
+
+        for (letters, error) in [("a", "two"), ("aba", "repeats"), ("ab1", "only letters")] {
+            assert!(
+                Alphabet::new(letters).unwrap_err().contains(error),
+                "{letters}"
+            );
+        }
     }
 
     #[test]
