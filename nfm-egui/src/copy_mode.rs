@@ -25,9 +25,7 @@ pub struct CellRange {
     pub end: CellPosition,
 }
 
-use regex::RegexSet;
 use std::collections::VecDeque;
-use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -174,47 +172,6 @@ pub struct TextRow {
     pub text: String,
     pub columns: Vec<u32>,
     pub wraps_to_next: bool,
-}
-
-fn prompt_patterns() -> &'static RegexSet {
-    static PATTERNS: OnceLock<RegexSet> = OnceLock::new();
-    PATTERNS.get_or_init(|| {
-        // Copied from the reference WezTerm config.prompt_patterns.
-        // Keep these here until the sample has Lua configuration.
-        RegexSet::new([
-            r"^PS [^>]*>\s*",
-            r"^\d+:\d+>\s*",
-            r"^›\s*",
-            r"^────────────────────*",
-        ])
-        .expect("valid hardcoded prompt patterns")
-    })
-}
-
-/// Prompt regexes operate on logical lines, so a soft-wrapped prompt is
-/// matched once at its first physical row. The snapshot never changes.
-pub fn find_prompt_boundaries(
-    rows: u64,
-    mut read: impl FnMut(u64) -> Option<TextRow>,
-) -> Option<Vec<u64>> {
-    let mut boundaries = Vec::new();
-    let mut line = String::new();
-    let mut line_start = 0;
-    for y in 0..rows {
-        let row = read(y)?;
-        if y == 0 {
-            line_start = y;
-        }
-        line.push_str(&row.text);
-        if !row.wraps_to_next || y + 1 == rows {
-            if prompt_patterns().is_match(&line) {
-                boundaries.push(line_start);
-            }
-            line.clear();
-            line_start = y + 1;
-        }
-    }
-    Some(boundaries)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -544,6 +501,7 @@ pub struct CopyMode {
     pub visual_mode: VisualMode,
     pub visual_trim: bool,
     pub pending_visual_object: Option<(WordObject, u32)>,
+    host_objects: Vec<char>,
     preferred_x: u32,
     preferred_logical_x: Option<u64>,
     columns: u32,
@@ -567,6 +525,36 @@ impl CopyMode {
     }
     pub fn set_scroll_padding(&mut self, rows: u32) {
         self.scroll_padding = Some(rows);
+    }
+    /// Letters the host resolves as text objects after `i`/`a`, through
+    /// `CopyNavigationDocument::host_object`. Letters used by built-in objects
+    /// are rejected.
+    pub fn set_host_objects(&mut self, keys: &[char]) -> Result<(), String> {
+        if let Some(key) = keys
+            .iter()
+            .find(|key| !key.is_ascii_alphabetic() || matches!(key, 'w' | 'W'))
+        {
+            return Err(format!("{key:?} cannot be a host text object"));
+        }
+        self.host_objects = keys.to_vec();
+        Ok(())
+    }
+    fn text_object_key(&self, key: egui::Key, modifiers: egui::Modifiers) -> Option<CopyTextObject> {
+        copy_text_object_key(key, modifiers).or_else(|| {
+            if modifiers.ctrl || modifiers.alt || modifiers.mac_cmd {
+                return None;
+            }
+            let mut name = key.name().chars();
+            let letter = name.next().filter(|c| c.is_ascii_alphabetic() && name.next().is_none())?;
+            let letter = if modifiers.shift {
+                letter.to_ascii_uppercase()
+            } else {
+                letter.to_ascii_lowercase()
+            };
+            self.host_objects
+                .contains(&letter)
+                .then_some(CopyTextObject::Host(letter))
+        })
     }
 
     pub fn start(&mut self, generation: u64, state: View) {
@@ -791,12 +779,12 @@ impl CopyMode {
         })
     }
 
+    /// Host objects have no range here; the controller asks the document.
     pub fn text_object_selection(
         &self,
         count: u32,
         object: WordObject,
         kind: CopyTextObject,
-        prompt_boundaries: &[u64],
         read: impl FnMut(u64) -> Option<TextRow>,
     ) -> Option<CopySelection> {
         let range = match kind {
@@ -805,14 +793,12 @@ impl CopyMode {
             CopyTextObject::Delimiter(open, close) => {
                 self.delimiter_object_range(object, open, close, read)
             }
-            CopyTextObject::Command => self.command_object_range(object, count, prompt_boundaries),
+            CopyTextObject::Host(_) => return None,
         }?;
-        let linewise = matches!(kind, CopyTextObject::Command);
         Some(CopySelection {
             range,
-            linewise,
-            trim: linewise
-                || (matches!(kind, CopyTextObject::Word(_)) && object == WordObject::Inner),
+            linewise: false,
+            trim: matches!(kind, CopyTextObject::Word(_)) && object == WordObject::Inner,
             rectangle: false,
         })
     }
@@ -1425,37 +1411,6 @@ impl CopyMode {
         }
         self.bounded_object_range(opener, closer?, object, &mut read)
     }
-    pub fn command_object_range(
-        &self,
-        object: WordObject,
-        count: u32,
-        boundaries: &[u64],
-    ) -> Option<CellRange> {
-        let index = boundaries
-            .partition_point(|&y| y <= self.cursor.y)
-            .checked_sub(1)?;
-        let prompt = boundaries[index];
-        let mut end = self.rows.checked_sub(1)?;
-        if let Some(&next) = boundaries.get(index.saturating_add(count as usize)) {
-            end = next.checked_sub(1)?;
-        }
-        let start = if object == WordObject::Around {
-            prompt
-        } else {
-            prompt + 1
-        };
-        if start > end {
-            return None;
-        }
-        Some(CellRange {
-            start: CellPosition { x: 0, y: start },
-            end: CellPosition {
-                x: self.columns.checked_sub(1)?,
-                y: end,
-            },
-        })
-    }
-
     pub fn total_rows(&self) -> u64 {
         self.rows
     }
@@ -1609,28 +1564,6 @@ impl CopyMode {
             result = Some(motion.result(actual));
         }
         result.map_or(MotionEvaluation::NoMovement, MotionEvaluation::Complete)
-    }
-
-    pub fn command_target(
-        &self,
-        forward: bool,
-        count: u32,
-        boundaries: &[u64],
-    ) -> Option<CellPosition> {
-        let steps = usize::try_from(count.max(1)).ok()?;
-        let index = if forward {
-            boundaries
-                .partition_point(|&row| row <= self.cursor.y)
-                .checked_add(steps - 1)?
-        } else {
-            boundaries
-                .partition_point(|&row| row < self.cursor.y)
-                .checked_sub(steps)?
-        };
-        Some(CellPosition {
-            x: 0,
-            y: *boundaries.get(index)?,
-        })
     }
 
     fn bounded_object_range(
@@ -2155,7 +2088,8 @@ pub enum CopyTextObject {
     Word(bool),
     Quote(char),
     Delimiter(char, char),
-    Command,
+    /// A key the host registered with `CopyMode::set_host_objects`.
+    Host(char),
 }
 
 pub fn copy_text_object_key(key: egui::Key, modifiers: egui::Modifiers) -> Option<CopyTextObject> {
@@ -2165,7 +2099,6 @@ pub fn copy_text_object_key(key: egui::Key, modifiers: egui::Modifiers) -> Optio
     }
     match key {
         Key::W => Some(CopyTextObject::Word(modifiers.shift)),
-        Key::C if !modifiers.shift => Some(CopyTextObject::Command),
         Key::Quote => Some(CopyTextObject::Quote(if modifiers.shift {
             '"'
         } else {
@@ -2523,7 +2456,7 @@ impl CopyMode {
             }
             self.pending_visual_object = None;
             let count = prefix_count.saturating_mul(self.take_count());
-            return copy_text_object_key(key, modifiers).map_or(CopyAction::None, |kind| {
+            return self.text_object_key(key, modifiers).map_or(CopyAction::None, |kind| {
                 CopyAction::SelectObject {
                     object,
                     kind,
@@ -2593,7 +2526,7 @@ impl CopyMode {
                         Some(YankCommand::RowEnd(count))
                     }
                     (Some(object), key, modifiers) => {
-                        copy_text_object_key(key, modifiers).map(|kind| YankCommand::Object {
+                        self.text_object_key(key, modifiers).map(|kind| YankCommand::Object {
                             object,
                             kind,
                             count,
@@ -3626,7 +3559,7 @@ mod tests {
     }
 
     #[test]
-    fn copy_text_object_selection_preserves_word_quote_delimiter_and_command_yank_rules() {
+    fn copy_text_object_selection_preserves_word_quote_and_delimiter_yank_rules() {
         for (kind, text, x, expected_start, expected_end) in [
             (CopyTextObject::Word(false), "  foo  ", 3, 2, 4),
             (CopyTextObject::Quote('"'), "  \"foo\" ", 3, 3, 5),
@@ -3634,7 +3567,7 @@ mod tests {
         ] {
             let mode = copy_at(x, 0, 1);
             let selection = mode
-                .text_object_selection(1, WordObject::Inner, kind, &[], |_| Some(row(text, false)))
+                .text_object_selection(1, WordObject::Inner, kind, |_| Some(row(text, false)))
                 .unwrap();
             assert_eq!(selection.range.start.x, expected_start);
             assert_eq!(selection.range.end.x, expected_end);
@@ -3642,26 +3575,15 @@ mod tests {
             assert!(!selection.rectangle);
             assert_eq!(selection.trim, matches!(kind, CopyTextObject::Word(_)));
             let around = mode
-                .text_object_selection(1, WordObject::Around, kind, &[], |_| Some(row(text, false)))
+                .text_object_selection(1, WordObject::Around, kind, |_| Some(row(text, false)))
                 .unwrap();
             assert!(!around.trim);
         }
-        let mode = copy_at(0, 1, 6);
-        let command = mode
-            .text_object_selection(
-                1,
-                WordObject::Inner,
-                CopyTextObject::Command,
-                &[0, 3],
-                |_| None,
-            )
-            .unwrap();
-        assert!(command.linewise && command.trim && !command.rectangle);
+        // The controller asks the host for host objects.
         assert!(
-            mode.text_object_selection(1, WordObject::Inner, CopyTextObject::Command, &[], |_| {
-                None
-            })
-            .is_none()
+            copy_at(0, 1, 6)
+                .text_object_selection(1, WordObject::Inner, CopyTextObject::Host('c'), |_| None)
+                .is_none()
         );
     }
 
@@ -3808,75 +3730,6 @@ mod tests {
                 },
                 true
             ))
-        );
-    }
-
-    #[test]
-    fn yank_command_objects_use_regex_prompt_boundaries() {
-        let rows = [
-            row("PS C:\\> first", false),
-            row("output", false),
-            row("12:34> second", false),
-            row("more", false),
-        ];
-        let mode = copy_at(2, 1, 4);
-        let boundaries =
-            super::find_prompt_boundaries(rows.len() as u64, |y| rows.get(y as usize).cloned())
-                .unwrap();
-        assert_eq!(boundaries, [0, 2]);
-        assert_eq!(
-            mode.command_object_range(WordObject::Inner, 1, &boundaries),
-            Some(CellRange {
-                start: CellPosition { x: 0, y: 1 },
-                end: CellPosition { x: 19, y: 1 },
-            })
-        );
-        assert_eq!(
-            mode.command_object_range(WordObject::Around, 2, &boundaries),
-            Some(CellRange {
-                start: CellPosition { x: 0, y: 0 },
-                end: CellPosition { x: 19, y: 3 },
-            })
-        );
-    }
-
-    #[test]
-    fn command_navigation_skips_current_prompt_counts_and_stops_at_edges() {
-        let mode = copy_at(7, 10, 40);
-        let boundaries = [0, 10, 20, 30];
-        assert_eq!(
-            mode.command_target(false, 1, &boundaries),
-            Some(CellPosition { x: 0, y: 0 })
-        );
-        assert_eq!(
-            mode.command_target(true, 1, &boundaries),
-            Some(CellPosition { x: 0, y: 20 })
-        );
-        assert_eq!(
-            mode.command_target(true, 2, &boundaries),
-            Some(CellPosition { x: 0, y: 30 })
-        );
-        assert_eq!(mode.command_target(false, 2, &boundaries), None);
-        assert_eq!(mode.command_target(true, 3, &boundaries), None);
-        assert_eq!(mode.command_target(true, 1, &[]), None);
-        let mode = copy_at(7, 15, 40);
-        assert_eq!(
-            mode.command_target(false, 1, &boundaries),
-            Some(CellPosition { x: 0, y: 10 })
-        );
-    }
-
-    #[test]
-    fn prompt_patterns_match_logical_lines_without_osc_markers() {
-        let rows = [
-            row("ordinary output", false),
-            row("› command", true),
-            row(" continued input", false),
-            row("────────────────────", false),
-        ];
-        assert_eq!(
-            super::find_prompt_boundaries(rows.len() as u64, |y| { rows.get(y as usize).cloned() }),
-            Some(vec![1, 3])
         );
     }
 

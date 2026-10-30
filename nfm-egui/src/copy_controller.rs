@@ -14,12 +14,16 @@ pub trait CopyNavigationDocument {
     fn text_row(&self, row: u64) -> Result<Option<TextRow>, String>;
     fn resolve_cell(&self, cell: CellPosition, right: bool) -> Result<CellPosition, String>;
     fn selection_text(&self, selection: &CopySelection) -> Result<String, String>;
-    fn prompt_boundaries(&self, rows: u64) -> Result<Vec<u64>, String> {
-        let error = RefCell::new(None);
-        let boundaries =
-            find_prompt_boundaries(rows, |y| record(self.text_row(y), &error).flatten());
-        check(&error)?;
-        boundaries.ok_or_else(|| "Unable to read command boundaries".into())
+    /// The selection for a text object the host registered with
+    /// `CopyMode::set_host_objects`, or `None` when there is nothing to select.
+    fn host_object(
+        &self,
+        _key: char,
+        _object: WordObject,
+        _count: u32,
+        _cursor: CellPosition,
+    ) -> Result<Option<CopySelection>, String> {
+        Ok(None)
     }
 }
 
@@ -368,14 +372,14 @@ impl<'a, D: CopyNavigationDocument + ?Sized> CopyController<'a, D> {
         kind: CopyTextObject,
         count: u32,
     ) -> Result<Option<CopySelection>, String> {
-        let boundaries = if matches!(kind, CopyTextObject::Command) {
-            self.document.prompt_boundaries(self.view.total_rows)?
-        } else {
-            Vec::new()
-        };
+        if let CopyTextObject::Host(key) = kind {
+            return self
+                .document
+                .host_object(key, object, count, self.mode.cursor);
+        }
         let selection = self
             .mode
-            .text_object_selection(count, object, kind, &boundaries, |y| self.row(y));
+            .text_object_selection(count, object, kind, |y| self.row(y));
         check(&self.error)?;
         Ok(selection)
     }
@@ -522,6 +526,24 @@ mod tests {
             }
             Ok(text)
         }
+        /// `c` selects the cursor's whole row, like a one-row command.
+        fn host_object(
+            &self,
+            key: char,
+            _object: WordObject,
+            _count: u32,
+            cursor: CellPosition,
+        ) -> Result<Option<CopySelection>, String> {
+            Ok((key == 'c').then_some(CopySelection {
+                range: CellRange {
+                    start: CellPosition { x: 0, y: cursor.y },
+                    end: CellPosition { x: 7, y: cursor.y },
+                },
+                linewise: true,
+                trim: true,
+                rectangle: false,
+            }))
+        }
     }
     fn document(lines: &[(&str, bool)]) -> Document {
         Document {
@@ -575,6 +597,37 @@ mod tests {
         assert_eq!(update.viewport_top, Some(1));
         assert_eq!(update.reveal, Some(CellPosition { x: 1, y: 2 }));
         assert_eq!(mode.cursor, CellPosition { x: 1, y: 2 });
+    }
+    #[test]
+    fn host_objects_use_registered_keys_and_the_document_selection() {
+        let doc = document(&[("PS> ls", false), ("out", false), ("PS> ", false)]);
+        let (mut mode, view) = start(3, CellPosition { x: 0, y: 1 });
+        assert!(mode.set_host_objects(&['w']).is_err());
+        assert!(mode.set_host_objects(&['1']).is_err());
+        let press = |mode: &mut CopyMode, keys: [egui::Key; 3]| {
+            let mut controller = CopyController::new(mode, &doc, view);
+            controller.begin_input_batch();
+            keys.iter()
+                .flat_map(|&k| controller.input(&key(k)).unwrap().effects)
+                .collect::<Vec<_>>()
+        };
+        let yic = [egui::Key::Y, egui::Key::I, egui::Key::C];
+        // Unregistered, `c` is not a text object.
+        assert!(press(&mut mode, yic).is_empty());
+        mode.set_host_objects(&['c']).unwrap();
+        assert!(matches!(
+            &press(&mut mode, yic)[..],
+            [CopyEffect::CopyText { text, .. }] if text == "out\n"
+        ));
+        press(&mut mode, [egui::Key::V, egui::Key::I, egui::Key::C]);
+        assert_eq!(
+            mode.visual_selection_to(mode.cursor, |y| doc.rows.get(y as usize).cloned())
+                .map(|selection| selection.range),
+            Some(CellRange {
+                start: CellPosition { x: 0, y: 1 },
+                end: CellPosition { x: 7, y: 1 },
+            })
+        );
     }
     #[test]
     fn horizontal_navigation_reveals_full_cell_but_positioning_remains_row_only() {

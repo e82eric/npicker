@@ -78,10 +78,10 @@ backticks, parentheses, brackets, braces, and angle brackets. In visual mode,
 use `i` or `a` plus the object, such as `viw` or `va(`, then extend with motions
 or press `y`. Repeating an object does not expand it exactly as Vim does.
 
-`yic` / `yac` and `vic` / `vac` use command boundaries detected from prompt
-patterns. These are useful for terminal output; ordinary previews need not have
-meaningful command boundaries. The current shared prompt patterns are fixed in
-the engine and text resembling a prompt can create a false boundary.
+Hosts can add their own text objects: register letters with
+`CopyMode::set_host_objects`, and `i`/`a` followed by one of them asks
+`CopyNavigationDocument::host_object` for the selection. A terminal can use
+this for commands, such as `yic` / `yac`; the engine has no such object itself.
 
 Linewise copies end with a newline. Rectangular copies produce one line for
 each physical row. Unicode glyphs, wide cells, and combining marks follow the
