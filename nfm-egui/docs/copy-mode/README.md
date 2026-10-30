@@ -85,9 +85,14 @@ this for commands, such as `yic` / `yac`; the engine has no such object itself.
 
 Linewise copies end with a newline. Rectangular copies produce one line for
 each physical row. Unicode glyphs, wide cells, and combining marks follow the
-document's cell mapping. Successful yanks flash the copied region for 250 ms;
-a new yank replaces and restarts the flash. Full-width painting for linewise
-selections and spans crossing rows is a decoration choice, not extra copied text.
+document's cell mapping. Successful yanks pulse the background of the copied
+region for 250 ms: steady, then softened once just before it clears. Text keeps
+its colors. A new yank replaces and restarts the pulse. The peak is
+`Palette::yank_background`, or by default the preview selection pushed toward
+the text color. `YANK_PULSE`, `yank_pulse_timing` and
+`Palette::yank_pulse_background` let a host paint the same pulse. Full-width
+painting for linewise selections and spans crossing rows is a decoration
+choice, not extra copied text.
 
 ## Searching and quick select
 

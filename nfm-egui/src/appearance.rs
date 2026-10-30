@@ -22,8 +22,23 @@ pub struct Palette {
     pub search_match_text: Option<Color32>,
     pub search_active_background: Option<Color32>,
     pub search_active_text: Option<Color32>,
+    /// Peak of the yank pulse; None uses the preview selection pushed toward
+    /// the text color. Only the background changes, so text keeps its colors.
     pub yank_background: Option<Color32>,
-    pub yank_text: Option<Color32>,
+}
+impl Palette {
+    /// The yank pulse background at `strength`, from the background up to the
+    /// peak: lighter than the selection on dark themes and darker on light ones.
+    pub fn yank_pulse_background(&self, strength: f32) -> Color32 {
+        let peak = self
+            .yank_background
+            .unwrap_or_else(|| blend(self.preview_selection_background, self.text, 0.30));
+        blend(self.background, peak, strength)
+    }
+}
+pub(crate) fn blend(a: Color32, b: Color32, amount: f32) -> Color32 {
+    let mix = |a: u8, b: u8| (f32::from(a) * (1.0 - amount) + f32::from(b) * amount).round() as u8;
+    Color32::from_rgb(mix(a.r(), b.r()), mix(a.g(), b.g()), mix(a.b(), b.b()))
 }
 impl Default for Palette {
     fn default() -> Self {
@@ -45,7 +60,6 @@ impl Default for Palette {
             search_active_background: None,
             search_active_text: None,
             yank_background: None,
-            yank_text: None,
         }
     }
 }

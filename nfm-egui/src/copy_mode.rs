@@ -30,6 +30,27 @@ use std::time::{Duration, Instant};
 use unicode_segmentation::UnicodeSegmentation;
 
 pub const YANK_HIGHLIGHT_DURATION: Duration = Duration::from_millis(250);
+/// How strongly the yank highlight shows over `YANK_HIGHLIGHT_DURATION`, in
+/// equal steps: steady, then softened once just before it clears.
+pub const YANK_PULSE: [f32; 5] = [1.0, 1.0, 1.0, 1.0, 0.5];
+
+/// The pulse strength at `step`; later steps keep the last strength.
+pub fn yank_pulse_strength(step: usize) -> f32 {
+    YANK_PULSE[step.min(YANK_PULSE.len() - 1)]
+}
+
+/// The pulse step for the time left, and how long until the next one.
+pub fn yank_pulse_timing(remaining: Duration) -> (usize, Duration) {
+    let steps = YANK_PULSE.len();
+    let step_length = YANK_HIGHLIGHT_DURATION / steps as u32;
+    let elapsed = YANK_HIGHLIGHT_DURATION.saturating_sub(remaining);
+    let step = (elapsed.as_nanos() / step_length.as_nanos()) as usize;
+    let next = step_length * (step as u32 + 1);
+    (
+        step.min(steps - 1),
+        next.saturating_sub(elapsed).min(remaining),
+    )
+}
 pub const SCROLL_PADDING_ROWS: u32 = 2;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2901,6 +2922,23 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn yank_pulse_steps_through_its_duration() {
+        let step_length = YANK_HIGHLIGHT_DURATION / 5;
+        assert_eq!(yank_pulse_timing(YANK_HIGHLIGHT_DURATION), (0, step_length));
+        assert_eq!(
+            yank_pulse_timing(YANK_HIGHLIGHT_DURATION - step_length * 2),
+            (2, step_length)
+        );
+        assert_eq!(
+            yank_pulse_timing(Duration::from_millis(1)),
+            (4, Duration::from_millis(1))
+        );
+        assert_eq!(yank_pulse_strength(0), 1.0);
+        assert!(yank_pulse_strength(4) < yank_pulse_strength(3));
+        assert_eq!(yank_pulse_strength(9), YANK_PULSE[4]);
+    }
 
     #[test]
     fn block_selection_normalizes_corners_and_swaps_endpoints() {

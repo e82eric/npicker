@@ -1,7 +1,8 @@
 //! Picker adapter for the shared copy-mode state machine.
+use crate::appearance::blend;
 use crate::copy_mode::{
     CellPosition, CellRange, CopyAction, CopyMode, CopySelection, Motion, TextRow, View,
-    YankCommand,
+    YankCommand, yank_pulse_strength, yank_pulse_timing,
 };
 use crate::{Appearance, Preview, PreviewCell, preview};
 use egui::{Context, Event, Key, Modifiers};
@@ -683,7 +684,6 @@ mod yank_paint_tests {
         appearance.palette.search_match_background = Some(egui::Color32::BLUE);
         appearance.palette.search_match_text = Some(egui::Color32::WHITE);
         appearance.palette.yank_background = Some(egui::Color32::RED);
-        appearance.palette.yank_text = Some(egui::Color32::BLACK);
         let mut copy = PreviewCopyMode::text(&Preview::Text("ab".into()), 0, 4).unwrap();
         let range = CellRange {
             start: CellPosition { x: 1, y: 0 },
@@ -708,9 +708,17 @@ mod yank_paint_tests {
         });
         output.textures_delta.clear();
         assert_eq!(colored_cells(&output, egui::Color32::RED), 1);
-        assert!(output.shapes.iter().any(|shape| matches!(&shape.shape,
-            egui::Shape::Text(text) if text.galley.text() == "b"
-                && text.galley.job.sections[0].format.color == egui::Color32::BLACK)));
+        // The yank only changes the background, so "b" keeps the same color
+        // as the untouched "a".
+        let color = |glyph: &str| {
+            output.shapes.iter().find_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) if text.galley.text() == glyph => {
+                    Some(text.galley.job.sections[0].format.color)
+                }
+                _ => None,
+            })
+        };
+        assert_eq!(color("b"), color("a"));
     }
 
     #[test]
@@ -869,7 +877,10 @@ mod yank_paint_tests {
         let palette = Appearance::default().palette;
         let mut copy = PreviewCopyMode::text(&Preview::Text("x".into()), 0, 4).unwrap();
         let before = paint(&ctx, &mut copy, &[key(Key::V)]);
-        assert_eq!(colored_cells(&before, palette.success), 0);
+        assert_eq!(
+            colored_cells(&before, palette.yank_pulse_background(1.0)),
+            0
+        );
         let yanked = paint(&ctx, &mut copy, &[key(Key::Y)]);
         assert!(
             yanked
@@ -877,18 +888,34 @@ mod yank_paint_tests {
                 .commands
                 .contains(&egui::OutputCommand::CopyText("x".into()))
         );
-        assert_eq!(colored_cells(&yanked, palette.success), 1);
+        assert_eq!(
+            colored_cells(&yanked, palette.yank_pulse_background(1.0)),
+            1
+        );
         // An idle frame keeps the visible feedback and schedules its removal.
         let idle = paint(&ctx, &mut copy, &[]);
-        assert_eq!(colored_cells(&idle, palette.success), 1);
+        assert_eq!(colored_cells(&idle, palette.yank_pulse_background(1.0)), 1);
         assert!(
             idle.viewport_output[&egui::ViewportId::ROOT].repaint_delay <= YANK_HIGHLIGHT_DURATION
         );
+        // It softens once just before it clears.
+        let range = copy.mode.yank_highlight_range().unwrap();
+        copy.mode.highlight_yank(
+            range,
+            Instant::now() - YANK_HIGHLIGHT_DURATION + YANK_HIGHLIGHT_DURATION / 10,
+        );
+        let fading = paint(&ctx, &mut copy, &[]);
+        let faded = palette.yank_pulse_background(crate::copy_mode::YANK_PULSE[4]);
+        assert_ne!(faded, palette.yank_pulse_background(1.0));
+        assert_eq!(colored_cells(&fading, faded), 1);
         let range = copy.mode.yank_highlight_range().unwrap();
         copy.mode
             .highlight_yank(range, Instant::now() - YANK_HIGHLIGHT_DURATION);
         assert_eq!(
-            colored_cells(&paint(&ctx, &mut copy, &[]), palette.success),
+            colored_cells(
+                &paint(&ctx, &mut copy, &[]),
+                palette.yank_pulse_background(1.0)
+            ),
             0
         );
     }
@@ -908,7 +935,10 @@ mod yank_paint_tests {
                 .contains(&egui::OutputCommand::CopyText("猫\n23".into()))
         );
         assert_eq!(
-            colored_cells(&output, Appearance::default().palette.success),
+            colored_cells(
+                &output,
+                Appearance::default().palette.yank_pulse_background(1.0)
+            ),
             4
         );
     }
@@ -954,7 +984,7 @@ mod yank_paint_tests {
                         .iter()
                         .filter(|shape| matches!(
                             &shape.shape,
-                            egui::Shape::Rect(rect) if rect.fill == appearance.palette.success
+                            egui::Shape::Rect(rect) if rect.fill == appearance.palette.yank_pulse_background(1.0)
                                 && (rect.rect.width() - viewport_width).abs() < 0.01
                         ))
                         .count(),
@@ -1014,7 +1044,7 @@ mod yank_paint_tests {
             .iter()
             .filter_map(|shape| match &shape.shape {
                 egui::Shape::Rect(rect)
-                    if rect.fill == appearance.palette.success
+                    if rect.fill == appearance.palette.yank_pulse_background(1.0)
                         && rect.rect.width() > width / 2.0 =>
                 {
                     Some(rect.rect)
@@ -1976,8 +2006,13 @@ impl PreviewCopyMode {
             self.left = self.mode.cursor.x + 1 - width;
         }
         self.mode.clear_expired_yank_highlight(Instant::now());
+        let mut yank_background = appearance.palette.yank_pulse_background(1.0);
         if let Some(remaining) = self.mode.yank_highlight_remaining(Instant::now()) {
-            ui.ctx().request_repaint_after(remaining);
+            let (step, next) = yank_pulse_timing(remaining);
+            yank_background = appearance
+                .palette
+                .yank_pulse_background(yank_pulse_strength(step));
+            ui.ctx().request_repaint_after(next);
         }
         let Some(Preview::Grid {
             columns,
@@ -2116,15 +2151,11 @@ impl PreviewCopyMode {
             .as_ref()
             .map(|selection| (selection, appearance.palette.preview_selection_background))
             .into_iter()
-            .chain(yank_selection.as_ref().map(|selection| {
-                (
-                    selection,
-                    appearance
-                        .palette
-                        .yank_background
-                        .unwrap_or(appearance.palette.success),
-                )
-            }))
+            .chain(
+                yank_selection
+                    .as_ref()
+                    .map(|selection| (selection, yank_background)),
+            )
             .filter(|(selection, _)| {
                 selection.linewise
                     || (!selection.rectangle && selection.range.start.y != selection.range.end.y)
@@ -2217,14 +2248,8 @@ impl PreviewCopyMode {
                     contains(range, rectangle, glyph_x as u32, absolute)
                 });
                 if yanked {
-                    cell.background = appearance
-                        .palette
-                        .yank_background
-                        .unwrap_or(appearance.palette.success);
-                    cell.foreground = appearance
-                        .palette
-                        .yank_text
-                        .unwrap_or(appearance.palette.background);
+                    cell.background = yank_background;
+                    cell.foreground = syntax_foreground;
                 }
                 if active_match
                     .is_some_and(|range| contains(range, false, glyph_x as u32, absolute))
@@ -2413,10 +2438,6 @@ impl crate::search_service::SearchDocument for Document {
         }
         Ok(())
     }
-}
-fn blend(a: egui::Color32, b: egui::Color32, amount: f32) -> egui::Color32 {
-    let mix = |a: u8, b: u8| (f32::from(a) * (1.0 - amount) + f32::from(b) * amount).round() as u8;
-    egui::Color32::from_rgb(mix(a.r(), b.r()), mix(a.g(), b.g()), mix(a.b(), b.b()))
 }
 
 fn search_matches(
