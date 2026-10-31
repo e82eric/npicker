@@ -1,5 +1,4 @@
 //! Picker adapter for the shared copy-mode state machine.
-use crate::appearance::blend;
 use crate::copy_mode::{
     CellPosition, CellRange, CopyAction, CopyMode, CopySelection, Motion, TextRow, View,
     YankCommand, yank_pulse_strength, yank_pulse_timing,
@@ -533,11 +532,7 @@ mod yank_paint_tests {
         .unwrap();
         let _ = paint(&ctx, &mut copy, &[]);
         assert!(copy.open_quick_select(true, 4));
-        let tint = blend(
-            appearance.palette.background,
-            appearance.palette.accent,
-            0.15,
-        );
+        let tint = appearance.palette.cursor_line_colors().0;
         assert_eq!(colored_cells(&paint(&ctx, &mut copy, &[]), tint), 0);
         let origin = copy.mode.cursor;
         copy.quick_select
@@ -2034,21 +2029,15 @@ impl PreviewCopyMode {
             }
         }
         if let Some(quick) = &self.quick_select {
-            // Linewise yanks start from the origin row, so tint its background
-            // like a cursorline; the text keeps its own colors.
+            // Linewise yanks start from the origin row; mark it with a
+            // cursorline bar.
             if let Some(y) = quick.origin_row().and_then(|y| y.checked_sub(self.top)) {
-                let tint = blend(
-                    appearance.palette.background,
-                    appearance.palette.accent,
-                    0.15,
-                );
+                let (background, text) = appearance.palette.cursor_line_colors();
                 let start = y as usize * columns;
                 for cell in cells.iter_mut().skip(start).take(columns) {
-                    if cell.inverse {
-                        std::mem::swap(&mut cell.foreground, &mut cell.background);
-                        cell.inverse = false;
-                    }
-                    cell.background = tint;
+                    cell.inverse = false;
+                    cell.background = background;
+                    cell.foreground = text;
                 }
             }
             for hint in quick.cell_text() {

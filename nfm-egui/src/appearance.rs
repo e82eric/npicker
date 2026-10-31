@@ -25,8 +25,19 @@ pub struct Palette {
     /// Peak of the yank pulse; None uses the preview selection pushed toward
     /// the text color. Only the background changes, so text keeps its colors.
     pub yank_background: Option<Color32>,
+    /// Line-yank origin row (`Y` hints). None derives a muted bar from the
+    /// background and text, with the background color as its text.
+    pub cursor_line_background: Option<Color32>,
+    pub cursor_line_text: Option<Color32>,
 }
 impl Palette {
+    /// Background and text of the line-yank origin row.
+    pub fn cursor_line_colors(&self) -> (Color32, Color32) {
+        let background = self
+            .cursor_line_background
+            .unwrap_or_else(|| blend(self.background, self.text, 0.60));
+        (background, self.cursor_line_text.unwrap_or(self.background))
+    }
     /// The yank pulse background at `strength`, from the background up to the
     /// peak: lighter than the selection on dark themes and darker on light ones.
     pub fn yank_pulse_background(&self, strength: f32) -> Color32 {
@@ -60,6 +71,8 @@ impl Default for Palette {
             search_active_background: None,
             search_active_text: None,
             yank_background: None,
+            cursor_line_background: None,
+            cursor_line_text: None,
         }
     }
 }
