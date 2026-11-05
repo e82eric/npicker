@@ -1,9 +1,9 @@
 //! Byte-backed previews. Resolve one owned document per selected item. NFM
 //! parses complete documents locally or requests bounded pages from the host.
 use crate::preview::{PreviewViewport, parse_ansi};
+use crate::styled_document::{DocumentLayout, StyledDocument};
 use crate::{Cancellation, Preview, PreviewProvider, PreviewRequest, Selection};
 use egui::Color32;
-pub use nfm_preview_vt::{AnsiDocument, Selection as DocumentSelection, SelectionKind, TextRow};
 use std::sync::{Arc, Mutex};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -98,7 +98,10 @@ struct Cached {
     key: Key,
     document: ByteDocument,
     initialized: bool,
-    ansi: Option<Arc<Mutex<nfm_preview_vt::AnsiDocument>>>,
+    /// Parsed once per complete source; independent of width.
+    styled: Option<Arc<StyledDocument>>,
+    /// The styled document wrapped at the current (or frozen) width.
+    layout: Option<Arc<DocumentLayout>>,
     frozen_columns: Option<u16>,
     reflow_top: Option<(u16, usize, StablePosition)>,
 }
@@ -120,37 +123,23 @@ impl<T> BytePreviewProvider<T> {
         self
     }
 
-    /// Read the currently cached complete ANSI document. The callback runs
-    /// under the provider lock: do not call this provider recursively. Check
-    /// both document version and item index to avoid reading a stale selection.
-    /// Paged sources expose no retained document through this API.
-    pub fn with_ansi_document<R>(
+    /// The cached layout of a complete document for this selection, if it is
+    /// current. Layouts are immutable; each width change creates a new one
+    /// with a fresh revision. Paged sources retain no layout.
+    pub fn document_layout(
         &self,
         document_version: u64,
         selection_index: usize,
-        read: impl FnOnce(&mut nfm_preview_vt::AnsiDocument) -> R,
-    ) -> Result<Option<R>, String> {
-        let mut cache = self.cache.lock().map_err(|_| "Preview cache poisoned")?;
-        let Some(cached) = cache
-            .as_mut()
-            .filter(|c| c.key.0 == document_version && c.key.1 == selection_index)
-        else {
-            return Ok(None);
-        };
-        cached
-            .ansi
+    ) -> Result<Option<Arc<DocumentLayout>>, String> {
+        let cache = self.cache.lock().map_err(|_| "Preview cache poisoned")?;
+        Ok(cache
             .as_ref()
-            .map(|doc| {
-                let mut doc = doc
-                    .lock()
-                    .map_err(|_| "ANSI document poisoned".to_owned())?;
-                Ok(read(&mut doc))
-            })
-            .transpose()
+            .filter(|c| c.key.0 == document_version && c.key.1 == selection_index)
+            .and_then(|c| c.layout.clone()))
     }
 
-    /// Freeze parsed width during copy mode. Releasing the lock allows the
-    /// next request to reparse at its display width with a fresh revision.
+    /// Freeze the layout width during copy mode. Releasing it allows the next
+    /// request to re-wrap at its display width with a fresh revision.
     pub fn freeze_ansi_width(
         &self,
         document_version: u64,
@@ -164,11 +153,10 @@ impl<T> BytePreviewProvider<T> {
         else {
             return Ok(false);
         };
-        let Some(ansi) = cached.ansi.as_ref() else {
+        let Some(layout) = cached.layout.as_ref() else {
             return Ok(false);
         };
-        cached.frozen_columns =
-            frozen.then_some(ansi.lock().map_err(|_| "ANSI document poisoned")?.columns());
+        cached.frozen_columns = frozen.then_some(layout.columns() as u16);
         Ok(true)
     }
 
@@ -186,18 +174,11 @@ impl<T> BytePreviewProvider<T> {
         }
     }
 }
-fn normalize(bytes: &[u8], max_bytes: usize) -> Result<Vec<u8>, String> {
+fn bounded(bytes: &[u8], max_bytes: usize) -> Result<&[u8], String> {
     if bytes.len() > max_bytes {
         return Err("ANSI preview exceeds configured byte limit".into());
     }
-    let mut result = Vec::with_capacity(bytes.len());
-    for (i, &byte) in bytes.iter().enumerate() {
-        if byte == b'\n' && (i == 0 || bytes[i - 1] != b'\r') {
-            result.push(b'\r');
-        }
-        result.push(byte);
-    }
-    Ok(result)
+    Ok(bytes)
 }
 impl<T: Clone + Send + 'static> PreviewProvider<T> for BytePreviewProvider<T> {
     fn copy_document(
@@ -209,9 +190,8 @@ impl<T: Clone + Send + 'static> PreviewProvider<T> for BytePreviewProvider<T> {
         Ok(cache
             .as_ref()
             .filter(|c| c.key.0 == version && c.key.1 == index)
-            .and_then(|c| c.ansi.clone())
-            .map(crate::preview_copy::ansi_copy_document)
-            .transpose()?)
+            .and_then(|c| c.layout.clone())
+            .map(|layout| layout as Arc<dyn crate::copy_document::CopyDocument>))
     }
 
     fn page_step(&self, rows: usize) -> usize {
@@ -246,7 +226,8 @@ impl<T: Clone + Send + 'static> PreviewProvider<T> for BytePreviewProvider<T> {
                 key,
                 document,
                 initialized: false,
-                ansi: None,
+                styled: None,
+                layout: None,
                 frozen_columns: None,
                 reflow_top: None,
             });
@@ -295,48 +276,37 @@ impl<T: Clone + Send + 'static> PreviewProvider<T> for BytePreviewProvider<T> {
                 reflow_top = Some((request.columns, page.page.first_row, page.top));
                 request.scroll_offset = 0;
                 let mut document =
-                    parse_ansi(&normalize(&page.page.bytes, self.max_bytes)?, &request)?;
+                    parse_ansi(bounded(&page.page.bytes, self.max_bytes)?, &request)?;
                 if let Preview::Grid { total_rows, .. } = &mut document {
                     *total_rows = page.total_rows;
                 }
                 (document, page.page.first_row)
             }
             ByteSource::Complete(bytes) => {
-                let columns = cached.frozen_columns.unwrap_or(request.columns);
-                if cached
-                    .ansi
-                    .as_ref()
-                    .is_none_or(|doc| doc.lock().map_or(true, |doc| doc.columns() != columns))
-                {
-                    cached.ansi = Some(Arc::new(Mutex::new(
-                        nfm_preview_vt::AnsiDocument::parse_with_limits(
-                            &normalize(bytes, self.max_bytes)?,
-                            columns,
-                            request.rows,
-                            self.max_bytes.saturating_mul(2),
+                let columns = usize::from(cached.frozen_columns.unwrap_or(request.columns));
+                let styled = match &cached.styled {
+                    Some(styled) => styled.clone(),
+                    None => {
+                        let styled = StyledDocument::from_ansi(
+                            bytes,
+                            self.max_bytes,
                             self.max_scrollback_lines,
-                        )
-                        .map_err(|error| error.to_string())?,
-                    )));
-                }
-                let mut ansi = cached
-                    .ansi
-                    .as_ref()
-                    .unwrap()
-                    .lock()
-                    .map_err(|_| "ANSI document poisoned")?;
-                let first = ansi.first_row(requested, request.rows);
-                let rgb =
-                    |c: Color32| ((c.r() as u32) << 16) | ((c.g() as u32) << 8) | c.b() as u32;
-                let grid = ansi
-                    .viewport(
-                        first,
-                        request.rows,
-                        rgb(request.foreground),
-                        rgb(request.background),
-                    )
-                    .map_err(|error| error.to_string())?;
-                let document = crate::preview::preview_from_grid(grid);
+                        )?;
+                        cached.styled = Some(styled.clone());
+                        styled
+                    }
+                };
+                let layout = match &cached.layout {
+                    Some(layout) if layout.columns() == columns => layout.clone(),
+                    _ => {
+                        let layout = styled.layout(columns, &cancel)?;
+                        cached.layout = Some(layout.clone());
+                        layout
+                    }
+                };
+                let first = layout.first_row(requested, rows);
+                let document =
+                    layout.grid(first, rows, request.foreground, request.background, None);
                 (document, first)
             }
             ByteSource::Paged {
@@ -371,7 +341,7 @@ impl<T: Clone + Send + 'static> PreviewProvider<T> for BytePreviewProvider<T> {
                 }
                 request.columns = *columns;
                 request.scroll_offset = 0;
-                let mut document = parse_ansi(&normalize(&page.bytes, self.max_bytes)?, &request)?;
+                let mut document = parse_ansi(bounded(&page.bytes, self.max_bytes)?, &request)?;
                 if let Preview::Grid {
                     total_rows: total, ..
                 } = &mut document
@@ -557,12 +527,18 @@ mod tests {
             .unwrap();
     }
     #[test]
-    fn normalization_uses_configured_input_limit_and_allows_crlf_expansion() {
-        assert_eq!(normalize(b"a\nb\n", 4).unwrap(), b"a\r\nb\r\n");
-        assert!(normalize(b"a\nb\n", 3).is_err());
-        let bytes = vec![b'x'; 10 * 1024 * 1024 + 1];
-        assert!(normalize(&bytes, bytes.len()).is_ok());
-        assert!(normalize(&bytes, 10 * 1024 * 1024).is_err());
+    fn input_limit_uses_configured_bound() {
+        assert!(bounded(b"a\nb\n", 4).is_ok());
+        assert!(bounded(b"a\nb\n", 3).is_err());
+        let provider = BytePreviewProvider::new(|_: &Selection<()>, _| {
+            Ok(ByteDocument::complete(&b"0123456789"[..]))
+        })
+        .with_limits(4, 10);
+        assert!(
+            provider
+                .preview(request(0, 0, 6, 2), Cancellation::test())
+                .is_err()
+        );
     }
 
     #[test]
@@ -570,53 +546,42 @@ mod tests {
         let provider = BytePreviewProvider::new(|_: &Selection<()>, _| {
             Ok(ByteDocument::complete(&b"abcdefghi\none\ntwo\nthree"[..]))
         });
+        use crate::copy_document::CopyDocument;
         provider
             .preview(request(0, 0, 6, 2), Cancellation::test())
             .unwrap();
-        let revision = provider
-            .with_ansi_document(1, 0, |doc| {
-                assert!(doc.text_row(0).unwrap().unwrap().wraps_to_next);
-                doc.revision()
-            })
-            .unwrap()
-            .unwrap();
+        let metadata = |provider: &BytePreviewProvider<()>, version, index| {
+            provider
+                .document_layout(version, index)
+                .unwrap()
+                .map(|layout| layout.metadata().unwrap())
+        };
+        let layout = provider.document_layout(1, 0).unwrap().unwrap();
+        assert!(layout.text_row(0).unwrap().unwrap().text.wraps_to_next);
+        let revision = layout.metadata().unwrap().revision;
         provider
             .preview(request(0, 2, 6, 3), Cancellation::test())
             .unwrap();
-        assert_eq!(
-            provider
-                .with_ansi_document(1, 0, |doc| doc.revision())
-                .unwrap(),
-            Some(revision)
-        );
+        assert_eq!(metadata(&provider, 1, 0).unwrap().revision, revision);
         assert!(provider.freeze_ansi_width(1, 0, true).unwrap());
         provider
             .preview(request(0, 0, 12, 2), Cancellation::test())
             .unwrap();
-        assert_eq!(
-            provider
-                .with_ansi_document(1, 0, |doc| (doc.columns(), doc.revision()))
-                .unwrap(),
-            Some((6, revision))
-        );
-        assert!(provider.with_ansi_document(2, 0, |_| ()).unwrap().is_none());
-        assert!(provider.with_ansi_document(1, 1, |_| ()).unwrap().is_none());
+        let frozen = metadata(&provider, 1, 0).unwrap();
+        assert_eq!((frozen.columns, frozen.revision), (6, revision));
+        assert!(provider.document_layout(2, 0).unwrap().is_none());
+        assert!(provider.document_layout(1, 1).unwrap().is_none());
         assert!(provider.freeze_ansi_width(1, 0, false).unwrap());
         provider
             .preview(request(0, 0, 12, 2), Cancellation::test())
             .unwrap();
-        let next = provider
-            .with_ansi_document(1, 0, |doc| {
-                assert_eq!(doc.columns(), 12);
-                doc.revision()
-            })
-            .unwrap()
-            .unwrap();
-        assert_ne!(next, revision);
+        let next = metadata(&provider, 1, 0).unwrap();
+        assert_eq!(next.columns, 12);
+        assert_ne!(next.revision, revision);
         provider
             .preview(request(1, 0, 12, 2), Cancellation::test())
             .unwrap();
-        assert!(provider.with_ansi_document(1, 0, |_| ()).unwrap().is_none());
+        assert!(provider.document_layout(1, 0).unwrap().is_none());
     }
     fn request(index: usize, offset: usize, columns: u16, rows: u16) -> PreviewRequest<()> {
         PreviewRequest {

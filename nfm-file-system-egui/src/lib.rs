@@ -1,7 +1,9 @@
 //! Host-owned filesystem picker. NFM owns scanning, navigation and previews.
+use nfm_egui::copy_document::CopyDocument;
+use nfm_egui::preview::PreviewViewport;
 use nfm_egui::{
     Appearance, Cancellation, ItemsSource, Picker, PickerConfig, PickerEvent, Placement, Preview,
-    PreviewRequest, SearchSnapshotProvider, egui,
+    PreviewProvider, PreviewRequest, SearchSnapshotProvider, egui,
 };
 pub use nfm_file_system::FileSystemPickerOptions;
 use nfm_file_system::{
@@ -23,6 +25,67 @@ const PARENT_HELP: &str = "Parent directory";
 pub trait FileSourceAdapter<S: ItemsSource>: Send + Sync + 'static {
     fn source(&self, store: Arc<FileSystemSearchStore>) -> Arc<dyn SearchSnapshotProvider<S>>;
     fn path<'a>(&self, item: &'a S::Item) -> Option<&'a str>;
+}
+/// Previews an item's path with the native file provider, forwarding paging
+/// and the copy document so preview focus and copy mode work.
+struct PathPreview<S: ItemsSource + 'static> {
+    adapter: Arc<dyn FileSourceAdapter<S>>,
+    native: Arc<dyn PreviewProvider<String>>,
+}
+impl<S: ItemsSource + 'static> PathPreview<S> {
+    fn request(&self, request: PreviewRequest<S::Item>) -> Option<PreviewRequest<String>> {
+        let path = self.adapter.path(&request.selection.item)?.to_owned();
+        Some(PreviewRequest {
+            selection: nfm_egui::Selection {
+                item: path,
+                text: request.selection.text,
+                index: request.selection.index,
+                source_version: request.selection.source_version,
+                snapshot: request.selection.snapshot,
+            },
+            document_version: request.document_version,
+            initial_page: request.initial_page,
+            columns: request.columns,
+            rows: request.rows,
+            scroll_offset: request.scroll_offset,
+            foreground: request.foreground,
+            background: request.background,
+        })
+    }
+}
+impl<S: ItemsSource + Send + Sync + 'static> PreviewProvider<S::Item> for PathPreview<S> {
+    fn preview(
+        &self,
+        request: PreviewRequest<S::Item>,
+        cancel: Cancellation,
+    ) -> Result<Preview, String> {
+        self.preview_viewport(request, cancel)
+            .map(|page| page.document)
+    }
+    fn preview_viewport(
+        &self,
+        request: PreviewRequest<S::Item>,
+        cancel: Cancellation,
+    ) -> Result<PreviewViewport, String> {
+        let first_row = request.scroll_offset;
+        match self.request(request) {
+            Some(request) => self.native.preview_viewport(request, cancel),
+            None => Ok(PreviewViewport {
+                document: Preview::Empty,
+                first_row,
+            }),
+        }
+    }
+    fn copy_document(
+        &self,
+        version: u64,
+        index: usize,
+    ) -> Result<Option<Arc<dyn CopyDocument>>, String> {
+        self.native.copy_document(version, index)
+    }
+    fn page_step(&self, rows: usize) -> usize {
+        self.native.page_step(rows)
+    }
 }
 /// The standalone picker uses filesystem snapshots directly.
 pub struct FilePaths;
@@ -117,36 +180,12 @@ where
         picker.set_external_preview(false);
         picker.set_bindings(Vec::new());
         picker.set_keybinding_help(vec![("Ctrl+U".into(), PARENT_HELP.into())]);
-        let native_provider =
-            nfm_preview::egui::file_preview_provider_with_bat_theme(options.bat_theme.clone());
-        let preview_adapter = adapter.clone();
         picker.set_preview_provider(
             ctx,
-            Arc::new(
-                move |request: PreviewRequest<S::Item>, cancel: Cancellation| {
-                    let Some(path) = preview_adapter.path(&request.selection.item) else {
-                        return Ok(Preview::Empty);
-                    };
-                    let path = path.to_owned();
-                    let request = PreviewRequest {
-                        selection: nfm_egui::Selection {
-                            item: path,
-                            text: request.selection.text,
-                            index: request.selection.index,
-                            source_version: request.selection.source_version,
-                            snapshot: request.selection.snapshot,
-                        },
-                        document_version: request.document_version,
-                        initial_page: request.initial_page,
-                        columns: request.columns,
-                        rows: request.rows,
-                        scroll_offset: request.scroll_offset,
-                        foreground: request.foreground,
-                        background: request.background,
-                    };
-                    native_provider.preview(request, cancel)
-                },
-            ),
+            Arc::new(PathPreview {
+                adapter: adapter.clone(),
+                native: nfm_preview::file_preview_provider(),
+            }),
         );
         Ok(Self {
             picker,

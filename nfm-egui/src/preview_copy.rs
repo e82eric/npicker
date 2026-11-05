@@ -1068,11 +1068,6 @@ enum Document {
         styled: Vec<Vec<PreviewCell>>,
         columns: u32,
     },
-    Ansi {
-        handle: std::sync::Arc<std::sync::Mutex<nfm_preview_vt::AnsiDocument>>,
-        columns: u32,
-        rows: u64,
-    },
 }
 
 impl Document {
@@ -1080,14 +1075,12 @@ impl Document {
         match self {
             Self::Host { metadata, .. } => metadata.columns,
             Self::Text { columns, .. } => *columns,
-            Self::Ansi { columns, .. } => *columns,
         }
     }
     fn rows(&self) -> u64 {
         match self {
             Self::Host { metadata, .. } => metadata.total_rows,
             Self::Text { rows, .. } => rows.len() as u64,
-            Self::Ansi { rows, .. } => *rows,
         }
     }
     fn row(&self, y: u64) -> Option<Row> {
@@ -1097,21 +1090,6 @@ impl Document {
                 widths: row.widths,
             }),
             Self::Text { rows, .. } => rows.get(usize::try_from(y).ok()?).cloned(),
-            Self::Ansi { handle, .. } => {
-                let row = handle
-                    .lock()
-                    .ok()?
-                    .text_row(usize::try_from(y).ok()?)
-                    .ok()??;
-                Some(Row {
-                    text: TextRow {
-                        text: row.text,
-                        columns: row.columns,
-                        wraps_to_next: row.wraps_to_next,
-                    },
-                    widths: row.widths,
-                })
-            }
         }
     }
     fn resolve(&self, mut cell: CellPosition, right: bool) -> Option<CellPosition> {
@@ -1152,31 +1130,6 @@ impl Document {
         if let Self::Host { handle, .. } = self {
             return handle.selection_text(selection).ok();
         }
-        if let Self::Ansi { handle, .. } = self {
-            let mut doc = handle.lock().ok()?;
-            let revision = doc.revision();
-            return doc
-                .selection_text(&nfm_preview_vt::Selection {
-                    revision,
-                    start: nfm_preview_vt::CellPosition {
-                        row: selection.range.start.y as usize,
-                        column: selection.range.start.x,
-                    },
-                    end: nfm_preview_vt::CellPosition {
-                        row: selection.range.end.y as usize,
-                        column: selection.range.end.x,
-                    },
-                    kind: if selection.rectangle {
-                        nfm_preview_vt::SelectionKind::Rectangle
-                    } else if selection.linewise {
-                        nfm_preview_vt::SelectionKind::Linewise
-                    } else {
-                        nfm_preview_vt::SelectionKind::Characterwise
-                    },
-                    trim: selection.trim,
-                })
-                .ok();
-        }
         let mut result = String::new();
         let range = selection.range;
         for y in range.start.y..=range.end.y {
@@ -1214,22 +1167,6 @@ impl Document {
     fn grid(&self, top: u64, rows: usize, appearance: &Appearance) -> Option<Preview> {
         match self {
             Self::Host { handle, .. } => handle.viewport(top, rows, appearance).ok(),
-            Self::Ansi { handle, .. } => {
-                let rgb = |c: egui::Color32| {
-                    ((c.r() as u32) << 16) | ((c.g() as u32) << 8) | c.b() as u32
-                };
-                let grid = handle
-                    .lock()
-                    .ok()?
-                    .viewport(
-                        top as usize,
-                        rows as u16,
-                        rgb(appearance.palette.text),
-                        rgb(appearance.palette.background),
-                    )
-                    .ok()?;
-                Some(preview::preview_from_grid(grid))
-            }
             Self::Text {
                 styled, columns, ..
             } => {
@@ -1390,11 +1327,6 @@ impl PreviewCopyMode {
     pub(crate) fn valid(&self) -> bool {
         if let Document::Host { handle, metadata } = &self.document {
             return handle.metadata().is_ok_and(|current| current == *metadata);
-        }
-        if let Document::Ansi { handle, .. } = &self.document {
-            return handle
-                .lock()
-                .is_ok_and(|doc| Some(doc.revision()) == self.mode.generation);
         }
         true
     }
@@ -2327,70 +2259,6 @@ impl PreviewCopyMode {
         painter.galley(pos, galley, appearance.palette.accent);
     }
 }
-pub(crate) fn ansi_copy_document(
-    handle: std::sync::Arc<std::sync::Mutex<nfm_preview_vt::AnsiDocument>>,
-) -> Result<std::sync::Arc<dyn crate::copy_document::CopyDocument>, String> {
-    struct AnsiCopy(Document, crate::copy_document::DocumentMetadata);
-    impl crate::copy_document::CopyDocument for AnsiCopy {
-        fn metadata(&self) -> Result<crate::copy_document::DocumentMetadata, String> {
-            if let Document::Ansi { handle, .. } = &self.0 {
-                if handle
-                    .lock()
-                    .map_err(|_| "ANSI document poisoned")?
-                    .revision()
-                    != self.1.revision
-                {
-                    return Err("stale document".into());
-                }
-            }
-            Ok(self.1)
-        }
-        fn text_row(&self, y: u64) -> Result<Option<crate::copy_document::DocumentRow>, String> {
-            self.metadata()?;
-            Ok(self.0.row(y).map(|r| crate::copy_document::DocumentRow {
-                text: r.text,
-                widths: r.widths,
-            }))
-        }
-        fn resolve_cell(&self, cell: CellPosition, right: bool) -> Result<CellPosition, String> {
-            self.metadata()?;
-            self.0.resolve(cell, right).ok_or("invalid cell".into())
-        }
-        fn selection_text(&self, selection: &CopySelection) -> Result<String, String> {
-            self.metadata()?;
-            self.0
-                .selection_text(selection)
-                .ok_or("invalid selection".into())
-        }
-        fn viewport(
-            &self,
-            top: u64,
-            rows: usize,
-            appearance: &Appearance,
-        ) -> Result<Preview, String> {
-            self.metadata()?;
-            self.0
-                .grid(top, rows, appearance)
-                .ok_or("invalid viewport".into())
-        }
-    }
-    let doc = handle.lock().map_err(|_| "ANSI document poisoned")?;
-    let metadata = crate::copy_document::DocumentMetadata {
-        revision: doc.revision(),
-        total_rows: doc.total_rows() as u64,
-        columns: u32::from(doc.columns()),
-    };
-    drop(doc);
-    Ok(std::sync::Arc::new(AnsiCopy(
-        Document::Ansi {
-            handle,
-            columns: metadata.columns,
-            rows: metadata.total_rows,
-        },
-        metadata,
-    )))
-}
-
 struct SearchJob {
     revision: u64,
     cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,

@@ -57,6 +57,7 @@ pub struct DocumentBuilder {
     runs: Vec<Run>,
     source_rows: Vec<SourceRow>,
     column_maps: Vec<ColumnMap>,
+    fills: Vec<Option<Style>>,
     line_start: usize,
     source_origin: usize,
 }
@@ -68,6 +69,7 @@ impl Default for DocumentBuilder {
             runs: Vec::new(),
             source_rows: Vec::new(),
             column_maps: Vec::new(),
+            fills: Vec::new(),
             line_start: 0,
             source_origin: 0,
         }
@@ -85,6 +87,19 @@ impl DocumentBuilder {
         columns: &[u32],
         wraps: bool,
         styles: &[ColumnStyleRun],
+    ) -> Result<(), String> {
+        self.push_row_filled(text, columns, wraps, styles, None)
+    }
+    /// Like `push_row`; `fill` styles the cells past the end of the logical
+    /// line up to the layout's right edge (terminal background-color erase).
+    /// Only the fill of a line's final row applies.
+    pub fn push_row_filled(
+        &mut self,
+        text: &str,
+        columns: &[u32],
+        wraps: bool,
+        styles: &[ColumnStyleRun],
+        fill: Option<Style>,
     ) -> Result<(), String> {
         if columns.len() != text.len() {
             return Err("Invalid document column map".into());
@@ -150,6 +165,7 @@ impl DocumentBuilder {
         });
         if !wraps {
             self.lines.push(self.line_start..self.text.len());
+            self.fills.push(fill);
             self.line_start = self.text.len();
         }
         Ok(())
@@ -171,6 +187,7 @@ impl DocumentBuilder {
     pub fn finish(mut self) -> Arc<StyledDocument> {
         if self.source_rows.last().is_some_and(|r| r.wraps) {
             self.lines.push(self.line_start..self.text.len());
+            self.fills.push(None);
         }
         Arc::new(StyledDocument {
             text: self.text.snapshot(),
@@ -178,6 +195,7 @@ impl DocumentBuilder {
             runs: self.runs,
             source_rows: self.source_rows,
             column_maps: self.column_maps,
+            fills: self.fills,
             source_origin: self.source_origin,
         })
     }
@@ -196,9 +214,21 @@ pub struct StyledDocument {
     runs: Vec<Run>,
     source_rows: Vec<SourceRow>,
     column_maps: Vec<ColumnMap>,
+    fills: Vec<Option<Style>>,
     source_origin: usize,
 }
 impl StyledDocument {
+    /// Parse terminal output (SGR styles, carriage-return overwrite, erase and
+    /// relative cursor motion; see `crate::ansi`) into a width-independent
+    /// document; `layout` wraps it for display. Output past `max_lines` lines
+    /// is dropped.
+    pub fn from_ansi(
+        bytes: &[u8],
+        max_bytes: usize,
+        max_lines: usize,
+    ) -> Result<Arc<Self>, String> {
+        crate::ansi::parse(bytes, max_bytes, max_lines)
+    }
     pub fn source_byte_offset(&self, row: usize, column: u32) -> Option<usize> {
         let position = self.source_position(row, column)?;
         Some(self.lines[position.line].start + position.byte)
@@ -252,7 +282,7 @@ impl StyledDocument {
         }
         let mut rows = Vec::new();
         let mut line_rows = Vec::with_capacity(self.lines.len());
-        for range in &self.lines {
+        for (line, range) in self.lines.iter().enumerate() {
             if cancel.is_cancelled() {
                 return Err("preview cancelled".into());
             }
@@ -271,6 +301,7 @@ impl StyledDocument {
                         end: range.start + byte,
                         width,
                         wraps: true,
+                        fill: None,
                     });
                     start = range.start + byte;
                     width = 0;
@@ -282,6 +313,7 @@ impl StyledDocument {
                 end: range.end,
                 width,
                 wraps: false,
+                fill: self.fills.get(line).copied().flatten(),
             });
         }
         static REVISION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -383,6 +415,8 @@ struct LayoutRow {
     end: usize,
     width: usize,
     wraps: bool,
+    /// Style of the padding after the line's text (final row only).
+    fill: Option<Style>,
 }
 pub struct DocumentLayout {
     document: Arc<StyledDocument>,
@@ -392,6 +426,16 @@ pub struct DocumentLayout {
     revision: u64,
 }
 impl DocumentLayout {
+    pub fn columns(&self) -> usize {
+        self.columns
+    }
+    pub fn total_rows(&self) -> usize {
+        self.rows.len()
+    }
+    /// First row of a `rows`-tall viewport, clamped to the last full page.
+    pub(crate) fn first_row(&self, requested: usize, rows: usize) -> usize {
+        requested.min(self.rows.len().saturating_sub(rows))
+    }
     pub fn cell(&self, position: Position) -> Option<CellPosition> {
         let line = self.document.lines.get(position.line)?;
         let absolute = line.start + position.byte.min(line.len());
@@ -444,7 +488,7 @@ impl DocumentLayout {
             widths,
         })
     }
-    fn grid(
+    pub(crate) fn grid(
         &self,
         first: usize,
         count: usize,
@@ -483,8 +527,9 @@ impl DocumentLayout {
                 }
                 x += width;
             }
+            let fill = row.fill.unwrap_or_default();
             while x < self.columns {
-                let mut cell = styled_cell(Style::default(), " ", foreground, background);
+                let mut cell = styled_cell(fill, " ", foreground, background);
                 apply_highlight(&mut cell, x, y, highlight);
                 cells.push(cell);
                 x += 1;
@@ -1027,6 +1072,32 @@ mod tests {
         assert_eq!(document.source_row(0).unwrap().text, "abc  ");
         let layout = document.layout(10, &Cancellation::test()).unwrap();
         assert_eq!(layout.rows.len(), 2);
+    }
+    #[test]
+    fn ansi_documents_rewrap_and_extend_erase_backgrounds_to_the_edge() {
+        let document =
+            StyledDocument::from_ansi(b"\x1b[41mred\x1b[K\x1b[0m\nplain", 1024, 100).unwrap();
+        assert_eq!(document.source_row(0).unwrap().text, "red");
+        for columns in [6, 10] {
+            let layout = document.layout(columns, &Cancellation::test()).unwrap();
+            let Preview::Grid { cells, .. } =
+                layout.grid(0, 2, egui::Color32::WHITE, egui::Color32::BLACK, None)
+            else {
+                panic!()
+            };
+            let red = cells[0].background;
+            assert_ne!(red, egui::Color32::BLACK);
+            assert_eq!(cells[columns - 1].background, red);
+            assert_eq!(cells[columns].text, "p");
+            assert_eq!(cells[2 * columns - 1].background, egui::Color32::BLACK);
+        }
+        assert_eq!(
+            document
+                .layout(2, &Cancellation::test())
+                .unwrap()
+                .total_rows(),
+            5
+        );
     }
     #[test]
     fn trailing_background_is_rendered_without_changing_searchable_text() {

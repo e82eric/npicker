@@ -98,13 +98,17 @@ pub struct Cancellation {
     stopped: Arc<AtomicBool>,
 }
 impl Cancellation {
-    #[cfg(test)]
-    pub(crate) fn test() -> Self {
+    /// A token that is never cancelled, for synchronous helpers.
+    pub fn never() -> Self {
         Self {
             revision: Arc::new(AtomicU64::new(0)),
             expected: 0,
             stopped: Arc::new(AtomicBool::new(false)),
         }
+    }
+    #[cfg(test)]
+    pub(crate) fn test() -> Self {
+        Self::never()
     }
     #[cfg(test)]
     pub(crate) fn cancel_for_test(&self) {
@@ -481,47 +485,31 @@ pub(crate) fn paint(
     }
 }
 
-/// ANSI parsing uses the standalone Ghostty VT library.
+/// Input bound for `parse_ansi`; byte previews configure their own.
+pub const MAX_ANSI_BYTES: usize = 20 * 1024 * 1024;
+/// Retained line bound for `parse_ansi`.
+pub const MAX_ANSI_LINES: usize = 8192;
+
+/// Parse ANSI output (pure Rust; see `ansi.rs`) and render the
+/// request's viewport, wrapping long lines at `request.columns`.
 pub fn parse_ansi<T>(bytes: &[u8], request: &PreviewRequest<T>) -> Result<Preview, String> {
-    let rgb = |c: Color32| ((c.r() as u32) << 16) | ((c.g() as u32) << 8) | c.b() as u32;
-    let grid = nfm_preview_vt::parse(
-        bytes,
-        request.columns,
-        request.rows,
-        request.scroll_offset,
-        rgb(request.foreground),
-        rgb(request.background),
-    )
-    .map_err(|error| error.to_string())?;
-    Ok(preview_from_grid(grid))
-}
-pub(crate) fn preview_from_grid(grid: nfm_preview_vt::Grid) -> Preview {
-    let color =
-        |value: u32| Color32::from_rgb((value >> 16) as u8, (value >> 8) as u8, value as u8);
-    Preview::Grid {
-        columns: grid.columns as usize,
-        total_rows: grid.total_rows,
-        cells: grid
-            .cells
-            .into_iter()
-            .map(|cell| PreviewCell {
-                text: cell.codepoints[..usize::from(cell.length).min(8)]
-                    .iter()
-                    .filter_map(|&c| char::from_u32(c))
-                    .collect(),
-                foreground: color(cell.foreground),
-                background: color(cell.background),
-                underline_color: color(cell.underline_color),
-                bold: cell.flags & 1 != 0,
-                italic: cell.flags & 2 != 0,
-                strikethrough: cell.flags & 4 != 0,
-                inverse: cell.flags & 8 != 0,
-                invisible: cell.flags & 16 != 0,
-                faint: cell.flags & 32 != 0,
-                underline: cell.underline != 0,
-            })
-            .collect(),
+    if request.columns == 0 || request.rows == 0 {
+        return Err("Invalid preview dimensions".into());
     }
+    let rows = usize::from(request.rows);
+    let document = crate::styled_document::StyledDocument::from_ansi(
+        bytes,
+        MAX_ANSI_BYTES,
+        MAX_ANSI_LINES + rows,
+    )?;
+    let layout = document.layout(usize::from(request.columns), &Cancellation::never())?;
+    Ok(layout.grid(
+        layout.first_row(request.scroll_offset, rows),
+        rows,
+        request.foreground,
+        request.background,
+        None,
+    ))
 }
 
 #[cfg(test)]

@@ -10,8 +10,7 @@ See [Using copy mode](docs/copy-mode/README.md) for preview controls, keybinding
 
 `nfm-egui` is the shared picker UI for the terminal and SimpleWindowManager.
 It owns picker state and widgets, not a native window, event loop, OpenGL context,
-clipboard, application actions, or the terminal itself. The existing NFM Skia
-host remains available alongside SimpleWindowManager's native Win32 egui host.
+clipboard, application actions, or the terminal itself.
 
 The default layout preserves the terminal's bottom query, with rank zero directly
 above it and previews above the results. `Layout::QueryTop` provides a top query
@@ -127,8 +126,8 @@ joining on the UI thread; a provider that ignores cancellation can continue unti
 its work returns, retaining its owned snapshot safely.
 
 Use `preview::parse_ansi(bytes, &request)` for command/ANSI
-previews. This links only the standalone VT library via `nfm-preview-vt`; see
-[the VT build contract](../nfm-preview-vt/README.md). Raw ANSI is not interpreted
+previews. Parsing is pure Rust (`vte` plus the line model in `src/ansi.rs`);
+`StyledDocument::from_ansi` exposes the same parser for document previews. Raw ANSI is not interpreted
 by `Preview::Text`. Native window thumbnails and application-specific preview
 content are supplied by host adapters, not a second NFM-owned popup window.
 
@@ -217,16 +216,8 @@ cargo test -p nfm-egui
 cargo check -p nfm-egui --features opengl
 ```
 
-With the standalone VT environment variables configured:
-
-```powershell
-cargo run -p nfm-egui-demo 
-cargo test -p nfm-egui -p nfm-preview-vt --all-features
-```
-
 The default control needs no native VT build. Demo window/input dependencies live
 only in the separate demo package and do not enter shared-control builds.
-Existing Skia host behavior remains unchanged.
 
 For an OpenGL screenshot after the stream settles, pass `--screenshot target/picker.png`.
 The demo captures its framebuffer and closes automatically.
@@ -237,18 +228,19 @@ background and ANSI text decorations while the control handles line scrolling.
 ColorImage; the control fits it to the preview area and uploads its texture once.
 The image document should be used with the egui context that paints it.
 
-On Windows, the parent `nfm-rust-win32host` package's optional `egui-previews`
-feature exposes `preview::egui::file_preview_provider()`. This adapts the same
-bat/ffmpeg/ffprobe resolver and cancellable command backend used by the Skia file
-menu. Hosts do not need to duplicate media detection or ANSI parsing.
-Structured queries use the same parser and source completions as the Skia picker:
+[`nfm-preview`](../nfm-preview/README.md) provides
+`nfm_preview::file_preview_provider()`, the ffmpeg/ffprobe and highlighted-text
+file preview used by the filesystem picker. Hosts do not need to duplicate media
+detection.
+
+Structured queries share one parser and source completions:
 `/:Column==value` filters (also `!=`, `=~`, `!~`, `>`, `>=`, `<`, `<=`),
 `/!Ascending==Column` or `/!Descending==Column` sorts, and
 `/#Display==Column,OtherColumn` selects/reorders displayed columns. Quoted values,
 comma-separated alternatives, repeated expressions and fuzzy text can be combined.
 These expressions are available on structured sources, such as processes.
 
-Typing `/` opens the Skia-style six-row completion popup at the active token.
+Typing `/` opens a six-row completion popup at the active token.
 Up/Down selects a suggestion, Enter or Tab applies it, and Escape dismisses the
 popup before closing the picker. Suggestions include actions, columns, operators
 and values, with match highlighting and mouse selection. Completion retains the
@@ -296,9 +288,9 @@ Install `byte_preview::BytePreviewProvider` with
 `highlight` uses inclusive document row/column coordinates. NFM owns half-page
 keyboard scrolling, clamping, parsing, highlight application and clipping.
 Paged previews parse at the original source width before clipping to the UI;
-resizing cannot reflow terminal coordinates. LF-only input is normalized to
-CRLF. Input and parser allocation limits remain those of `nfm-preview-vt`.
-Complete documents can reflow at the requested UI width.
+resizing cannot reflow terminal coordinates. LF and CRLF are equivalent.
+`BytePreviewProvider::with_limits` bounds input bytes and retained lines.
+Complete documents are parsed once and re-wrapped at the requested UI width.
 
 The resolver is cached by selected source index, text and version. Append-only
 sources use version zero for previews because existing payloads cannot change.
@@ -360,12 +352,13 @@ The preview and Ghostty terminal share the engine exported as
   Shift+N navigate matches. Word searches also use the copied engine bindings.
 - Ctrl+P hides the preview and returns to the query.
 
-Ghostty VT is a required dependency. Plain and styled text previews and complete
-ANSI byte previews use a retained document adapter exposed by
-`PreviewProvider::copy_document`, preserving full graphemes, wide-cell widths,
-and soft wraps. Layout stays fixed during preview focus, including resize;
-returning to the query allows the next preview request to reparse at the new
-width. `Picker::preview_focused()` lets hosts inspect focus.
+Plain and styled text previews and complete ANSI byte previews use a retained
+document adapter exposed by `PreviewProvider::copy_document`; complete ANSI
+previews hand out their `DocumentLayout`, preserving full graphemes, wide-cell
+widths, and soft wraps. Layout stays fixed during preview focus, including resize;
+returning to the query allows the next preview request to re-wrap at the new
+width. `BytePreviewProvider::document_layout` returns the current layout.
+`Picker::preview_focused()` lets hosts inspect focus.
 
 Images and cell-only/paged previews without a copy document handle do not take
 copy-mode focus. Ghostty's host-specific line-split and hint-picker actions

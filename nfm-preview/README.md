@@ -1,33 +1,25 @@
 # nfm-preview
 
-Shared preview resolution, bounded command output, cancellation, ANSI documents,
-formatted text, native-window identifiers, and Windows file-preview profiles.
+File-type routing for path previews. `resolver(MediaPreviewSettings)` returns a
+`FilePreviewResolver` that picks a `nfm_preview_file` plan for each path:
 
-The default configuration has no renderer dependency. Enable `egui` for
-`nfm_preview::egui::file_preview_provider()` and PNG decoding. This adapter creates
-no native window or GPU context. Existing bat/ffmpeg/ffprobe behavior is retained.
+- Images: the first frame from `ffmpeg`, as PNG.
+- Videos: a frame at `video_position` (default a quarter of the way through),
+  located with `ffprobe`.
+- Directories: a sorted entry list, with `/` after subdirectories.
+- Everything else: the file's UTF-8 text, syntax-highlighted in process with
+  `nfm-preview-text`, or a "Binary file" notice.
 
-`PreviewFactory::create` accepts `PreviewEvents`, which delivers `PreviewEvent`
-through a host callback or a crossbeam sender. Callbacks should return promptly;
-delivery runs on the producing thread. The legacy host wraps events in its own
-view-model envelope without another forwarding thread. SWM uses the egui adapter
-directly and does not depend on the legacy host.
+Frames larger than 1280×1280 are scaled down to fit. `MediaPreviewSettings::files`
+sets the highlighting theme and syntax, and `max_bytes` bounds both text and
+ffmpeg output. The resolver runs on the preview worker, so the ffprobe call never
+blocks the UI. No window or GPU context is created.
 
-The parser's document types are public so both egui and legacy renderers can
-present the same output. The `preview` module remains available for compatibility.
+`file_preview_provider()` wraps the default resolver as a
+`PreviewProvider<String>`. `path_preview_provider(resolver)` does the same for
+any resolver, including a host's own. Filesystem pickers install the default
+provider, and hosts can replace it with `set_preview_provider`.
 
-Use `egui::file_preview_provider_with_bat_theme(Some("gruvbox-dark".into()))`
-or `preview::native_file::preview_factory_with_bat_theme` to explicitly select a
-bat theme. `None` preserves bat's config and inherited `BAT_THEME`. Filesystem
-pickers expose this as `FileSystemPickerOptions::bat_theme` and retain it during
-navigation. Theme names must be available in `bat --list-themes`.
-
-All ANSI output is parsed by the standalone Ghostty VT library through
-`nfm-preview-vt`, including command and formatted previews. Build Ghostty VT
-separately and set `GHOSTTY_ROOT` or both `NFM_GHOSTTY_VT_INCLUDE_DIR`
-and `NFM_GHOSTTY_VT_LIB_DIR` to select its headers and static library.
-See [the VT build instructions](../nfm-preview-vt/README.md).
-The styled-line API remains available to both renderers. Stdout and stderr are
-parsed independently and displayed in that order, so terminal state cannot bleed
-between streams. Capture is bounded to 20 MiB and 4000 lines; native scrollback
-also limits retained physical rows.
+```text
+cargo test -p nfm-preview -- --include-ignored   # needs ffmpeg and ffprobe
+```

@@ -7,8 +7,6 @@ pub struct FileSystemPickerOptions {
     pub files_only: bool,
     pub search_string: Option<String>,
     pub preview_visible: bool,
-    /// None preserves bat's configuration and BAT_THEME environment setting.
-    pub bat_theme: Option<String>,
 }
 
 impl Default for FileSystemPickerOptions {
@@ -20,7 +18,6 @@ impl Default for FileSystemPickerOptions {
             files_only: false,
             search_string: None,
             preview_visible: true,
-            bat_theme: None,
         }
     }
 }
@@ -62,7 +59,6 @@ impl FileSystemPickerOptions {
         Self {
             roots,
             preview_visible,
-            bat_theme: self.bat_theme.clone(),
             ..Self::default()
         }
     }
@@ -100,7 +96,6 @@ mod tests {
             max_depth: 2,
             files_only: true,
             search_string: Some("query".into()),
-            bat_theme: Some("gruvbox-dark".into()),
             ..Default::default()
         };
         let next = options.navigate_to(vec!["child".into()], false);
@@ -108,6 +103,5 @@ mod tests {
         assert_eq!(next.max_depth, i32::MAX);
         assert!(!next.files_only && !next.directories_only && !next.preview_visible);
         assert!(next.search_string.is_none());
-        assert_eq!(next.bat_theme, options.bat_theme);
     }
 }

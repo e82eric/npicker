@@ -3116,7 +3116,8 @@ mod query_parity_tests {
         );
         assert_eq!(
             provider
-                .with_ansi_document(selection.0, selection.1, |doc| doc.columns())
+                .document_layout(selection.0, selection.1)
+                .map(|layout| layout.map(|layout| layout.columns() as u16))
                 .unwrap(),
             Some(new_columns)
         );
@@ -3149,7 +3150,14 @@ mod query_parity_tests {
         }
         let (version, index) = picker.preview.as_ref().unwrap().document_selection.unwrap();
         let revision = provider
-            .with_ansi_document(version, index, |doc| doc.revision())
+            .document_layout(version, index)
+            .map(|layout| {
+                layout.map(|layout| {
+                    crate::copy_document::CopyDocument::metadata(&*layout)
+                        .unwrap()
+                        .revision
+                })
+            })
             .unwrap()
             .unwrap();
         draw(
@@ -3188,7 +3196,14 @@ mod query_parity_tests {
         assert!(picker.preview_focused());
         assert_eq!(
             provider
-                .with_ansi_document(version, index, |doc| doc.revision())
+                .document_layout(version, index)
+                .map(
+                    |layout| layout.map(|layout| crate::copy_document::CopyDocument::metadata(
+                        &*layout
+                    )
+                    .unwrap()
+                    .revision)
+                )
                 .unwrap(),
             Some(revision)
         );

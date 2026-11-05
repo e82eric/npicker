@@ -1,6 +1,7 @@
 #![doc = include_str!("../README.md")]
 //! Embedded picker UI. Hosts own windows, input, egui/GL contexts and actions.
 //! See the crate README for the embedding and lifetime contracts.
+mod ansi;
 mod appearance;
 pub mod copy_controller;
 pub mod copy_document;

@@ -560,13 +560,19 @@ impl CopyMode {
         self.host_objects = keys.to_vec();
         Ok(())
     }
-    fn text_object_key(&self, key: egui::Key, modifiers: egui::Modifiers) -> Option<CopyTextObject> {
+    fn text_object_key(
+        &self,
+        key: egui::Key,
+        modifiers: egui::Modifiers,
+    ) -> Option<CopyTextObject> {
         copy_text_object_key(key, modifiers).or_else(|| {
             if modifiers.ctrl || modifiers.alt || modifiers.mac_cmd {
                 return None;
             }
             let mut name = key.name().chars();
-            let letter = name.next().filter(|c| c.is_ascii_alphabetic() && name.next().is_none())?;
+            let letter = name
+                .next()
+                .filter(|c| c.is_ascii_alphabetic() && name.next().is_none())?;
             let letter = if modifiers.shift {
                 letter.to_ascii_uppercase()
             } else {
@@ -2477,13 +2483,13 @@ impl CopyMode {
             }
             self.pending_visual_object = None;
             let count = prefix_count.saturating_mul(self.take_count());
-            return self.text_object_key(key, modifiers).map_or(CopyAction::None, |kind| {
-                CopyAction::SelectObject {
+            return self
+                .text_object_key(key, modifiers)
+                .map_or(CopyAction::None, |kind| CopyAction::SelectObject {
                     object,
                     kind,
                     count,
-                }
-            });
+                });
         }
         if self.pending_jump.is_some() {
             self.skip_trigger_text = false;
@@ -2547,11 +2553,12 @@ impl CopyMode {
                         Some(YankCommand::RowEnd(count))
                     }
                     (Some(object), key, modifiers) => {
-                        self.text_object_key(key, modifiers).map(|kind| YankCommand::Object {
-                            object,
-                            kind,
-                            count,
-                        })
+                        self.text_object_key(key, modifiers)
+                            .map(|kind| YankCommand::Object {
+                                object,
+                                kind,
+                                count,
+                            })
                     }
                     _ => pending_motion.map(|motion| YankCommand::Motion {
                         motion,
