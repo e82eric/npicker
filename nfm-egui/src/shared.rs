@@ -148,7 +148,6 @@ where
         picker.set_external_preview(false);
         picker.set_preview_line_numbers(config.preview_line_numbers);
         picker.set_bindings(config.bindings);
-        picker.set_keybinding_help(Vec::new());
         picker.set_preview_provider(
             ctx,
             Arc::new(

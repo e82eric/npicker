@@ -199,17 +199,68 @@ Graphics resources can be recreated without recreating picker/search state.
   Native window hosts can read `picker.effective_position(configured_position)`
   after `show` to resize their window when the placement changes. The host owns
   monitor/work-area bounds and restores its popup geometry when FullPane ends.
-  `PickerBinding.action` is `PickerAction::ToggleFullPane` or
-  `PickerAction::Custom(id)`. Construction and `set_bindings` merge host bindings
-  over the default chord; later entries replace earlier entries with the same
-  trigger and modifiers. Toggle bindings can be remapped to another key. Their
-  effective shortcuts appear in help. Other built-in shortcuts remain separate.
-  Each binding carries an optional `description`; NFM generates its help entry
-  from the effective chord and description. `None` omits the entry. Hosts should
-  use `set_keybinding_help` only for additional hints, rather than repeating
-  descriptions already supplied on bindings.
+- Ctrl+Shift+L shows or hides preview line numbers.
+- Ctrl+Shift+/ opens the command palette (see Commands below).
 - Tab applies the first source completion at the query caret. The query displays
   no additional completion row, matching the Ghostty panel. Hosts can also use `completions` and `apply_completion`.
+
+### Commands
+
+Every picker shortcut above except Enter, Escape, Tab, result navigation and
+query editing runs a `PickerAction` command, and so can be rebound, removed,
+run from the command palette, or run by the host:
+
+| Command | Default keys |
+|---|---|
+| `ToggleCommandPalette` | Ctrl+Shift+/ (or Ctrl+Shift+?) |
+| `TogglePreview` | Ctrl+P, Ctrl+Space |
+| `TogglePreviewFocus` | Ctrl+W |
+| `QuickSelect` | Alt+Space |
+| `CopySelection` | Ctrl+C |
+| `CopyPreviewDocument` | Ctrl+Shift+C (in copy mode) |
+| `ScrollPreviewPageUp` / `ScrollPreviewPageDown` | Ctrl+Page Up / Page Down |
+| `ScrollPreviewLineUp` / `ScrollPreviewLineDown` | Ctrl+Up / Down |
+| `TogglePreviewLineNumbers` | Ctrl+Shift+L |
+| `ToggleRelativePreviewLineNumbers` | none |
+| `ToggleFullPane` | Ctrl+Shift+F |
+
+The two line-number commands are independent switches, like Vim's `number` and
+`relativenumber`: line numbers alone are absolute, relative numbers alone are
+relative, and both together are hybrid.
+
+`default_bindings()` returns these. Construction and `set_bindings` merge host
+bindings over them by chord: a host binding with the same trigger and modifiers
+replaces the default, and binding a chord to `PickerAction::Unbind` removes it.
+`PickerAction::Custom(id)` bindings are reported as
+`PickerEvent::CustomAction { action: id, .. }`; only the first custom command
+in a frame is reported. `PickerAction::name` and `from_name` give each built-in
+command a stable name (the variant's, such as `"TogglePreviewLineNumbers"`;
+`Unbind` is `"None"`) for host configuration files.
+
+While copy mode is focused, the scrolling and `CopySelection` chords belong to
+copy mode (Ctrl+C yanks, Ctrl+Page Up/Down page), and Ctrl+P moves to the
+previous match while copy-mode search is open. A command whose key is held
+repeats, except for `ToggleFullPane`, the line-number commands and custom
+commands.
+
+`Picker::execute(ctx, action)` runs a command at the start of the next frame,
+as if its key had been pressed, so hosts can offer picker commands in their own
+menus or remote-control interfaces.
+
+The command palette (Ctrl+Shift+/) is a list of commands: every built-in
+command, then each custom command whose binding has a `description`, each with
+its current keys. It is a picker over a structured source with Command and Keys
+columns, so it searches like any structured picker: fuzzy text (matching either
+column) ranks commands and highlights the matched characters, and structured
+expressions such as `/:Keys=~Shift` filter, sort or choose columns with the
+usual completions. Up/Down and Page Up/Down select; Enter runs the selected
+command on the next frame, as `execute` does; Escape or the palette key closes
+it without cancelling the picker.
+Commands without a key, such as `ToggleRelativePreviewLineNumbers`, run from
+here. The palette opens at the top of the picker, sized for the whole list or
+the space available, and keeps that size while filtering. Custom bindings
+without a `description` stay out of the palette. `set_keybinding_help` is
+deprecated and has no effect.
 
 ## Demo and checks
 
@@ -253,7 +304,7 @@ popup before closing the picker. Suggestions include actions, columns, operators
 and values, with match highlighting and mouse selection. Completion retains the
 surrounding query and cursor position. Headers and row display use the source's
 selected columns; header text is yellow with a gold separator.
-Keyboard parity: Ctrl+C requests copying the selected item; Preview copying requires Ctrl+W preview focus; Ctrl+Shift+C then copies the complete document. Results-pane copy commands apply to the selected item. Ctrl+Shift+/ opens a keyboard help overlay; Up/Down, Page Up/Down, Home/End scroll it, and Escape closes help without cancelling the picker. Hosts can add their action descriptions with `set_keybinding_help` and check `keybinding_help_visible` before consuming custom keys.
+Keyboard parity: Ctrl+C requests copying the selected item; Preview copying requires Ctrl+W preview focus; Ctrl+Shift+C then copies the complete document. Results-pane copy commands apply to the selected item. Ctrl+Shift+/ opens the command palette; Escape closes it without cancelling the picker. Hosts should check `keybinding_help_visible` (true while the palette is open) before consuming custom keys.
 
 Hosts can call `set_external_preview(true)` to reserve preview space without a
 preview worker. `PickerOutput.preview_rect` supplies the clipped bounds in egui
@@ -413,7 +464,11 @@ mode and NFM previews, including after config reload.
 
 Preview line numbers are off by default. Set `PickerConfig::preview_line_numbers`
 or call `Picker::set_preview_line_numbers` with `PreviewLineNumbers::Absolute`,
-`Relative` or `Hybrid` (Vim's `number` + `relativenumber`). Numbers count
+`Relative` or `Hybrid` (Vim's `number` + `relativenumber`). Users can change
+them with Ctrl+Shift+L and the palette's line-number commands;
+`Picker::preview_line_numbers` reads the current style so hosts can keep it.
+Toggling while copy mode is focused keeps the focused layout, so the gutter
+narrows its visible width until copy mode is left and the preview rewraps. Numbers count
 logical lines, so soft-wrapped continuation rows are blank and a relative
 number is the count `j`/`k` needs to reach that line. Relative numbers follow
 the copy cursor only while the preview is focused; unfocused previews show

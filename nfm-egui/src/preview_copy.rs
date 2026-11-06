@@ -1140,6 +1140,11 @@ impl PreviewCopyMode {
         self.quick_select.is_some()
     }
 
+    /// Whether `/` or `?` search input is open; it reads Ctrl+N and Ctrl+P.
+    pub(crate) fn search_input_active(&self) -> bool {
+        self.search_input.is_some()
+    }
+
     pub(crate) fn open_quick_select(&mut self, from_copy: bool, rows: usize) -> bool {
         self.hide_decorations();
         self.quick_origin = Some((self.mode.clone(), self.top, self.left));

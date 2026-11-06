@@ -15,11 +15,6 @@ use std::{
     sync::Arc,
 };
 
-#[cfg(windows)]
-const PARENT_HELP: &str = "Parent directory / drive list";
-#[cfg(not(windows))]
-const PARENT_HELP: &str = "Parent directory";
-
 /// Adapt filesystem snapshots to a host's shared picker item type.
 /// Navigation and preview behavior remain inside NFM.
 pub trait FileSourceAdapter<S: ItemsSource>: Send + Sync + 'static {
@@ -179,7 +174,6 @@ where
         };
         picker.set_external_preview(false);
         picker.set_bindings(Vec::new());
-        picker.set_keybinding_help(vec![("Ctrl+U".into(), PARENT_HELP.into())]);
         picker.set_preview_provider(
             ctx,
             Arc::new(PathPreview {

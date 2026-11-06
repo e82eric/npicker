@@ -105,7 +105,6 @@ where
         };
         picker.set_external_preview(true);
         picker.set_bindings(Vec::new());
-        picker.set_keybinding_help(Vec::new());
         Self {
             picker,
             thumbnail: WindowThumbnail::default(),

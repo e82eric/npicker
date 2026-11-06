@@ -7,6 +7,7 @@ use crate::{
     session::{Session, Update},
 };
 use egui::{Context, Id, Key, Modifiers};
+use nfm_picker_sources::structured::{StructuredStreamingSnapshot, structured_source};
 use nfm_search_core::search::resolve_match_positions;
 use std::{
     sync::Arc,
@@ -39,22 +40,131 @@ pub enum PickerTrigger {
     Key(Key),
     DoubleClick,
 }
+/// A picker command. Key bindings, the command palette and
+/// [`Picker::execute`] all run commands; `Custom` commands are reported to
+/// the host as [`PickerEvent::CustomAction`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PickerAction {
+    /// Open or close the command palette, which also lists key bindings.
+    ToggleCommandPalette,
+    TogglePreview,
+    /// Enter or leave preview copy mode.
+    TogglePreviewFocus,
+    QuickSelect,
+    /// Ask the host to copy the selected result.
+    CopySelection,
+    /// Copy the whole preview document.
+    CopyPreviewDocument,
+    ScrollPreviewPageUp,
+    ScrollPreviewPageDown,
+    ScrollPreviewLineUp,
+    ScrollPreviewLineDown,
+    /// Show or hide line numbers, like Vim's `number`. With relative
+    /// numbers on, this switches between relative and hybrid.
+    TogglePreviewLineNumbers,
+    /// Show or hide relative line numbers, like Vim's `relativenumber`.
+    /// With line numbers on, this switches between absolute and hybrid.
+    ToggleRelativePreviewLineNumbers,
     ToggleFullPane,
+    /// Bind a chord to this to remove its default command.
+    Unbind,
     Custom(usize),
+}
+impl PickerAction {
+    /// Every built-in command, in command palette order.
+    pub const BUILT_IN: [PickerAction; 13] = [
+        Self::ToggleCommandPalette,
+        Self::TogglePreview,
+        Self::TogglePreviewFocus,
+        Self::QuickSelect,
+        Self::CopySelection,
+        Self::CopyPreviewDocument,
+        Self::ScrollPreviewPageUp,
+        Self::ScrollPreviewPageDown,
+        Self::ScrollPreviewLineUp,
+        Self::ScrollPreviewLineDown,
+        Self::TogglePreviewLineNumbers,
+        Self::ToggleRelativePreviewLineNumbers,
+        Self::ToggleFullPane,
+    ];
+    /// Stable name for host configuration, such as `"TogglePreview"`. `Unbind`
+    /// is `"None"`; custom commands have no name.
+    pub fn name(self) -> Option<&'static str> {
+        Some(match self {
+            Self::ToggleCommandPalette => "ToggleCommandPalette",
+            Self::TogglePreview => "TogglePreview",
+            Self::TogglePreviewFocus => "TogglePreviewFocus",
+            Self::QuickSelect => "QuickSelect",
+            Self::CopySelection => "CopySelection",
+            Self::CopyPreviewDocument => "CopyPreviewDocument",
+            Self::ScrollPreviewPageUp => "ScrollPreviewPageUp",
+            Self::ScrollPreviewPageDown => "ScrollPreviewPageDown",
+            Self::ScrollPreviewLineUp => "ScrollPreviewLineUp",
+            Self::ScrollPreviewLineDown => "ScrollPreviewLineDown",
+            Self::TogglePreviewLineNumbers => "TogglePreviewLineNumbers",
+            Self::ToggleRelativePreviewLineNumbers => "ToggleRelativePreviewLineNumbers",
+            Self::ToggleFullPane => "ToggleFullPane",
+            Self::Unbind => "None",
+            Self::Custom(_) => return None,
+        })
+    }
+    /// The built-in command (or `Unbind`) with this [`name`](Self::name).
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::BUILT_IN
+            .into_iter()
+            .chain([Self::Unbind])
+            .find(|action| action.name() == Some(name))
+    }
+    /// Command palette title; custom commands use their binding's description.
+    pub fn title(self) -> Option<&'static str> {
+        Some(match self {
+            Self::ToggleCommandPalette => "Command palette",
+            Self::TogglePreview => "Toggle preview",
+            Self::TogglePreviewFocus => "Focus preview / query",
+            Self::QuickSelect => "Quick Select preview",
+            Self::CopySelection => "Copy selection",
+            Self::CopyPreviewDocument => "Copy preview document",
+            Self::ScrollPreviewPageUp => "Scroll preview up a page",
+            Self::ScrollPreviewPageDown => "Scroll preview down a page",
+            Self::ScrollPreviewLineUp => "Scroll preview up a line",
+            Self::ScrollPreviewLineDown => "Scroll preview down a line",
+            Self::TogglePreviewLineNumbers => "Toggle line numbers",
+            Self::ToggleRelativePreviewLineNumbers => "Toggle relative line numbers",
+            Self::ToggleFullPane => "Toggle full-pane picker",
+            Self::Unbind | Self::Custom(_) => return None,
+        })
+    }
+    /// Whether a key repeat runs the command again. Egui also reports a press
+    /// as a repeat when it never saw the key's release, so most commands accept
+    /// repeats; these run once per physical press.
+    fn repeats(self) -> bool {
+        !matches!(
+            self,
+            Self::ToggleFullPane
+                | Self::TogglePreviewLineNumbers
+                | Self::ToggleRelativePreviewLineNumbers
+                | Self::Unbind
+                | Self::Custom(_)
+        )
+    }
 }
 #[derive(Clone, Debug)]
 pub struct PickerBinding {
     pub trigger: PickerTrigger,
     pub modifiers: Modifiers,
     pub action: PickerAction,
-    /// Omit to hide this binding from the help overlay.
+    /// Command palette title of a custom command. Omit it to leave the
+    /// command out of the palette. Built-in commands use their own title.
     pub description: Option<String>,
 }
 impl PickerBinding {
-    fn help_entry(&self) -> Option<(String, String)> {
-        Some((self.shortcut_label(), self.description.clone()?))
+    fn key(key: Key, modifiers: Modifiers, action: PickerAction) -> Self {
+        Self {
+            trigger: PickerTrigger::Key(key),
+            modifiers,
+            action,
+            description: None,
+        }
     }
     fn shortcut_label(&self) -> String {
         let mut label = String::new();
@@ -68,20 +178,49 @@ impl PickerBinding {
                 label.push_str(prefix);
             }
         }
-        label.push_str(&match self.trigger {
-            PickerTrigger::Key(key) => format!("{key:?}"),
-            PickerTrigger::DoubleClick => "Double click".into(),
+        label.push_str(match self.trigger {
+            PickerTrigger::Key(Key::Slash) => "/",
+            PickerTrigger::Key(Key::Questionmark) => "?",
+            PickerTrigger::Key(Key::ArrowUp) => "Up",
+            PickerTrigger::Key(Key::ArrowDown) => "Down",
+            PickerTrigger::Key(Key::ArrowLeft) => "Left",
+            PickerTrigger::Key(Key::ArrowRight) => "Right",
+            PickerTrigger::Key(Key::PageUp) => "Page Up",
+            PickerTrigger::Key(Key::PageDown) => "Page Down",
+            PickerTrigger::Key(key) => key.name(),
+            PickerTrigger::DoubleClick => "Double click",
         });
         label
     }
 }
+/// The picker's default key bindings. Host bindings replace these by chord;
+/// bind a chord to [`PickerAction::Unbind`] to remove one.
+pub fn default_bindings() -> Vec<PickerBinding> {
+    use PickerAction::*;
+    let ctrl_shift = Modifiers::CTRL | Modifiers::SHIFT;
+    [
+        (Key::Slash, ctrl_shift, ToggleCommandPalette),
+        // Shifted slash arrives as a question mark on some layouts.
+        (Key::Questionmark, ctrl_shift, ToggleCommandPalette),
+        (Key::P, Modifiers::CTRL, TogglePreview),
+        (Key::Space, Modifiers::CTRL, TogglePreview),
+        (Key::W, Modifiers::CTRL, TogglePreviewFocus),
+        (Key::Space, Modifiers::ALT, QuickSelect),
+        (Key::C, Modifiers::CTRL, CopySelection),
+        (Key::C, ctrl_shift, CopyPreviewDocument),
+        (Key::PageUp, Modifiers::CTRL, ScrollPreviewPageUp),
+        (Key::PageDown, Modifiers::CTRL, ScrollPreviewPageDown),
+        (Key::ArrowUp, Modifiers::CTRL, ScrollPreviewLineUp),
+        (Key::ArrowDown, Modifiers::CTRL, ScrollPreviewLineDown),
+        (Key::L, ctrl_shift, TogglePreviewLineNumbers),
+        (Key::F, ctrl_shift, ToggleFullPane),
+    ]
+    .into_iter()
+    .map(|(key, modifiers, action)| PickerBinding::key(key, modifiers, action))
+    .collect()
+}
 fn resolved_bindings(bindings: Vec<PickerBinding>) -> Vec<PickerBinding> {
-    let mut resolved = vec![PickerBinding {
-        trigger: PickerTrigger::Key(Key::F),
-        modifiers: Modifiers::CTRL | Modifiers::SHIFT,
-        action: PickerAction::ToggleFullPane,
-        description: Some("Toggle full-pane picker".into()),
-    }];
+    let mut resolved = default_bindings();
     for binding in bindings {
         if let Some(existing) = resolved.iter_mut().find(|existing| {
             existing.trigger == binding.trigger
@@ -92,8 +231,25 @@ fn resolved_bindings(bindings: Vec<PickerBinding>) -> Vec<PickerBinding> {
             resolved.push(binding);
         }
     }
+    resolved.retain(|binding| binding.action != PickerAction::Unbind);
     resolved
 }
+/// A command palette row: a command, its title and its current keys.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PaletteRow {
+    keys: String,
+    title: String,
+    action: PickerAction,
+}
+/// The open command palette: a picker over a Command/Keys table, so it
+/// searches, highlights, filters columns and completes like any structured
+/// source. `actions[i]` is the command on row `i`.
+struct CommandPalette {
+    picker: Picker<StructuredStreamingSnapshot>,
+    actions: Vec<PickerAction>,
+}
+/// Space between the palette and the edge of the picker it covers.
+const PALETTE_MARGIN: f32 = 12.0;
 /// Right-align numbers in `rect`, leaving its last cell as a separator;
 /// left-aligned numbers start at its left edge.
 fn paint_line_numbers(
@@ -268,10 +424,9 @@ pub struct Picker<S: ItemsSource + Send + Sync + 'static> {
     query_rect: egui::Rect,
     query_text_pos: egui::Pos2,
     dismissed_completion: Option<(String, usize)>,
-    keybinding_help_visible: bool,
-    keybinding_help_offset: usize,
-    keybinding_help_rows: usize,
-    additional_keybinding_help: Vec<(String, String)>,
+    palette: Option<Box<CommandPalette>>,
+    /// Commands from `execute`, run at the start of the next frame.
+    pending_actions: Vec<PickerAction>,
     copy_notice: String,
     preview_viewport: Option<crate::preview_copy::PreviewCopyMode>,
     preview_focus: bool,
@@ -327,10 +482,8 @@ where
             query_rect: egui::Rect::NOTHING,
             query_text_pos: egui::Pos2::ZERO,
             dismissed_completion: None,
-            keybinding_help_visible: false,
-            keybinding_help_offset: 0,
-            keybinding_help_rows: 1,
-            additional_keybinding_help: Vec::new(),
+            palette: None,
+            pending_actions: Vec::new(),
             copy_notice: "Copied".into(),
             preview_viewport: None,
             preview_focus: false,
@@ -371,7 +524,7 @@ where
         self.suggestions.clear();
         self.suggestion_selected = 0;
         self.dismissed_completion = None;
-        self.keybinding_help_visible = false;
+        self.close_palette();
         self.error = None;
         self.closed = false;
         self.focus_query = true;
@@ -669,6 +822,12 @@ where
         self.config.preview_line_numbers = numbers;
     }
 
+    /// The current style, which the line-number commands change; hosts can
+    /// read it to keep the user's choice.
+    pub fn preview_line_numbers(&self) -> PreviewLineNumbers {
+        self.config.preview_line_numbers
+    }
+
     /// Gutter width in cells: the widest line number plus a separator column.
     fn preview_gutter_columns(&self) -> usize {
         if self.config.preview_line_numbers == PreviewLineNumbers::Off {
@@ -735,7 +894,7 @@ where
         }
         if !self.config.preview_visible
             || self.visible_preview_rows == 0
-            || self.keybinding_help_visible
+            || self.palette.is_some()
             || !self.current_results()
         {
             return;
@@ -758,7 +917,7 @@ where
     }
 
     pub fn keybinding_help_visible(&self) -> bool {
-        self.keybinding_help_visible
+        self.palette.is_some()
     }
     pub fn preview_visible(&self) -> bool {
         self.config.preview_visible
@@ -778,118 +937,162 @@ where
         self.config.preview_visible = preview_visible;
         self.full_pane_preview = false;
     }
-    pub fn set_keybinding_help(&mut self, bindings: Vec<(String, String)>) {
-        self.additional_keybinding_help = bindings;
+    /// Has no effect: the command palette lists only commands. Give a custom
+    /// command a `PickerBinding::description` to list it.
+    #[deprecated(
+        note = "the command palette lists only commands; describe custom commands with PickerBinding::description"
+    )]
+    pub fn set_keybinding_help(&mut self, _bindings: Vec<(String, String)>) {}
+
+    /// Run a command at the start of the next frame, as if its key had been
+    /// pressed. A custom command is reported as [`PickerEvent::CustomAction`].
+    pub fn execute(&mut self, ctx: &Context, action: PickerAction) {
+        self.pending_actions.push(action);
+        ctx.request_repaint();
     }
-    fn keybinding_help_ui(&mut self, ctx: &Context, bounds: egui::Rect, appearance: &Appearance) {
-        let mut bindings: Vec<(String, String)> = [
-            ("Enter", "Select / enter directory"),
-            ("Escape", "Cancel / dismiss suggestions"),
-            ("Up / Down", "Select result / suggestion"),
-            ("Tab", "Complete suggestion"),
-            ("Left / Right", "Move query cursor"),
-            ("Ctrl+Left / Right", "Move cursor by word"),
-            ("Shift+Left / Right", "Select query text"),
-            ("Home / End", "Query start / end"),
-            ("Backspace / Delete", "Delete query character"),
-            ("Ctrl+Backspace / Delete", "Delete query word"),
-            ("Ctrl+C", "Copy selection"),
-            ("Ctrl+Shift+C", "Copy document (preview focus)"),
-            ("Ctrl+V", "Paste query text"),
-            ("Ctrl+P", "Toggle preview"),
-            ("Ctrl+W", "Focus preview / query"),
-            ("h j k l / arrows", "Move preview copy cursor"),
-            (
-                "v / Shift+V / Ctrl+Q",
-                "Select characters / lines / rectangle",
-            ),
-            ("y / yy / yiw", "Yank preview selection / line / word"),
-            ("Alt+Space", "Quick Select preview"),
-            ("/ / ? / n / Shift+N", "Search preview / next / previous"),
-            ("Ctrl+R (search)", "Toggle literal / regex search"),
-            ("Ctrl+N / Ctrl+P (search)", "Next / previous match"),
-            ("Ctrl+Page Up / Down", "Scroll preview"),
-            ("Ctrl+Up / Down", "Scroll preview by line"),
-            ("Ctrl+Shift+/", "Toggle key bindings"),
-        ]
-        .into_iter()
-        .map(|(key, description)| (key.into(), description.into()))
-        .collect();
-        bindings.extend(
+
+    /// Every palette row: built-in commands, then the host's described custom
+    /// commands.
+    fn palette_rows(&self) -> Vec<PaletteRow> {
+        let keys = |action: PickerAction| {
             self.config
                 .bindings
                 .iter()
-                .filter_map(PickerBinding::help_entry),
-        );
-        bindings.extend(self.additional_keybinding_help.clone());
-        let row_height = appearance.typography.preview_row_height(ctx);
-        let rect = bounds.intersect(ctx.content_rect()).shrink(12.0);
-        if !rect.is_positive() {
-            return;
-        }
-        let padding = 9.0;
-        self.keybinding_help_rows = (((rect.height() - 2.0 * padding) / row_height).floor()
-            as usize)
-            .saturating_sub(2)
-            .max(1)
-            .min(bindings.len());
-        self.keybinding_help_offset = self
-            .keybinding_help_offset
-            .min(bindings.len().saturating_sub(self.keybinding_help_rows));
-        let height = ((self.keybinding_help_rows + 2) as f32 * row_height + 2.0 * padding)
-            .min(rect.height());
-        let panel = egui::Rect::from_center_size(rect.center(), egui::vec2(rect.width(), height));
-        // Fixed rows avoid label wrapping and inherited widget spacing exceeding
-        // the row budget when preview visibility changes the picker height.
-        let painter = ctx
-            .layer_painter(egui::LayerId::new(
-                egui::Order::Tooltip,
-                self.id.with("keybinding-help"),
-            ))
-            .with_clip_rect(panel);
-        painter.rect_filled(panel, 8, appearance.palette.background);
-        painter.rect_stroke(
-            panel,
-            8,
-            egui::Stroke::new(1.0, appearance.palette.accent),
-            egui::StrokeKind::Inside,
-        );
-        let content = panel.shrink(padding);
-        let center = |row: usize| {
-            egui::pos2(
-                content.left(),
-                content.top() + (row as f32 + 0.5) * row_height,
-            )
+                .filter(|binding| binding.action == action)
+                .map(PickerBinding::shortcut_label)
+                .collect::<Vec<_>>()
+                .join(", ")
         };
-        painter.text(
-            center(0),
-            egui::Align2::LEFT_CENTER,
-            "Key bindings",
-            appearance.typography.bold.clone(),
-            appearance.palette.accent,
-        );
-        painter.text(
-            center(1),
-            egui::Align2::LEFT_CENTER,
-            "Up/Down, Page Up/Down, Home/End to scroll; Escape to close",
-            appearance.typography.normal.clone(),
-            appearance.palette.muted,
-        );
-        for (row, (key, description)) in bindings
-            .iter()
-            .skip(self.keybinding_help_offset)
-            .take(self.keybinding_help_rows)
-            .enumerate()
-        {
-            painter.text(
-                center(row + 2),
-                egui::Align2::LEFT_CENTER,
-                format!("{key:<26} {description}"),
-                appearance.typography.normal.clone(),
-                appearance.palette.text,
-            );
+        let mut rows: Vec<PaletteRow> = PickerAction::BUILT_IN
+            .into_iter()
+            .map(|action| PaletteRow {
+                keys: keys(action),
+                title: action.title().unwrap_or_default().into(),
+                action,
+            })
+            .collect();
+        for binding in &self.config.bindings {
+            let (PickerAction::Custom(_), Some(title)) = (binding.action, &binding.description)
+            else {
+                continue;
+            };
+            if !rows.iter().any(|row| row.action == binding.action) {
+                rows.push(PaletteRow {
+                    keys: keys(binding.action),
+                    title: title.clone(),
+                    action: binding.action,
+                });
+            }
+        }
+        rows
+    }
+
+    fn open_palette(&mut self, ctx: &Context) {
+        let rows = self.palette_rows();
+        let source = structured_source(
+            vec!["Command".into(), "Keys".into()],
+            rows.iter()
+                .map(|row| vec![row.title.clone(), row.keys.clone()])
+                .collect(),
+        )
+        .expect("palette columns are valid");
+        // The palette runs no picker commands of its own. This picker's
+        // palette keys close it (see `palette_ui`).
+        let bindings = default_bindings()
+            .into_iter()
+            .map(|binding| PickerBinding {
+                action: PickerAction::Unbind,
+                ..binding
+            })
+            .collect();
+        let config = PickerConfig {
+            layout: Layout::QueryTop,
+            title: "Command palette".into(),
+            // Every command has a row, so filtering never resizes the palette.
+            result_rows: rows.len().max(1),
+            bindings,
+            preview_visible: false,
+            ..PickerConfig::default()
+        };
+        let picker = Picker::new(self.id.with("command-palette"), ctx, source, config);
+        self.palette = Some(Box::new(CommandPalette {
+            picker,
+            actions: rows.into_iter().map(|row| row.action).collect(),
+        }));
+        self.dismissed_completion = Some((self.query.clone(), self.query_cursor));
+        self.suggestions.clear();
+    }
+
+    fn close_palette(&mut self) {
+        if let Some(palette) = self.palette.take() {
+            let mut picker = palette.picker;
+            picker.close();
+            self.focus_query = true;
         }
     }
+
+    /// Show the open palette at the top of `bounds`. The chosen command runs
+    /// on the next frame, as if from [`Self::execute`].
+    fn palette_ui(&mut self, ctx: &Context, bounds: egui::Rect, appearance: &Appearance) {
+        if self.palette.is_none() {
+            return;
+        }
+        // This picker's palette keys close the palette, whatever it shows.
+        let bindings = &self.config.bindings;
+        let toggled = ctx.input_mut(|input| {
+            let mut toggled = false;
+            let mut events = std::mem::take(&mut input.events).into_iter().peekable();
+            while let Some(event) = events.next() {
+                if let egui::Event::Key {
+                    key,
+                    pressed,
+                    modifiers,
+                    ..
+                } = &event
+                    && bindings.iter().any(|binding| {
+                        binding.action == PickerAction::ToggleCommandPalette
+                            && binding.trigger == PickerTrigger::Key(*key)
+                            && same_binding_modifiers(binding.modifiers, *modifiers)
+                    })
+                {
+                    if *pressed {
+                        toggled = true;
+                        if matches!(events.peek(), Some(egui::Event::Text(_))) {
+                            events.next();
+                        }
+                    }
+                    continue;
+                }
+                input.events.push(event);
+            }
+            toggled
+        });
+        if toggled {
+            self.close_palette();
+            return;
+        }
+        let Some(palette) = &mut self.palette else {
+            return;
+        };
+        let mut placement = Placement::new(bounds.intersect(ctx.content_rect()));
+        placement.position = crate::Position::Top;
+        placement.margin = PALETTE_MARGIN;
+        let output = palette.picker.show(ctx, placement, appearance, false);
+        ctx.move_to_top(egui::LayerId::new(
+            egui::Order::Foreground,
+            palette.picker.id,
+        ));
+        let chosen = match output.event {
+            Some(PickerEvent::Accepted(selection)) => palette.actions.get(selection.index).copied(),
+            Some(PickerEvent::Cancelled) => None,
+            _ => return,
+        };
+        self.close_palette();
+        if let Some(action) = chosen {
+            self.execute(ctx, action);
+        }
+    }
+
     pub fn notify_copied(&mut self, ctx: &Context) {
         let value = self
             .selection()
@@ -966,15 +1169,104 @@ where
             .find(|binding| binding.trigger == PickerTrigger::DoubleClick)
             .map(|binding| binding.action)
     }
-    fn dispatch_binding(
+    /// Whether a bound key runs `action` now. Commands that would take keys
+    /// copy mode uses for itself leave them to copy mode while it is focused.
+    fn binding_applies(&self, action: PickerAction) -> bool {
+        use PickerAction::*;
+        let focused = self.preview_focused();
+        match action {
+            CopySelection
+            | ScrollPreviewPageUp
+            | ScrollPreviewPageDown
+            | ScrollPreviewLineUp
+            | ScrollPreviewLineDown => !focused,
+            CopyPreviewDocument => focused,
+            // Ctrl+P moves to the previous match while copy-mode search is open.
+            TogglePreview => {
+                !(focused
+                    && self
+                        .preview_viewport
+                        .as_ref()
+                        .is_some_and(|viewport| viewport.search_input_active()))
+            }
+            _ => true,
+        }
+    }
+
+    /// Run a command. Returns a custom command's id for the host event, and
+    /// sets `copy` for `CopySelection`.
+    fn run_action(
         &mut self,
         action: PickerAction,
         ctx: &Context,
         configured: crate::Position,
+        copy: &mut bool,
     ) -> Option<usize> {
+        use PickerAction::*;
         match action {
-            PickerAction::Custom(id) => Some(id),
-            PickerAction::ToggleFullPane => {
+            Custom(id) => return Some(id),
+            Unbind => {}
+            ToggleCommandPalette => {
+                if self.palette.is_some() {
+                    self.close_palette();
+                } else {
+                    self.open_palette(ctx);
+                }
+            }
+            TogglePreview => {
+                self.config.preview_visible = !self.config.preview_visible;
+                self.full_pane_preview = false;
+                if !self.config.preview_visible {
+                    self.leave_preview_focus();
+                    if let Some(preview) = &mut self.preview {
+                        preview.clear();
+                    }
+                    self.preview_key = None;
+                }
+            }
+            TogglePreviewFocus => self.toggle_preview_focus(ctx),
+            QuickSelect => self.quick_select(ctx),
+            CopySelection => *copy = true,
+            CopyPreviewDocument => {
+                self.ensure_preview_viewport();
+                if let Some(viewport) = &self.preview_viewport {
+                    viewport.copy_all(ctx);
+                    // Egui can send Copy with the chord; it must not also
+                    // copy the selected result.
+                    ctx.input_mut(|input| {
+                        input
+                            .events
+                            .retain(|event| !matches!(event, egui::Event::Copy))
+                    });
+                }
+            }
+            ScrollPreviewPageUp => self.scroll_preview(-1),
+            ScrollPreviewPageDown => self.scroll_preview(1),
+            ScrollPreviewLineUp => self.scroll_preview_rows(-1),
+            ScrollPreviewLineDown => self.scroll_preview_rows(1),
+            // As in Vim, absolute and relative numbers are independent
+            // switches; with both on the gutter is hybrid.
+            TogglePreviewLineNumbers | ToggleRelativePreviewLineNumbers => {
+                use PreviewLineNumbers as Style;
+                let (number, relative) = match self.config.preview_line_numbers {
+                    Style::Off => (false, false),
+                    Style::Absolute => (true, false),
+                    Style::Relative => (false, true),
+                    Style::Hybrid => (true, true),
+                };
+                let (number, relative) = if action == TogglePreviewLineNumbers {
+                    (!number, relative)
+                } else {
+                    (number, !relative)
+                };
+                self.set_preview_line_numbers(match (number, relative) {
+                    (false, false) => Style::Off,
+                    (true, false) => Style::Absolute,
+                    (false, true) => Style::Relative,
+                    (true, true) => Style::Hybrid,
+                });
+            }
+            ToggleFullPane => {
                 self.placement_override = if self.placement_override.is_some() {
                     None
                 } else {
@@ -996,8 +1288,34 @@ where
                     self.config.preview_visible = false;
                 }
                 self.reset_preview_layout(ctx);
-                None
             }
+        }
+        None
+    }
+
+    /// Open Quick Select on the preview, or cancel an open one.
+    fn quick_select(&mut self, ctx: &Context) {
+        // Some hosts emit a text space alongside Alt+Space. It belongs to the
+        // shortcut and must never edit the query on cancellation.
+        ctx.input_mut(|input| {
+            input
+                .events
+                .retain(|event| !matches!(event, egui::Event::Text(text) if text == " "))
+        });
+        self.ensure_preview_viewport();
+        let from_copy = self.preview_focus;
+        let Some(viewport) = &mut self.preview_viewport else {
+            return;
+        };
+        if viewport.quick_select_active() {
+            if viewport.cancel_quick_select() {
+                self.deactivate_preview_focus();
+            }
+        } else if viewport.open_quick_select(from_copy, self.visible_preview_rows) {
+            self.preview_focus = true;
+            self.focus_query = false;
+            self.suggestions.clear();
+            ctx.memory_mut(|memory| memory.request_focus(self.id.with("preview-copy")));
         }
     }
 
@@ -1640,8 +1958,10 @@ where
         };
         // The host decides which pane is interactive. Restore query focus before
         // processing input, including the first frame after a pane is uncovered.
+        // An open palette has focus and takes the input instead.
+        let palette_was_open = self.palette.is_some();
         ctx.memory_mut(|memory| {
-            if interactive && !self.closed {
+            if interactive && !self.closed && !palette_was_open {
                 memory.request_focus(focus_id);
             } else {
                 if memory.has_focus(input_id) {
@@ -1666,163 +1986,85 @@ where
         } else {
             1
         };
-        let mut binding_action = None;
-        if interactive && !self.closed && focused && !self.keybinding_help_visible {
-            ctx.input_mut(|input| {
-                let mut events = std::mem::take(&mut input.events).into_iter().peekable();
-                while let Some(event) = events.next() {
-                    let binding = if let egui::Event::Key { key, modifiers, .. } = &event {
-                        self.config.bindings.iter().find(|binding| {
-                            binding.trigger == PickerTrigger::Key(*key)
-                                && same_binding_modifiers(binding.modifiers, *modifiers)
-                        })
-                    } else {
-                        None
-                    };
-                    if let Some(binding) = binding {
-                        let egui::Event::Key {
-                            pressed, repeat, ..
-                        } = event
-                        else {
-                            unreachable!()
-                        };
-                        if pressed && !repeat && binding_action.is_none() {
-                            binding_action = Some(binding.action);
-                        }
-                        if pressed && matches!(events.peek(), Some(egui::Event::Text(_))) {
-                            events.next();
-                        }
-                    } else {
-                        input.events.push(event);
-                    }
-                }
-            });
-        }
-        let custom_action = binding_action
-            .and_then(|action| self.dispatch_binding(action, ctx, placement.position));
-        let mut preview_handled = false;
+        // Commands run in order: those from `execute` and the palette, then
+        // bound keys. A bound key is consumed only when its command applies,
+        // so copy mode keeps the keys it uses itself.
+        let mut actions = std::mem::take(&mut self.pending_actions);
         if interactive && !self.closed && focused {
-            if !self.keybinding_help_visible
-                && ctx.input_mut(|input| input.consume_key(Modifiers::ALT, Key::Space))
-            {
-                // Some hosts emit a text space alongside Alt+Space. It belongs
-                // to the shortcut and must never edit the query on cancellation.
+            if !palette_was_open {
                 ctx.input_mut(|input| {
-                    input
-                        .events
-                        .retain(|event| !matches!(event, egui::Event::Text(text) if text == " "))
-                });
-                self.ensure_preview_viewport();
-                let from_copy = self.preview_focus;
-                if let Some(viewport) = &mut self.preview_viewport {
-                    if viewport.quick_select_active() {
-                        if viewport.cancel_quick_select() {
-                            self.deactivate_preview_focus();
-                        }
-                    } else if viewport.open_quick_select(from_copy, self.visible_preview_rows) {
-                        self.preview_focus = true;
-                        self.focus_query = false;
-                        self.suggestions.clear();
-                        ctx.memory_mut(|memory| memory.request_focus(self.id.with("preview-copy")));
-                    }
-                }
-            }
-            if ctx.input_mut(|input| input.consume_key(Modifiers::CTRL, Key::W)) {
-                self.toggle_preview_focus(ctx);
-            }
-            if self.preview_focused() && !self.keybinding_help_visible {
-                let help = ctx.input_mut(|input| {
-                    input.consume_key(Modifiers::CTRL | Modifiers::SHIFT, Key::Slash)
-                        || input.consume_key(Modifiers::CTRL | Modifiers::SHIFT, Key::Questionmark)
-                });
-                if help {
-                    self.keybinding_help_visible = true;
-                    self.keybinding_help_offset = 0;
-                } else {
-                    let hide = ctx.input_mut(|input| {
-                        input.consume_key(Modifiers::CTRL, Key::P)
-                            || input.consume_key(Modifiers::CTRL, Key::Space)
-                    });
-                    if hide {
-                        self.config.preview_visible = false;
-                        self.full_pane_preview = false;
-                        self.leave_preview_focus();
-                        if let Some(preview) = &mut self.preview {
-                            preview.clear();
-                        }
-                        self.preview_key = None;
-                    } else {
-                        if ctx.input_mut(|input| {
-                            input.consume_key(Modifiers::CTRL | Modifiers::SHIFT, Key::C)
-                        }) {
-                            self.preview_viewport.as_ref().unwrap().copy_all(ctx);
-                            ctx.input_mut(|input| {
-                                input
-                                    .events
-                                    .retain(|event| !matches!(event, egui::Event::Copy))
-                            });
-                        }
-                        let events = ctx.input(|input| input.events.clone());
-                        if self.preview_viewport.as_mut().unwrap().input(
-                            ctx,
-                            &events,
-                            self.visible_preview_rows,
-                        ) {
-                            self.deactivate_preview_focus();
+                    let mut events = std::mem::take(&mut input.events).into_iter().peekable();
+                    while let Some(event) = events.next() {
+                        let binding = if let egui::Event::Key { key, modifiers, .. } = &event {
+                            self.config.bindings.iter().find(|binding| {
+                                binding.trigger == PickerTrigger::Key(*key)
+                                    && same_binding_modifiers(binding.modifiers, *modifiers)
+                                    && self.binding_applies(binding.action)
+                            })
+                        } else {
+                            None
+                        };
+                        if let Some(binding) = binding {
+                            let egui::Event::Key {
+                                pressed, repeat, ..
+                            } = event
+                            else {
+                                unreachable!()
+                            };
+                            if pressed && (!repeat || binding.action.repeats()) {
+                                actions.push(binding.action);
+                            }
+                            if pressed && matches!(events.peek(), Some(egui::Event::Text(_))) {
+                                events.next();
+                            }
+                        } else {
+                            input.events.push(event);
                         }
                     }
-                    ctx.input_mut(|input| {
-                        input.events.retain(|event| {
-                            !matches!(
-                                event,
-                                egui::Event::Key { .. }
-                                    | egui::Event::Text(_)
-                                    | egui::Event::Paste(_)
-                                    | egui::Event::Copy
-                                    | egui::Event::Cut
-                            )
-                        })
-                    });
-                    preview_handled = true;
+                });
+            }
+        }
+        // Only the first custom command reaches the host this frame.
+        let mut custom_action = None;
+        if !self.closed {
+            for action in actions {
+                if let Some(id) = self.run_action(action, ctx, placement.position, &mut copy) {
+                    custom_action.get_or_insert(id);
                 }
             }
+        }
+        // The palette takes every key while it is open; keys that arrived
+        // with the one that opened it go nowhere.
+        let palette_open = self.palette.is_some();
+        if palette_open && !palette_was_open {
+            ctx.input_mut(|input| input.events.clear());
+        }
+        let mut preview_handled = palette_open;
+        if interactive && !self.closed && focused && !palette_open && self.preview_focused() {
+            let events = ctx.input(|input| input.events.clone());
+            if let Some(viewport) = &mut self.preview_viewport
+                && viewport.input(ctx, &events, self.visible_preview_rows)
+            {
+                self.deactivate_preview_focus();
+            }
+            ctx.input_mut(|input| {
+                input.events.retain(|event| {
+                    !matches!(
+                        event,
+                        egui::Event::Key { .. }
+                            | egui::Event::Text(_)
+                            | egui::Event::Paste(_)
+                            | egui::Event::Copy
+                            | egui::Event::Cut
+                    )
+                })
+            });
+            preview_handled = true;
         }
         if interactive && !self.closed && focused && !preview_handled {
             ctx.input_mut(|input| {
-                if input.consume_key(Modifiers::CTRL | Modifiers::SHIFT, Key::Slash)
-                    || input.consume_key(Modifiers::CTRL | Modifiers::SHIFT, Key::Questionmark)
-                {
-                    self.keybinding_help_visible = !self.keybinding_help_visible;
-                    self.keybinding_help_offset = 0;
-                    self.dismissed_completion = Some((self.query.clone(), self.query_cursor));
-                    self.suggestions.clear();
-                    self.focus_query = true;
-                }
-                if self.keybinding_help_visible {
-                    if input.consume_key(Modifiers::NONE, Key::Escape) {
-                        self.keybinding_help_visible = false;
-                        self.focus_query = true;
-                    }
-                    for (key, delta) in [
-                        (Key::ArrowUp, -1),
-                        (Key::ArrowDown, 1),
-                        (Key::PageUp, -(self.keybinding_help_rows as isize)),
-                        (Key::PageDown, self.keybinding_help_rows as isize),
-                    ] {
-                        if input.consume_key(Modifiers::NONE, key) {
-                            self.keybinding_help_offset =
-                                self.keybinding_help_offset.saturating_add_signed(delta);
-                        }
-                    }
-                    if input.consume_key(Modifiers::NONE, Key::Home) {
-                        self.keybinding_help_offset = 0;
-                    }
-                    if input.consume_key(Modifiers::NONE, Key::End) {
-                        self.keybinding_help_offset = usize::MAX;
-                    }
-                    input.events.clear();
-                    return;
-                }
+                // Unbound Ctrl+C chords, such as Ctrl+Shift+C outside copy
+                // mode, copy the selected result as they always have.
                 if input.consume_key(Modifiers::CTRL, Key::C) {
                     copy = true;
                 }
@@ -1860,30 +2102,6 @@ where
                         self.suggestion_selected =
                             (self.suggestion_selected + 1) % self.suggestions.len();
                     }
-                }
-                if input.consume_key(Modifiers::CTRL, Key::P)
-                    || input.consume_key(Modifiers::CTRL, Key::Space)
-                {
-                    self.config.preview_visible = !self.config.preview_visible;
-                    self.full_pane_preview = false;
-                    if !self.config.preview_visible {
-                        if let Some(preview) = &mut self.preview {
-                            preview.clear();
-                        }
-                        self.preview_key = None;
-                    }
-                }
-                if input.consume_key(Modifiers::CTRL, Key::PageUp) {
-                    self.scroll_preview(-1);
-                }
-                if input.consume_key(Modifiers::CTRL, Key::PageDown) {
-                    self.scroll_preview(1);
-                }
-                // Every press counts, including key repeats arriving in one frame.
-                let lines = input.count_and_consume_key(Modifiers::CTRL, Key::ArrowDown) as isize
-                    - input.count_and_consume_key(Modifiers::CTRL, Key::ArrowUp) as isize;
-                if lines != 0 {
-                    self.scroll_preview_rows(lines);
                 }
                 for (key, modifiers, delta) in [
                     (Key::N, Modifiers::CTRL, 1),
@@ -1990,7 +2208,7 @@ where
                 } else {
                     egui::Order::Middle
                 })
-                .interactable(interactive)
+                .interactable(interactive && !palette_open)
                 .fixed_pos(rect.min)
                 .show(ctx, |ui| {
                     ui.set_clip_rect(rect.intersect(placement.bounds).intersect(ui.clip_rect()));
@@ -2013,7 +2231,14 @@ where
                             ui.visuals_mut().selection.stroke.color =
                                 appearance.palette.selection_text;
                             if self.config.layout == Layout::QueryTop {
-                                self.query_ui(ui, ctx, input_id, appearance, complete, interactive);
+                                self.query_ui(
+                                    ui,
+                                    ctx,
+                                    input_id,
+                                    appearance,
+                                    complete,
+                                    interactive && !palette_open,
+                                );
                                 divider(ui, appearance);
                             }
                             if has_preview {
@@ -2068,7 +2293,14 @@ where
                             }
                             if self.config.layout == Layout::QueryBottom {
                                 divider(ui, appearance);
-                                self.query_ui(ui, ctx, input_id, appearance, complete, interactive);
+                                self.query_ui(
+                                    ui,
+                                    ctx,
+                                    input_id,
+                                    appearance,
+                                    complete,
+                                    interactive && !palette_open,
+                                );
                             }
                         });
                 });
@@ -2082,12 +2314,12 @@ where
                 ctx.request_discard("resolve shared picker size before presentation");
             }
         }
-        if interactive && self.keybinding_help_visible {
-            self.keybinding_help_ui(ctx, rect, appearance);
+        if interactive && !self.closed {
+            self.palette_ui(ctx, rect, appearance);
         }
         if interactive
             && !self.closed
-            && !self.keybinding_help_visible
+            && self.palette.is_none()
             && !self.preview_focused()
             && event.is_none()
         {
@@ -2099,8 +2331,13 @@ where
         {
             if double_click {
                 if let Some(action) = self.double_click_action() {
-                    if let Some(action) = self.dispatch_binding(action, ctx, placement.position) {
+                    let mut copy = false;
+                    if let Some(action) =
+                        self.run_action(action, ctx, placement.position, &mut copy)
+                    {
                         event = Some(PickerEvent::CustomAction { action, selection });
+                    } else if copy {
+                        event = Some(PickerEvent::CopyRequested(selection));
                     }
                 }
             } else if accept {
@@ -2135,7 +2372,7 @@ where
                 .as_ref()
                 .filter(|worker| !worker.loading)
                 .and_then(|worker| worker.document_selection),
-            preview_rect: if self.closed || self.keybinding_help_visible {
+            preview_rect: if self.closed || self.palette.is_some() {
                 None
             } else {
                 self.preview_rect
@@ -2143,7 +2380,9 @@ where
             event,
             wants_keyboard: interactive
                 && !self.closed
-                && (self.preview_focused() || ctx.memory(|m| m.has_focus(input_id))),
+                && (self.palette.is_some()
+                    || self.preview_focused()
+                    || ctx.memory(|m| m.has_focus(input_id))),
             busy,
             matched: if self.current_results() {
                 self.displayed.as_ref().map_or(0, |d| d.output.matched)
@@ -2402,8 +2641,9 @@ mod query_parity_tests {
     }
 
     #[test]
-    fn binding_help_uses_effective_descriptions_for_builtin_and_custom_actions() {
-        let bindings = resolved_bindings(vec![
+    fn palette_lists_commands_with_their_current_keys() {
+        let (_, mut picker) = make();
+        picker.set_bindings(vec![
             PickerBinding {
                 trigger: PickerTrigger::Key(Key::F),
                 modifiers: Modifiers::CTRL | Modifiers::SHIFT,
@@ -2422,22 +2662,311 @@ mod query_parity_tests {
                 action: PickerAction::ToggleFullPane,
                 description: None,
             },
+            // Undescribed custom commands stay out of the palette.
+            PickerBinding {
+                trigger: PickerTrigger::Key(Key::H),
+                modifiers: Modifiers::CTRL,
+                action: PickerAction::Custom(7),
+                description: None,
+            },
+            PickerBinding {
+                trigger: PickerTrigger::Key(Key::L),
+                modifiers: Modifiers::CTRL | Modifiers::SHIFT,
+                action: PickerAction::Unbind,
+                description: None,
+            },
         ]);
-        let help: Vec<_> = bindings
-            .iter()
-            .filter_map(PickerBinding::help_entry)
-            .collect();
+        let rows = picker.palette_rows();
+        let row = |title: &str| rows.iter().find(|row| row.title == title).unwrap();
+        // Built-in commands come first, in order, with their current keys,
+        // followed only by described custom commands.
+        let actions: Vec<_> = rows.iter().map(|row| row.action).collect();
         assert_eq!(
-            help,
-            vec![
-                ("Ctrl+Shift+F".into(), "Custom command".into()),
-                ("Alt+Double click".into(), "Open clicked item".into()),
-            ]
+            actions[..PickerAction::BUILT_IN.len()],
+            PickerAction::BUILT_IN
         );
-        let default = resolved_bindings(Vec::new());
         assert_eq!(
-            default[0].help_entry(),
-            Some(("Ctrl+Shift+F".into(), "Toggle full-pane picker".into()))
+            actions[PickerAction::BUILT_IN.len()..],
+            [PickerAction::Custom(5), PickerAction::Custom(6)]
+        );
+        assert_eq!(row("Toggle full-pane picker").keys, "Ctrl+G");
+        assert_eq!(row("Toggle preview").keys, "Ctrl+P, Ctrl+Space");
+        assert_eq!(row("Command palette").keys, "Ctrl+Shift+/, Ctrl+Shift+?");
+        assert_eq!(row("Scroll preview up a line").keys, "Ctrl+Up");
+        // Unbound commands stay runnable from the palette.
+        assert_eq!(row("Toggle line numbers").keys, "");
+        assert_eq!(row("Toggle relative line numbers").keys, "");
+        assert_eq!(row("Custom command").keys, "Ctrl+Shift+F");
+        assert_eq!(row("Open clicked item").keys, "Alt+Double click");
+    }
+
+    #[test]
+    fn command_names_round_trip() {
+        for action in PickerAction::BUILT_IN
+            .into_iter()
+            .chain([PickerAction::Unbind])
+        {
+            assert_eq!(
+                PickerAction::from_name(action.name().unwrap()),
+                Some(action)
+            );
+        }
+        assert_eq!(PickerAction::from_name("None"), Some(PickerAction::Unbind));
+        assert_eq!(PickerAction::Custom(3).name(), None);
+        assert_eq!(PickerAction::from_name("Missing"), None);
+    }
+
+    /// Press and release a chord, so egui does not report the next press of
+    /// the same key as a repeat.
+    fn tap(
+        ctx: &Context,
+        picker: &mut Picker<StructuredStreamingSnapshot>,
+        key: Key,
+        modifiers: Modifiers,
+    ) -> Option<PickerEvent<nfm_picker_sources::structured::StructuredPickerItem>> {
+        let (_, event) = draw(ctx, picker, vec![modified_key(key, modifiers)]);
+        let mut release = modified_key(key, modifiers);
+        if let egui::Event::Key { pressed, .. } = &mut release {
+            *pressed = false;
+        }
+        draw(ctx, picker, vec![release]);
+        event
+    }
+
+    #[test]
+    fn line_number_toggles_combine_like_vim_and_work_in_copy_mode() {
+        use PickerAction::{
+            TogglePreviewLineNumbers as Number, ToggleRelativePreviewLineNumbers as Relative,
+        };
+        use PreviewLineNumbers as Style;
+        let ctrl_shift = Modifiers::CTRL | Modifiers::SHIFT;
+        let (ctx, mut picker) = make();
+        wait(&mut picker);
+        picker.config.preview_visible = true;
+        show_text(&ctx, &mut picker, "one\ntwo");
+        let wide = picker.preview_key.unwrap().2;
+
+        tap(&ctx, &mut picker, Key::L, ctrl_shift);
+        assert_eq!(picker.preview_line_numbers(), Style::Absolute);
+        // The gutter takes columns, so the preview is requested narrower.
+        assert!(picker.preview_key.unwrap().2 < wide);
+
+        load_preview(&mut picker);
+        tap(&ctx, &mut picker, Key::W, Modifiers::CTRL);
+        assert!(picker.preview_focused());
+        tap(&ctx, &mut picker, Key::L, ctrl_shift);
+        assert_eq!(picker.preview_line_numbers(), Style::Off);
+        assert!(picker.preview_focused());
+
+        // Each command flips one switch: number, relativenumber.
+        for (action, expected) in [
+            (Relative, Style::Relative),
+            (Number, Style::Hybrid),
+            (Relative, Style::Absolute),
+            (Relative, Style::Hybrid),
+            (Number, Style::Relative),
+            (Relative, Style::Off),
+        ] {
+            picker.execute(&ctx, action);
+            draw(&ctx, &mut picker, vec![]);
+            assert_eq!(picker.preview_line_numbers(), expected, "after {action:?}");
+        }
+    }
+
+    #[test]
+    fn unbound_default_chords_do_nothing() {
+        let (ctx, mut picker) = make();
+        wait(&mut picker);
+        picker.set_bindings(vec![PickerBinding {
+            trigger: PickerTrigger::Key(Key::L),
+            modifiers: Modifiers::CTRL | Modifiers::SHIFT,
+            action: PickerAction::Unbind,
+            description: None,
+        }]);
+        tap(
+            &ctx,
+            &mut picker,
+            Key::L,
+            Modifiers::CTRL | Modifiers::SHIFT,
+        );
+        assert_eq!(picker.preview_line_numbers(), PreviewLineNumbers::Off);
+        assert!(!picker.config.bindings.iter().any(|binding| {
+            binding.action == PickerAction::TogglePreviewLineNumbers
+                || binding.action == PickerAction::Unbind
+        }));
+    }
+
+    /// The open palette's matching commands, once its search has caught up
+    /// with its query.
+    fn palette_matches(picker: &mut Picker<StructuredStreamingSnapshot>) -> Vec<PickerAction> {
+        let palette = picker.palette.as_mut().expect("palette is open");
+        wait(&mut palette.picker);
+        palette
+            .picker
+            .displayed
+            .as_ref()
+            .unwrap()
+            .output
+            .results
+            .iter()
+            .map(|result| palette.actions[result.node_index])
+            .collect()
+    }
+
+    #[test]
+    fn palette_searches_highlights_runs_built_in_and_custom_commands_and_closes() {
+        let (ctx, mut picker) = make();
+        picker.set_query("a");
+        wait(&mut picker);
+        picker.set_bindings(vec![PickerBinding {
+            trigger: PickerTrigger::Key(Key::K),
+            modifiers: Modifiers::CTRL,
+            action: PickerAction::Custom(9),
+            description: Some("Open in editor".into()),
+        }]);
+        draw(&ctx, &mut picker, vec![]);
+        let open = |picker: &mut Picker<_>| {
+            tap(&ctx, picker, Key::Slash, Modifiers::CTRL | Modifiers::SHIFT);
+            assert!(picker.keybinding_help_visible());
+            assert_eq!(picker.palette.as_ref().unwrap().picker.query(), "");
+        };
+
+        // Fuzzy search ranks the closest command first.
+        open(&mut picker);
+        draw(&ctx, &mut picker, vec![egui::Event::Text("tgrel".into())]);
+        assert_eq!(
+            palette_matches(&mut picker)[0],
+            PickerAction::ToggleRelativePreviewLineNumbers
+        );
+        // Matched characters are highlighted.
+        let (output, _) = draw(&ctx, &mut picker, vec![]);
+        let highlight = Appearance::default().palette.match_highlight;
+        assert!(output.shapes.iter().any(|shape| matches!(
+            &shape.shape,
+            egui::Shape::Text(text) if text.galley.job.text.contains("Toggle relative line numbers")
+                && text.galley.job.sections.iter().any(|section| section.format.color == highlight)
+        )));
+        draw(&ctx, &mut picker, vec![key(Key::Enter)]);
+        assert!(!picker.keybinding_help_visible());
+        // The chosen command runs on the next frame.
+        draw(&ctx, &mut picker, vec![]);
+        assert_eq!(picker.preview_line_numbers(), PreviewLineNumbers::Relative);
+        // Typing went to the palette, not the query.
+        assert_eq!(picker.query(), "a");
+
+        // Arrows choose among the matches.
+        open(&mut picker);
+        draw(
+            &ctx,
+            &mut picker,
+            vec![egui::Event::Text("line num".into())],
+        );
+        let matches = palette_matches(&mut picker);
+        assert_eq!(matches.len(), 2, "{matches:?}");
+        assert!(matches.contains(&PickerAction::TogglePreviewLineNumbers));
+        let relative = matches
+            .iter()
+            .position(|action| *action == PickerAction::ToggleRelativePreviewLineNumbers)
+            .unwrap();
+        let mut keys = vec![key(Key::ArrowDown); relative];
+        keys.push(key(Key::Enter));
+        draw(&ctx, &mut picker, keys);
+        draw(&ctx, &mut picker, vec![]);
+        assert_eq!(picker.preview_line_numbers(), PreviewLineNumbers::Off);
+
+        // Structured filters work on the Keys column.
+        open(&mut picker);
+        draw(
+            &ctx,
+            &mut picker,
+            vec![egui::Event::Text("/:Keys==Ctrl+K".into())],
+        );
+        assert_eq!(palette_matches(&mut picker), [PickerAction::Custom(9)]);
+        // Close the completion popup so Enter runs the command.
+        draw(&ctx, &mut picker, vec![]);
+        if !picker
+            .palette
+            .as_ref()
+            .unwrap()
+            .picker
+            .suggestions
+            .is_empty()
+        {
+            draw(&ctx, &mut picker, vec![key(Key::Escape)]);
+        }
+        assert!(picker.keybinding_help_visible());
+        draw(&ctx, &mut picker, vec![key(Key::Enter)]);
+        let (_, event) = draw(&ctx, &mut picker, vec![]);
+        assert!(matches!(
+            event,
+            Some(PickerEvent::CustomAction { action: 9, .. })
+        ));
+
+        // A query with no match runs nothing; the palette key still closes it.
+        open(&mut picker);
+        draw(&ctx, &mut picker, vec![egui::Event::Text("zzz".into())]);
+        assert!(palette_matches(&mut picker).is_empty());
+        let (_, event) = draw(&ctx, &mut picker, vec![key(Key::Enter)]);
+        assert!(event.is_none());
+        assert!(picker.keybinding_help_visible());
+        tap(
+            &ctx,
+            &mut picker,
+            Key::Slash,
+            Modifiers::CTRL | Modifiers::SHIFT,
+        );
+        assert!(!picker.keybinding_help_visible());
+
+        // Escape closes the palette only.
+        open(&mut picker);
+        let (_, event) = draw(&ctx, &mut picker, vec![key(Key::Escape)]);
+        assert!(event.is_none());
+        assert!(!picker.keybinding_help_visible());
+        assert!(!picker.is_closed());
+        assert_eq!(picker.query(), "a");
+    }
+
+    #[test]
+    fn executed_commands_run_on_the_next_frame() {
+        let (ctx, mut picker) = make();
+        wait(&mut picker);
+        draw(&ctx, &mut picker, vec![]);
+        picker.execute(&ctx, PickerAction::TogglePreviewLineNumbers);
+        assert_eq!(picker.preview_line_numbers(), PreviewLineNumbers::Off);
+        let (_, event) = draw(&ctx, &mut picker, vec![]);
+        assert!(event.is_none());
+        assert_eq!(picker.preview_line_numbers(), PreviewLineNumbers::Absolute);
+        picker.execute(&ctx, PickerAction::Custom(4));
+        let (_, event) = draw(&ctx, &mut picker, vec![]);
+        assert!(matches!(
+            event,
+            Some(PickerEvent::CustomAction { action: 4, .. })
+        ));
+    }
+
+    #[test]
+    fn ctrl_p_moves_between_matches_while_copy_search_is_open() {
+        let (ctx, mut picker) = make();
+        wait(&mut picker);
+        picker.config.preview_visible = true;
+        show_text(&ctx, &mut picker, "foo\nbar\nfoo\nbar");
+        tap(&ctx, &mut picker, Key::W, Modifiers::CTRL);
+        assert!(picker.preview_focused());
+        draw(
+            &ctx,
+            &mut picker,
+            vec![key(Key::Slash), egui::Event::Text("/".into())],
+        );
+        draw(&ctx, &mut picker, vec![egui::Event::Text("foo".into())]);
+        let viewport = picker.preview_viewport.as_ref().unwrap();
+        assert!(viewport.search_input_active());
+        let before = viewport.mode.cursor;
+        tap(&ctx, &mut picker, Key::P, Modifiers::CTRL);
+        assert!(picker.preview_visible());
+        assert!(picker.preview_focused());
+        assert_ne!(
+            picker.preview_viewport.as_ref().unwrap().mode.cursor,
+            before
         );
     }
 
@@ -2449,11 +2978,17 @@ mod query_parity_tests {
         for _ in 0..3 {
             picker.set_bindings(Vec::new());
         }
-        assert_eq!(picker.config.bindings.len(), 1);
-        assert_eq!(
-            picker.config.bindings[0].action,
-            PickerAction::ToggleFullPane
-        );
+        let defaults = default_bindings().len();
+        assert_eq!(picker.config.bindings.len(), defaults);
+        let chord = |picker: &Picker<_>, key| {
+            picker
+                .config
+                .bindings
+                .iter()
+                .find(|binding| binding.trigger == PickerTrigger::Key(key))
+                .map(|binding| binding.action)
+        };
+        assert_eq!(chord(&picker, Key::F), Some(PickerAction::ToggleFullPane));
         let mut modifiers = Modifiers::CTRL | Modifiers::SHIFT;
         modifiers.command = true;
         picker.set_bindings(vec![
@@ -2476,8 +3011,8 @@ mod query_parity_tests {
                 description: None,
             },
         ]);
-        assert_eq!(picker.config.bindings.len(), 2);
-        assert_eq!(picker.config.bindings[0].action, PickerAction::Custom(2));
+        assert_eq!(picker.config.bindings.len(), defaults + 1);
+        assert_eq!(chord(&picker, Key::F), Some(PickerAction::Custom(2)));
         draw(
             &ctx,
             &mut picker,
@@ -3573,56 +4108,79 @@ mod query_parity_tests {
         assert_eq!(picker.query(), "beta");
         assert!(!picker.is_closed());
     }
+    /// Add forty described custom commands, enough to scroll the palette.
+    fn add_host_commands(picker: &mut Picker<StructuredStreamingSnapshot>) {
+        picker.set_bindings(
+            Key::ALL
+                .iter()
+                .take(40)
+                .enumerate()
+                .map(|(index, key)| PickerBinding {
+                    trigger: PickerTrigger::Key(*key),
+                    modifiers: Modifiers::ALT | Modifiers::SHIFT,
+                    action: PickerAction::Custom(index),
+                    description: Some(format!("Host action {index}")),
+                })
+                .collect(),
+        );
+    }
     #[test]
-    fn help_rows_fit_after_the_preview_expands_and_collapses() {
+    fn palette_fits_and_keeps_its_size_and_top_while_filtering() {
         let (ctx, mut picker) = make();
+        wait(&mut picker);
         let mut appearance = Appearance::default();
         appearance.typography.normal = egui::FontId::monospace(15.0);
         appearance.typography.bold = egui::FontId::monospace(15.0);
         appearance.typography.row_height = 30.0;
-        picker
-            .additional_keybinding_help
-            .extend((0..40).map(|row| (format!("Host {row}"), "Host action".into())));
+        add_host_commands(&mut picker);
+        picker.execute(&ctx, PickerAction::ToggleCommandPalette);
         for (width, height) in [
-            (1600.0, 610.0),
+            (1600.0, 900.0),
             (1600.0, 296.0),
             (600.0, 296.0),
-            (1600.0, 610.0),
+            (1600.0, 900.0),
         ] {
             let bounds = egui::Rect::from_min_size(egui::pos2(8.0, 8.0), egui::vec2(width, height));
-            let mut frame = ctx.run_ui(
-                egui::RawInput {
-                    screen_rect: Some(egui::Rect::from_min_size(
-                        egui::Pos2::ZERO,
-                        bounds.max.to_vec2() + egui::vec2(8.0, 8.0),
-                    )),
-                    ..Default::default()
-                },
-                |ui| picker.keybinding_help_ui(ui.ctx(), bounds, &appearance),
-            );
-            frame.textures_delta.clear();
-            assert!(!frame.shapes.is_empty());
-            let mut text_rows = 0;
-            for shape in &frame.shapes {
-                assert!(bounds.contains_rect(shape.clip_rect));
-                if let egui::Shape::Text(text) = &shape.shape {
-                    text_rows += 1;
-                    assert!(text.pos.y >= shape.clip_rect.top());
-                    assert!(text.pos.y + text.galley.size().y <= shape.clip_rect.bottom());
-                }
+            let frame = |picker: &mut Picker<StructuredStreamingSnapshot>| {
+                let mut outer = egui::Rect::NOTHING;
+                ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            bounds.max.to_vec2() + egui::vec2(8.0, 8.0),
+                        )),
+                        ..Default::default()
+                    },
+                    |ui| {
+                        outer = picker
+                            .show(ui.ctx(), Placement::new(bounds), &appearance, false)
+                            .rect;
+                    },
+                )
+                .drop_without_applying_deltas();
+                outer
+            };
+            let mut panels = Vec::new();
+            for filter in ["", "host action 3", "zzz"] {
+                frame(&mut picker);
+                picker.palette.as_mut().unwrap().picker.set_query(filter);
+                palette_matches(&mut picker);
+                frame(&mut picker);
+                let outer = frame(&mut picker);
+                let palette_id = picker.palette.as_ref().unwrap().picker.id;
+                let panel = ctx.memory(|memory| memory.area_rect(palette_id)).unwrap();
+                // The palette sits at the top of the picker, inside it.
+                assert!(outer.contains_rect(panel), "{outer:?} {panel:?}");
+                assert_eq!(panel.top(), outer.top() + PALETTE_MARGIN);
+                panels.push(panel);
             }
-            assert_eq!(text_rows, picker.keybinding_help_rows + 2);
-            assert!(picker.keybinding_help_rows < 56);
+            assert!(panels.iter().all(|panel| *panel == panels[0]), "{panels:?}");
         }
     }
     #[test]
     fn preview_copy_and_help_shortcuts_preserve_the_menu_and_selection() {
         let (ctx, mut picker) = make();
         picker.config.preview_visible = true;
-        picker.set_keybinding_help(vec![(
-            "Ctrl+U".into(),
-            "Parent directory / drive list".into(),
-        )]);
         picker.set_preview_provider(
             &ctx,
             Arc::new(
@@ -3639,9 +4197,7 @@ mod query_parity_tests {
             assert!(Instant::now() < deadline);
             std::thread::sleep(Duration::from_millis(2));
         }
-        picker
-            .additional_keybinding_help
-            .extend((0..40).map(|index| (format!("Host {index}"), "Host action".into())));
+        add_host_commands(&mut picker);
         let selection = picker.selection().unwrap().index;
         let (output, event) = draw(
             &ctx,
@@ -3690,19 +4246,19 @@ mod query_parity_tests {
         assert!(event.is_none());
         assert!(picker.keybinding_help_visible());
         assert!(!output.shapes.is_empty());
-        draw(&ctx, &mut picker, vec![key(Key::End)]);
-        assert!(picker.keybinding_help_offset > 0);
-        draw(&ctx, &mut picker, vec![key(Key::Home)]);
-        assert_eq!(picker.keybinding_help_offset, 0);
+        // Keys go to the palette, not the picker under it.
         draw(
             &ctx,
             &mut picker,
             vec![
+                key(Key::PageDown),
                 key(Key::ArrowDown),
-                egui::Event::Text("ignored".into()),
-                key(Key::Enter),
+                egui::Event::Text("zzz ignored".into()),
             ],
         );
+        assert!(palette_matches(&mut picker).is_empty());
+        draw(&ctx, &mut picker, vec![key(Key::Enter)]);
+        assert!(picker.keybinding_help_visible());
         assert_eq!(picker.selection().unwrap().index, selection);
         assert_eq!(picker.query, "");
         let (_, event) = draw(&ctx, &mut picker, vec![key(Key::Escape)]);
@@ -3850,7 +4406,7 @@ mod query_parity_tests {
             vec![modified_key(Key::P, Modifiers::CTRL)],
         );
         assert!(picker.preview_rect.unwrap().is_positive());
-        picker.keybinding_help_visible = true;
+        picker.open_palette(&ctx);
         let mut bounds = Some(egui::Rect::EVERYTHING);
         let mut frame = ctx.run_ui(
             egui::RawInput {

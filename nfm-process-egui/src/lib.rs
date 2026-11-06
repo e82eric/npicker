@@ -94,10 +94,6 @@ where
         };
         picker.set_external_preview(false);
         picker.set_bindings(Vec::new());
-        picker.set_keybinding_help(vec![
-            ("Ctrl+R".into(), "Refresh processes".into()),
-            ("Ctrl+K".into(), "Kill selected process".into()),
-        ]);
         let preview_adapter = adapter.clone();
         let formatter = nfm_win32::format_process_preview;
         picker.set_preview_provider(
