@@ -94,9 +94,57 @@ fn resolved_bindings(bindings: Vec<PickerBinding>) -> Vec<PickerBinding> {
     }
     resolved
 }
+/// Right-align numbers in `rect`, leaving its last cell as a separator;
+/// left-aligned numbers start at its left edge.
+fn paint_line_numbers(
+    ui: &egui::Ui,
+    rect: egui::Rect,
+    numbers: &[Option<crate::preview_copy::GutterNumber>],
+    appearance: &Appearance,
+) {
+    let typography = &appearance.typography;
+    let row_height = typography.preview_row_height(ui.ctx());
+    let right = rect.right() - typography.cell_width.max(1.0);
+    let painter = ui.painter().with_clip_rect(rect.intersect(ui.clip_rect()));
+    for (y, number) in numbers.iter().enumerate() {
+        let Some(number) = number else {
+            continue;
+        };
+        let (font, color) = if number.current {
+            (typography.bold.clone(), appearance.palette.text)
+        } else {
+            (typography.normal.clone(), appearance.palette.muted)
+        };
+        let y = rect.top() + (y as f32 + 0.5) * row_height;
+        let (x, align) = if number.left_aligned {
+            (rect.left(), egui::Align2::LEFT_CENTER)
+        } else {
+            (right, egui::Align2::RIGHT_CENTER)
+        };
+        painter.text(egui::pos2(x, y), align, &number.text, font, color);
+    }
+}
 fn same_binding_modifiers(a: Modifiers, b: Modifiers) -> bool {
     (a.ctrl, a.shift, a.alt, a.mac_cmd) == (b.ctrl, b.shift, b.alt, b.mac_cmd)
 }
+/// Preview gutter numbering. Numbers count logical lines: soft-wrapped
+/// continuation rows are left blank, matching how `j`/`k` counts move.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PreviewLineNumbers {
+    #[default]
+    Off,
+    /// One-based line numbers.
+    Absolute,
+    /// Distance from the copy cursor's line while the preview is focused;
+    /// absolute numbers otherwise. The cursor line shows 0.
+    Relative,
+    /// Relative numbers with the cursor line's absolute number (Vim's
+    /// `number` + `relativenumber`); absolute numbers while unfocused.
+    Hybrid,
+}
+/// Fewest digits the line-number gutter reserves, so that short documents
+/// share one content width.
+const MIN_LINE_NUMBER_DIGITS: usize = 3;
 #[derive(Clone, Debug)]
 pub struct PickerConfig {
     pub layout: Layout,
@@ -110,6 +158,7 @@ pub struct PickerConfig {
     pub bindings: Vec<PickerBinding>,
     pub preview_rows: usize,
     pub preview_visible: bool,
+    pub preview_line_numbers: PreviewLineNumbers,
     pub sort: SearchSortMode,
 }
 impl Default for PickerConfig {
@@ -123,6 +172,7 @@ impl Default for PickerConfig {
             bindings: Vec::new(),
             preview_rows: 12,
             preview_visible: true,
+            preview_line_numbers: PreviewLineNumbers::Off,
             sort: SearchSortMode::Score,
         }
     }
@@ -209,8 +259,6 @@ pub struct Picker<S: ItemsSource + Send + Sync + 'static> {
     visible_result_rows: usize,
     visible_preview_rows: usize,
     external_preview: bool,
-    external_document: Option<Result<Preview, String>>,
-    external_loading: bool,
     preview_rect: Option<egui::Rect>,
     preview_rendered: bool,
     copied_until: Option<Instant>,
@@ -233,6 +281,8 @@ pub struct Picker<S: ItemsSource + Send + Sync + 'static> {
     full_pane_preview: bool,
     result_actions_enabled: bool,
     cursor_scroll_padding: u32,
+    /// Logical lines in the last numbered preview; sizes the gutter.
+    preview_line_count: u64,
 }
 impl<S> Picker<S>
 where
@@ -268,8 +318,6 @@ where
             visible_result_rows: 7,
             visible_preview_rows: 12,
             external_preview: false,
-            external_document: None,
-            external_loading: false,
             preview_rect: None,
             preview_rendered: false,
             copied_until: None,
@@ -290,6 +338,7 @@ where
             full_pane_preview: false,
             result_actions_enabled: true,
             cursor_scroll_padding: crate::copy_mode::SCROLL_PADDING_ROWS,
+            preview_line_count: 0,
         }
     }
     /// Change sources without clearing the presented rows or preview. Stale
@@ -336,7 +385,6 @@ where
         self.leave_preview_focus();
         self.preview_viewport = None;
         self.preview_key = None;
-        self.external_document = None;
         self.scroll_offset = 0;
         if let Some(preview) = &mut self.preview {
             // Row offsets belong to the old layout. Request an initial page
@@ -360,8 +408,6 @@ where
         self.visible_start = 0;
         self.preview_key = None;
         self.scroll_offset = 0;
-        self.external_document = None;
-        self.external_loading = false;
         self.preview_rect = None;
         self.completion_snapshot = None;
         self.suggestions.clear();
@@ -376,24 +422,6 @@ where
     /// Reserve preview space for a native host renderer without a worker.
     pub fn set_external_preview(&mut self, enabled: bool) {
         self.external_preview = enabled;
-    }
-    /// Paint a host-produced preview using the shared renderer. Paging and
-    /// native snapshot lifetimes remain the host's responsibility.
-    pub fn set_external_preview_document(
-        &mut self,
-        document: Option<Result<Preview, String>>,
-        loading: bool,
-    ) {
-        let same = match (self.external_document.as_ref(), document.as_ref()) {
-            (Some(Ok(Preview::Text(old))), Some(Ok(Preview::Text(new)))) => old == new,
-            (Some(Ok(Preview::StyledText(old))), Some(Ok(Preview::StyledText(new)))) => old == new,
-            _ => false,
-        };
-        if !same {
-            self.leave_preview_focus();
-        }
-        self.external_document = document;
-        self.external_loading = loading;
     }
     pub fn set_preview_provider(
         &mut self,
@@ -635,6 +663,22 @@ where
         }
     }
 
+    /// Show line numbers in a gutter left of preview text. Wrapping providers
+    /// receive the narrower width, so changing this re-requests the preview.
+    pub fn set_preview_line_numbers(&mut self, numbers: PreviewLineNumbers) {
+        self.config.preview_line_numbers = numbers;
+    }
+
+    /// Gutter width in cells: the widest line number plus a separator column.
+    fn preview_gutter_columns(&self) -> usize {
+        if self.config.preview_line_numbers == PreviewLineNumbers::Off {
+            return 0;
+        }
+        // Relative distances never exceed the line count, so it sizes every mode.
+        let digits = self.preview_line_count.max(1).ilog10() as usize + 1;
+        digits.max(MIN_LINE_NUMBER_DIGITS) + 1
+    }
+
     /// Suspend result acceptance while a host is rebuilding positional payloads.
     /// Preview navigation and copying remain available.
     pub fn set_result_actions_enabled(&mut self, enabled: bool) {
@@ -696,33 +740,17 @@ where
         {
             return;
         }
-        let mut copy = None;
-        if let Some(worker) = &self.preview {
-            if let Ok(Some(document)) = worker.copy_document() {
-                copy = crate::preview_copy::PreviewCopyMode::host(
-                    document,
-                    worker.document_scroll_offset,
-                    self.visible_preview_rows,
-                );
-            }
-        }
-        if copy.is_none() {
-            let document = self.external_document.as_ref().or_else(|| {
-                self.preview
-                    .as_ref()
-                    .filter(|worker| !worker.loading)
-                    .and_then(|worker| worker.document.as_ref())
-            });
-            if let Some(Ok(document)) = document {
-                copy = crate::preview_copy::PreviewCopyMode::text(
-                    document,
-                    self.preview
-                        .as_ref()
-                        .map_or(0, |worker| worker.document_scroll_offset),
-                    self.visible_preview_rows,
-                );
-            }
-        }
+        let Some(worker) = &self.preview else {
+            return;
+        };
+        let Ok(Some(document)) = worker.copy_document() else {
+            return;
+        };
+        let mut copy = crate::preview_copy::PreviewCopyMode::host(
+            document,
+            worker.document_scroll_offset,
+            self.visible_preview_rows,
+        );
         if let Some(viewport) = &mut copy {
             viewport.set_scroll_padding(self.cursor_scroll_padding);
         }
@@ -1030,10 +1058,8 @@ where
         if let Some(preview) = &mut self.preview {
             let loading = preview.loading;
             preview.poll();
-            if loading && !preview.loading {
-                if !self.preview_focus {
-                    self.preview_viewport = None;
-                }
+            if loading && !preview.loading && !self.preview_focus {
+                self.preview_viewport = None;
             }
             if loading && !preview.loading && preview.document.as_ref().is_some_and(|d| d.is_ok()) {
                 self.scroll_offset = preview.document_scroll_offset;
@@ -1082,25 +1108,21 @@ where
             self.scroll_offset = viewport.top as usize;
             return;
         }
-        let Some(Ok(document)) = self.preview.as_ref().and_then(|p| p.document.as_ref()) else {
+        let Some(Ok(Preview::Grid { total_rows, .. })) =
+            self.preview.as_ref().and_then(|p| p.document.as_ref())
+        else {
             return;
         };
-        let total = match document {
-            Preview::Text(text) => text.lines().count(),
-            Preview::StyledText(lines) => lines.len(),
-            Preview::Image(_) => 0,
-            Preview::Grid { total_rows, .. } => *total_rows,
-            Preview::Empty => 0,
-        };
+        let total = *total_rows;
         self.scroll_offset = self
             .scroll_offset
             .saturating_add_signed(delta)
             .min(total.saturating_sub(rows));
     }
     fn refresh_preview(&mut self, width: f32, appearance: &Appearance) {
-        let columns = (width / appearance.typography.cell_width.max(1.0))
-            .floor()
-            .clamp(1.0, 4096.0) as u16;
+        let cell_width = appearance.typography.cell_width.max(1.0);
+        let width = width - self.preview_gutter_columns() as f32 * cell_width;
+        let columns = (width / cell_width).floor().clamp(1.0, 4096.0) as u16;
         let rows = self.visible_preview_rows.clamp(1, u16::MAX as usize) as u16;
         if self.preview_viewport.is_some() {
             // Passive previews also cache a copy viewport for scrolling. That
@@ -1166,7 +1188,7 @@ where
             && (!self.current_results()
                 || self.displayed.as_ref().is_none_or(|d| !d.done)
                 || (self.visible_preview_rows > 0
-                    && (self.external_loading || self.preview.as_ref().is_some_and(|p| p.loading))))
+                    && self.preview.as_ref().is_some_and(|p| p.loading)))
     }
     fn preview_ui(&mut self, ui: &mut egui::Ui, appearance: &Appearance) {
         // Allocate every row, including loading/empty/short documents, so the
@@ -1184,43 +1206,109 @@ where
                 ui.set_min_height(height);
                 ui.set_max_height(height);
                 self.ensure_preview_viewport();
-                if let Some(copy) = &mut self.preview_viewport {
-                    self.preview_rendered = true;
-                    copy.paint_layers(
-                        ui,
-                        appearance,
-                        self.visible_preview_rows,
-                        self.preview_focus,
-                    );
-                    self.scroll_offset = copy.top as usize;
+                let gutter_columns = self.preview_gutter_columns();
+                if gutter_columns == 0 || !self.preview_numbered() {
+                    self.preview_content_ui(ui, appearance, PreviewLineNumbers::Off);
                     return;
                 }
-                let document = self.external_document.as_ref().or_else(|| {
-                    self.preview
-                        .as_ref()
-                        .and_then(|worker| worker.document.as_ref())
-                });
-                if let Some(document) = document {
-                    match document {
-                        Ok(document) => {
-                            self.preview_rendered = true;
-                            preview::paint(
-                                ui,
-                                document,
-                                appearance,
-                                self.visible_preview_rows,
-                                self.preview
-                                    .as_ref()
-                                    .map_or(0, |worker| worker.document_scroll_offset),
-                            );
-                        }
-                        Err(error) => {
-                            ui.colored_label(appearance.palette.error, error);
-                        }
-                    }
+                // The gutter sits outside the content so copy-mode cell
+                // coordinates, overlays and yanked text are unaffected.
+                let gutter_width =
+                    gutter_columns as f32 * appearance.typography.cell_width.max(1.0);
+                let origin = ui.cursor().min;
+                let content = egui::Rect::from_min_size(
+                    origin + egui::vec2(gutter_width, 0.0),
+                    egui::vec2((ui.available_width() - gutter_width).max(0.0), height),
+                );
+                let style = self.config.preview_line_numbers;
+                let numbers = ui
+                    .scope_builder(
+                        egui::UiBuilder::new()
+                            .max_rect(content)
+                            .layout(egui::Layout::top_down(egui::Align::LEFT)),
+                        |ui| self.preview_content_ui(ui, appearance, style),
+                    )
+                    .inner;
+                paint_line_numbers(
+                    ui,
+                    egui::Rect::from_min_size(origin, egui::vec2(gutter_width, height)),
+                    &numbers,
+                    appearance,
+                );
+                if self.preview_gutter_columns() != gutter_columns {
+                    // The next frame requests the preview at the new width.
+                    ui.ctx().request_repaint();
                 }
             },
         );
+    }
+    /// Whether the displayed preview takes a line-number gutter: a copy
+    /// viewport, or a page that reports its rows' lines.
+    fn preview_numbered(&self) -> bool {
+        self.preview_viewport.is_some() || self.page_lines().is_some()
+    }
+    /// Lines of the worker's page, which is painted while there is no viewport.
+    fn page_lines(&self) -> Option<&crate::preview::GridLines> {
+        match self.preview.as_ref()?.document.as_ref()? {
+            Ok(Preview::Grid { lines, .. }) => lines.as_ref(),
+            _ => None,
+        }
+    }
+    /// Paint the preview document and return its gutter numbers, one per
+    /// viewport row, when `numbers` is not `Off`.
+    fn preview_content_ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        appearance: &Appearance,
+        numbers: PreviewLineNumbers,
+    ) -> Vec<Option<crate::preview_copy::GutterNumber>> {
+        let rows = self.visible_preview_rows;
+        if let Some(copy) = &mut self.preview_viewport {
+            self.preview_rendered = true;
+            copy.paint_layers(ui, appearance, rows, self.preview_focus);
+            self.scroll_offset = copy.top as usize;
+            if numbers == PreviewLineNumbers::Off {
+                return Vec::new();
+            }
+            self.preview_line_count = copy.line_count();
+            return copy.line_numbers(rows, numbers, self.preview_focus);
+        }
+        match self
+            .preview
+            .as_ref()
+            .and_then(|worker| worker.document.as_ref())
+        {
+            Some(Ok(document)) => {
+                self.preview_rendered = true;
+                preview::paint(ui, document, appearance, rows);
+            }
+            Some(Err(error)) => {
+                ui.colored_label(appearance.palette.error, error);
+            }
+            None => {}
+        }
+        // Without a viewport the preview is unfocused, so its numbers are the
+        // page's absolute lines.
+        let Some(lines) = self
+            .page_lines()
+            .filter(|_| numbers != PreviewLineNumbers::Off)
+        else {
+            return Vec::new();
+        };
+        let total = lines.total;
+        let gutter = lines
+            .starts
+            .iter()
+            .map(|line| {
+                line.map(|line| crate::preview_copy::GutterNumber {
+                    text: (line + 1).to_string(),
+                    current: false,
+                    left_aligned: false,
+                })
+            })
+            .collect();
+        self.preview_line_count = total;
+        gutter
     }
     fn results_ui(
         &mut self,
@@ -2198,9 +2286,7 @@ mod query_parity_tests {
         picker.set_query("a");
         wait(&mut picker);
         picker.config.preview_visible = true;
-        picker.set_external_preview(true);
-        picker.set_external_preview_document(Some(Ok(Preview::Text("preview".into()))), false);
-        draw(&ctx, &mut picker, vec![]);
+        show_text(&ctx, &mut picker, "preview");
         assert!(!picker.preview_focused());
         assert!(picker.focus_preview(&ctx));
         assert!(picker.focus_preview(&ctx));
@@ -2213,10 +2299,9 @@ mod query_parity_tests {
         picker.set_query("a");
         wait(&mut picker);
         picker.config.preview_visible = true;
-        picker.set_external_preview(true);
-        picker.set_external_preview_document(Some(Ok(Preview::Text("preview".into()))), false);
-        draw(&ctx, &mut picker, vec![]);
+        show_text(&ctx, &mut picker, "preview");
         picker.toggle_preview_focus(&ctx);
+        picker.preview_viewport.as_mut().unwrap().mode.cursor.x = 3;
         let selected = picker.selection().unwrap().index;
         let shortcut = || modified_key(Key::F, Modifiers::CTRL | Modifiers::SHIFT);
         draw(
@@ -2232,7 +2317,13 @@ mod query_parity_tests {
         );
         assert_eq!(picker.selection().unwrap().index, selected);
         assert!(!picker.preview_focused());
-        assert!(picker.preview_viewport.is_none());
+        // The preview reloads at the new size; any viewport is a fresh one.
+        assert!(
+            picker
+                .preview_viewport
+                .as_ref()
+                .is_none_or(|copy| copy.mode.cursor.x == 0)
+        );
         let mut repeat = shortcut();
         if let egui::Event::Key { repeat, .. } = &mut repeat {
             *repeat = true;
@@ -2503,12 +2594,7 @@ mod query_parity_tests {
         wait(&mut picker);
         picker.selected = 1;
         picker.config.preview_visible = true;
-        picker.set_external_preview(true);
-        picker.set_external_preview_document(
-            Some(Ok(Preview::Text("one\ntwo\nthree".into()))),
-            false,
-        );
-        draw(&ctx, &mut picker, vec![]);
+        show_text(&ctx, &mut picker, "one\ntwo\nthree");
         picker.toggle_preview_focus(&ctx);
         assert!(picker.preview_focused());
         let selected = picker.selection().unwrap().index;
@@ -2518,7 +2604,7 @@ mod query_parity_tests {
         assert_eq!(picker.selection().unwrap().index, selected);
         assert!(!picker.preview_focused());
         assert!(picker.preview_viewport.is_none());
-        assert!(picker.external_document.is_none());
+        assert!(picker.preview.as_ref().unwrap().document.is_none());
         assert!(picker.preview_key.is_none());
         assert!(picker.result_actions_enabled);
     }
@@ -2530,12 +2616,7 @@ mod query_parity_tests {
         wait(&mut picker);
         picker.selected = 1;
         picker.config.preview_visible = true;
-        picker.set_external_preview(true);
-        picker.set_external_preview_document(
-            Some(Ok(Preview::Text("one\ntwo\nthree".into()))),
-            false,
-        );
-        draw(&ctx, &mut picker, vec![]);
+        show_text(&ctx, &mut picker, "one\ntwo\nthree");
         picker.toggle_preview_focus(&ctx);
         assert!(picker.preview_focused());
         assert!(picker.selection().is_some());
@@ -2545,7 +2626,6 @@ mod query_parity_tests {
         assert!(picker.selection().is_none());
         assert!(!picker.preview_focused());
         assert!(picker.preview_viewport.is_none());
-        assert!(picker.external_document.is_none());
         assert!(picker.preview.is_none());
         assert!(!picker.result_actions_enabled);
         assert_eq!(picker.selected, 0);
@@ -2628,12 +2708,10 @@ mod query_parity_tests {
         let (ctx, mut picker) = make();
         wait(&mut picker);
         picker.config.preview_visible = true;
-        picker.set_external_preview(true);
-        let text = (0..60)
+        let text: String = (0..60)
             .map(|row| format!("first{row} second{row}\n"))
             .collect();
-        picker.set_external_preview_document(Some(Ok(Preview::Text(text))), false);
-        draw(&ctx, &mut picker, vec![]);
+        show_text(&ctx, &mut picker, text);
         let selected = picker.selected;
         let (_, event) = draw(
             &ctx,
@@ -2736,9 +2814,8 @@ mod query_parity_tests {
         let (ctx, mut picker) = make();
         wait(&mut picker);
         picker.config.preview_visible = true;
-        picker.set_external_preview(true);
-        let text = (0..100).map(|row| format!("row{row:03}\n")).collect();
-        picker.set_external_preview_document(Some(Ok(Preview::Text(text))), false);
+        let text: String = (0..100).map(|row| format!("row{row:03}\n")).collect();
+        show_text(&ctx, &mut picker, text);
         draw(&ctx, &mut picker, vec![]);
         assert!(!picker.preview_focused());
         assert!(picker.preview_viewport.is_some());
@@ -2769,9 +2846,7 @@ mod query_parity_tests {
         let (ctx, mut picker) = make();
         wait(&mut picker);
         picker.config.preview_visible = true;
-        picker.set_external_preview(true);
-        picker.set_external_preview_document(Some(Ok(Preview::Text("preview text".into()))), false);
-        draw(&ctx, &mut picker, vec![]);
+        show_text(&ctx, &mut picker, "preview text");
         for focused in [true, false] {
             let mut passes = 0;
             let mut output = ctx.run_ui(
@@ -2807,12 +2882,7 @@ mod query_parity_tests {
         let (ctx, mut picker) = make();
         wait(&mut picker);
         picker.config.preview_visible = true;
-        picker.set_external_preview(true);
-        picker.set_external_preview_document(
-            Some(Ok(Preview::Text("alpha beta\nsecond line\nlast".into()))),
-            false,
-        );
-        draw(&ctx, &mut picker, vec![]);
+        show_text(&ctx, &mut picker, "alpha beta\nsecond line\nlast");
         let selected = picker.selected;
         let (_, event) = draw(
             &ctx,
@@ -2821,12 +2891,6 @@ mod query_parity_tests {
         );
         assert!(picker.preview_focused());
         assert!(event.is_none());
-        // Hosts may publish the same external document on every frame.
-        picker.set_external_preview_document(
-            Some(Ok(Preview::Text("alpha beta\nsecond line\nlast".into()))),
-            false,
-        );
-        assert!(picker.preview_focused());
         draw(
             &ctx,
             &mut picker,
@@ -2874,8 +2938,7 @@ mod query_parity_tests {
         let (ctx, mut picker) = make();
         wait(&mut picker);
         picker.config.preview_visible = true;
-        picker.set_external_preview(true);
-        picker.set_external_preview_document(Some(Ok(Preview::Text("one\ntwo".into()))), false);
+        show_text(&ctx, &mut picker, "one\ntwo");
         let mut appearance = Appearance::default();
         appearance.typography.normal = egui::FontId::monospace(15.0);
         appearance.typography.bold = egui::FontId::monospace(15.0);
@@ -2927,12 +2990,7 @@ mod query_parity_tests {
         );
         assert!(!picker.preview_focused());
         picker.config.preview_visible = true;
-        picker.set_external_preview(true);
-        picker.set_external_preview_document(
-            Some(Ok(Preview::Text("one two\nthree two".into()))),
-            false,
-        );
-        draw(&ctx, &mut picker, vec![]);
+        show_text(&ctx, &mut picker, "one two\nthree two");
         draw(
             &ctx,
             &mut picker,
@@ -3127,6 +3185,179 @@ mod query_parity_tests {
         picker.refresh_preview(400.0, &appearance);
         assert!(picker.preview_viewport.is_some());
         assert!(!picker.preview.as_ref().unwrap().loading);
+    }
+
+    fn load_preview(picker: &mut Picker<StructuredStreamingSnapshot>) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while picker.preview.as_ref().unwrap().loading {
+            picker.poll();
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// Preview every item as `text`, drawn once the selected item's page loads.
+    fn show_text(
+        ctx: &Context,
+        picker: &mut Picker<StructuredStreamingSnapshot>,
+        text: impl Into<String>,
+    ) {
+        let text = text.into();
+        picker.set_preview_provider(
+            ctx,
+            Arc::new(
+                move |_: PreviewRequest<nfm_picker_sources::structured::StructuredPickerItem>,
+                      _: crate::Cancellation| Ok(Preview::Text(text.clone())),
+            ),
+        );
+        draw(ctx, picker, vec![]);
+        load_preview(picker);
+        draw(ctx, picker, vec![]);
+    }
+
+    /// Paint the preview; return muted gutter numbers as (top, right, text)
+    /// sorted by row, and the leftmost content glyph origin.
+    fn paint_preview_gutter(
+        ctx: &Context,
+        picker: &mut Picker<StructuredStreamingSnapshot>,
+        appearance: &Appearance,
+    ) -> (Vec<(f32, f32, String)>, f32) {
+        let frame = ctx.run_ui(egui::RawInput::default(), |ui| {
+            picker.preview_ui(ui, appearance)
+        });
+        let muted = |text: &egui::epaint::TextShape| {
+            text.galley.job.sections[0].format.color == appearance.palette.muted
+        };
+        let mut numbers: Vec<(f32, f32, String)> = frame
+            .shapes
+            .iter()
+            .filter_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) if muted(text) => {
+                    let rect = text.visual_bounding_rect();
+                    Some((rect.top(), rect.right(), text.galley.text().to_owned()))
+                }
+                _ => None,
+            })
+            .collect();
+        numbers.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let content_left = frame
+            .shapes
+            .iter()
+            .filter_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) if !muted(text) => Some(text.pos.x),
+                _ => None,
+            })
+            .fold(f32::INFINITY, f32::min);
+        frame.drop_without_applying_deltas();
+        (numbers, content_left)
+    }
+
+    #[test]
+    fn changing_selection_keeps_the_gutter_while_the_next_preview_loads() {
+        let (ctx, mut picker) = make();
+        wait(&mut picker);
+        picker.config.preview_visible = true;
+        picker.visible_preview_rows = 6;
+        picker.set_preview_line_numbers(PreviewLineNumbers::Absolute);
+        let released = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let gate = released.clone();
+        let provider = Arc::new(crate::byte_preview::BytePreviewProvider::new(
+            move |selection: &Selection<nfm_picker_sources::structured::StructuredPickerItem>,
+                  _| {
+                while selection.index == 1 && !gate.load(std::sync::atomic::Ordering::Acquire) {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                let text: String = (0..40)
+                    .map(|row| format!("{} {row}\n", selection.text))
+                    .collect();
+                Ok(crate::byte_preview::ByteDocument::complete(
+                    text.into_bytes(),
+                ))
+            },
+        ));
+        picker.set_preview_provider(&ctx, provider);
+        let appearance = Appearance::default();
+        picker.refresh_preview(400.0, &appearance);
+        load_preview(&mut picker);
+        let (shown, content_left) = paint_preview_gutter(&ctx, &mut picker, &appearance);
+        assert_eq!(shown.len(), 6);
+
+        picker.move_selection(1);
+        picker.refresh_preview(400.0, &appearance);
+        assert!(picker.preview.as_ref().unwrap().loading);
+        // The previous page stays put with its numbers until the next arrives.
+        for _ in 0..3 {
+            let (numbers, left) = paint_preview_gutter(&ctx, &mut picker, &appearance);
+            assert_eq!(numbers, shown);
+            assert_eq!(left, content_left);
+        }
+        released.store(true, std::sync::atomic::Ordering::Release);
+        load_preview(&mut picker);
+        let (numbers, left) = paint_preview_gutter(&ctx, &mut picker, &appearance);
+        assert_eq!(numbers, shown);
+        assert_eq!(left, content_left);
+    }
+
+    #[test]
+    fn line_number_gutter_narrows_preview_requests_and_numbers_logical_lines() {
+        let (ctx, mut picker) = make();
+        wait(&mut picker);
+        picker.config.preview_visible = true;
+        picker.visible_preview_rows = 6;
+        let mut text = format!("first\n{}\n", "a".repeat(100));
+        for line in 3..=1200 {
+            text.push_str(&format!("line {line}\n"));
+        }
+        let provider = Arc::new(crate::byte_preview::BytePreviewProvider::new(
+            move |_: &Selection<nfm_picker_sources::structured::StructuredPickerItem>, _| {
+                Ok(crate::byte_preview::ByteDocument::complete(
+                    text.clone().into_bytes(),
+                ))
+            },
+        ));
+        picker.set_preview_provider(&ctx, provider);
+        let appearance = Appearance::default();
+        let cell = appearance.typography.cell_width;
+        let width = 400.0;
+        let columns = |gutter: usize| ((width - gutter as f32 * cell) / cell).floor() as u16;
+        let paint = |picker: &mut Picker<StructuredStreamingSnapshot>| {
+            paint_preview_gutter(&ctx, picker, &appearance)
+        };
+
+        picker.refresh_preview(width, &appearance);
+        assert_eq!(picker.preview_key.unwrap().2, columns(0));
+        picker.set_preview_line_numbers(PreviewLineNumbers::Absolute);
+        picker.refresh_preview(width, &appearance);
+        // Three digits and a separator before the line count is known.
+        assert_eq!(picker.preview_key.unwrap().2, columns(4));
+        load_preview(&mut picker);
+        let (numbers, _) = paint(&mut picker);
+        let texts: Vec<&str> = numbers.iter().map(|(_, _, text)| text.as_str()).collect();
+        // Line 2 wraps over three rows; its continuations are unnumbered.
+        assert_eq!(texts, ["1", "2", "3", "4"]);
+
+        // 1200 lines need four digits; the next request uses the wider gutter.
+        assert_eq!(picker.preview_gutter_columns(), 5);
+        picker.refresh_preview(width, &appearance);
+        assert_eq!(picker.preview_key.unwrap().2, columns(5));
+        assert!(picker.preview_viewport.is_none());
+        // While reloading, the same page keeps its numbers.
+        let (numbers, _) = paint(&mut picker);
+        assert_eq!(numbers.len(), 4);
+        load_preview(&mut picker);
+        let (numbers, content_left) = paint(&mut picker);
+        for (_, right, _) in &numbers {
+            assert!(*right <= 4.0 * cell + 0.5, "number overlaps separator");
+        }
+        assert!(content_left >= 5.0 * cell - 0.5, "content overlaps gutter");
+
+        picker.set_preview_line_numbers(PreviewLineNumbers::Off);
+        picker.refresh_preview(width, &appearance);
+        assert_eq!(picker.preview_key.unwrap().2, columns(0));
+        load_preview(&mut picker);
+        let (numbers, content_left) = paint(&mut picker);
+        assert!(numbers.is_empty());
+        assert!(content_left < cell);
     }
 
     #[test]
@@ -3397,16 +3628,7 @@ mod query_parity_tests {
             Arc::new(
                 |_: PreviewRequest<nfm_picker_sources::structured::StructuredPickerItem>,
                  _: crate::Cancellation| {
-                    Ok(Preview::StyledText(vec![
-                        vec![crate::PreviewCell {
-                            text: "colored 猫".into(),
-                            ..Default::default()
-                        }],
-                        vec![crate::PreviewCell {
-                            text: "second line".into(),
-                            ..Default::default()
-                        }],
-                    ]))
+                    Ok(Preview::Text("colored 猫\nsecond line".into()))
                 },
             ),
         );
@@ -3546,15 +3768,12 @@ mod query_parity_tests {
         );
     }
     #[test]
-    fn host_document_uses_shared_preview_painter_and_copy_without_worker() {
+    fn text_preview_paints_numbers_and_copies_as_a_document() {
         let (ctx, mut picker) = make();
         wait(&mut picker);
-        picker.set_external_preview(true);
         picker.config.preview_visible = true;
-        picker.set_external_preview_document(
-            Some(Ok(Preview::Text("host preview fixture".into()))),
-            false,
-        );
+        picker.set_preview_line_numbers(PreviewLineNumbers::Absolute);
+        show_text(&ctx, &mut picker, "host preview fixture\nsecond");
         let (frame, _) = draw(&ctx, &mut picker, vec![]);
         let painted: String = frame
             .shapes
@@ -3565,6 +3784,20 @@ mod query_parity_tests {
             })
             .collect();
         assert!(painted.contains("host preview fixture"));
+        let muted = Appearance::default().palette.muted;
+        let numbers: Vec<_> = frame
+            .shapes
+            .iter()
+            .filter_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) if text.galley.job.sections[0].format.color == muted => {
+                    Some(text.galley.text().to_owned())
+                }
+                _ => None,
+            })
+            // Other muted text, such as the match count, is not a line number.
+            .filter(|text: &String| text.chars().all(|ch| ch.is_ascii_digit()))
+            .collect();
+        assert_eq!(numbers, ["1", "2"]);
         let (unfocused, _) = draw(
             &ctx,
             &mut picker,
@@ -3592,15 +3825,9 @@ mod query_parity_tests {
                 .platform_output
                 .commands
                 .contains(&egui::OutputCommand::CopyText(
-                    "host preview fixture".into()
+                    "host preview fixture\nsecond".into()
                 ))
         );
-        assert!(picker.preview.is_none());
-        picker.set_external_preview_document(None, true);
-        draw(&ctx, &mut picker, vec![]);
-        assert!(picker.busy());
-        picker.set_external_preview_document(None, false);
-        assert!(!picker.busy());
     }
     #[test]
     fn external_preview_bounds_follow_toggle_help_and_close_without_a_worker() {

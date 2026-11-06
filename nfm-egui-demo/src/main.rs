@@ -1,7 +1,9 @@
 //! The example host owns its window/GL context and publishes a live candidate stream.
 use nfm_egui::{
-    Appearance, Cancellation, Picker, PickerConfig, PickerEvent, Placement, Position, Preview,
-    PreviewRequest, egui,
+    Appearance, Cancellation, Picker, PickerConfig, PickerEvent, Placement, Position,
+    PreviewLineNumbers, Selection,
+    byte_preview::{ByteDocument, BytePreviewProvider},
+    egui,
 };
 use nfm_search_core::{
     snapshot_store::SnapshotStore,
@@ -24,6 +26,7 @@ struct Demo {
     picker: Option<Picker<Source>>,
     appearance: Appearance,
     position: Position,
+    line_numbers: PreviewLineNumbers,
     status: String,
     screenshot: Option<PathBuf>,
     screenshot_requested: bool,
@@ -68,12 +71,27 @@ impl Demo {
             .find(|arg| arg == "--screenshot")
             .and_then(|_| args.next())
             .map(PathBuf::from);
+        let mut args = std::env::args();
+        let line_numbers = match args
+            .find(|arg| arg == "--line-numbers")
+            .and_then(|_| args.next())
+            .as_deref()
+        {
+            None | Some("off") => PreviewLineNumbers::Off,
+            Some("absolute") => PreviewLineNumbers::Absolute,
+            Some("relative") => PreviewLineNumbers::Relative,
+            Some("hybrid") => PreviewLineNumbers::Hybrid,
+            Some(other) => {
+                panic!("--line-numbers expects off|absolute|relative|hybrid, got {other}")
+            }
+        };
         let mut demo = Self {
             source,
             cancelled,
             picker: None,
             appearance: Appearance::default(),
             position: Position::Center,
+            line_numbers,
             status: "Live stream: search or navigate while candidates arrive.".into(),
             screenshot,
             screenshot_requested: false,
@@ -88,24 +106,26 @@ impl Demo {
             self.source.clone(),
             PickerConfig::default(),
         );
+        picker.set_preview_line_numbers(self.line_numbers);
+        // A document-backed provider gives copy mode (Ctrl+W) and line numbers
+        // the soft-wrap structure of the preview.
         picker.set_preview_provider(
             ctx,
-            Arc::new(|request: PreviewRequest<u64>, cancel: Cancellation| {
-                if cancel.is_cancelled() {
-                    return Ok(Preview::Empty);
-                }
-                {
+            Arc::new(BytePreviewProvider::new(
+                |selection: &Selection<u64>, _: Cancellation| {
                     let text = format!(
-                        "\x1b[1;33m{}\x1b[0m\r\n\x1b[32mPayload: {}\x1b[0m\r\n{}",
-                        request.selection.text,
-                        request.selection.item,
+                        "\x1b[1;33m{}\x1b[0m\r\n\x1b[32mPayload: {}\x1b[0m\r\n{}\r\n{}",
+                        selection.text,
+                        selection.item,
+                        "This line is long enough to soft-wrap, so its continuation rows have no number. "
+                            .repeat(4),
                         (0..50)
                             .map(|i| format!("Preview row {i}\r\n"))
                             .collect::<String>()
                     );
-                    nfm_egui::preview::parse_ansi(text.as_bytes(), &request)
-                }
-            }),
+                    Ok(ByteDocument::complete(text.into_bytes()))
+                },
+            )),
         );
         self.picker = Some(picker);
     }
@@ -154,9 +174,25 @@ impl eframe::App for Demo {
             ] {
                 ui.selectable_value(&mut self.position, position, label);
             }
+            ui.separator();
+            ui.label("Line numbers:");
+            for (numbers, label) in [
+                (PreviewLineNumbers::Off, "Off"),
+                (PreviewLineNumbers::Absolute, "Absolute"),
+                (PreviewLineNumbers::Relative, "Relative"),
+                (PreviewLineNumbers::Hybrid, "Hybrid"),
+            ] {
+                if ui
+                    .selectable_value(&mut self.line_numbers, numbers, label)
+                    .clicked()
+                    && let Some(picker) = &mut self.picker
+                {
+                    picker.set_preview_line_numbers(numbers);
+                }
+            }
         });
         ui.label(&self.status);
-        ui.label("↑/↓ navigate · Enter accepts · Esc cancels · Ctrl+C copies · Ctrl+P toggles preview · Ctrl+PageUp/Down scrolls preview");
+        ui.label("↑/↓ navigate · Enter accepts · Esc cancels · Ctrl+C copies · Ctrl+P toggles preview · Ctrl+W focuses the preview (j/k, 5j, Esc) · Ctrl+PageUp/Down scrolls preview");
         let ctx = ui.ctx();
         let mut bounds = ctx.content_rect();
         bounds.min.y += 90.0;

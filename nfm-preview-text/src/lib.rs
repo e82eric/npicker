@@ -5,7 +5,8 @@ use nfm_egui::copy_mode::{CellPosition, CopySelection, TextRow};
 use nfm_egui::egui::Color32;
 use nfm_egui::preview::PreviewViewport;
 use nfm_egui::{
-    Appearance, Cancellation, Preview, PreviewCell, PreviewProvider, PreviewRequest, Selection,
+    Appearance, Cancellation, GridLines, Preview, PreviewCell, PreviewProvider, PreviewRequest,
+    Selection,
 };
 use std::sync::{Arc, Mutex, OnceLock};
 use two_face::re_exports::syntect::{
@@ -186,6 +187,8 @@ impl TextDocument {
             columns,
             cells,
             total_rows: self.rows.len(),
+            // Rows never wrap; each row is one source line.
+            lines: Some(GridLines::unwrapped(top, rows, self.rows.len())),
         }
     }
     fn selected_text(&self, selection: &CopySelection) -> Result<String, String> {
@@ -239,6 +242,10 @@ impl TextDocument {
     }
 }
 impl CopyDocument for TextDocument {
+    // Rows never wrap; each row is one source line.
+    fn line_number(&self, row: u64) -> Option<u64> {
+        (row < self.rows.len() as u64).then_some(row)
+    }
     fn metadata(&self) -> Result<DocumentMetadata, String> {
         Ok(DocumentMetadata {
             revision: 1,

@@ -33,4 +33,12 @@ pub trait CopyDocument: Send + Sync + 'static {
     fn anchor(&self) -> Option<CellPosition> {
         None
     }
+    /// Zero-based logical line containing `row`; soft-wrapped rows share their
+    /// line's number. None for rows past the end.
+    fn line_number(&self, row: u64) -> Option<u64>;
+    /// Whether copy-mode search may read the whole document on the UI thread,
+    /// giving results in the same frame. Only small in-memory documents should.
+    fn search_synchronously(&self) -> bool {
+        false
+    }
 }

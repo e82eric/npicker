@@ -1,24 +1,28 @@
 //! Picker adapter for the shared copy-mode state machine.
+use crate::copy_document::DocumentRow;
 use crate::copy_mode::{
-    CellPosition, CellRange, CopyAction, CopyMode, CopySelection, Motion, TextRow, View,
-    YankCommand, yank_pulse_strength, yank_pulse_timing,
+    CellPosition, CellRange, CopyAction, CopyMode, CopySelection, Motion, View, YankCommand,
+    yank_pulse_strength, yank_pulse_timing,
 };
-use crate::{Appearance, Preview, PreviewCell, preview};
+use crate::{Appearance, Preview, preview};
 use egui::{Context, Event, Key, Modifiers};
 use std::time::Instant;
 use unicode_segmentation::UnicodeSegmentation;
-use unicode_width::UnicodeWidthStr;
-
-#[derive(Clone)]
-struct Row {
-    text: TextRow,
-    widths: Vec<u8>,
-}
 
 #[cfg(test)]
 mod yank_paint_tests {
     use super::*;
     use crate::copy_mode::{VisualMode, YANK_HIGHLIGHT_DURATION};
+
+    /// A viewport on ANSI text laid out `columns` wide.
+    fn ansi(text: &str, columns: usize) -> PreviewCopyMode {
+        let layout =
+            crate::styled_document::StyledDocument::from_ansi(text.as_bytes(), 1 << 20, 100)
+                .unwrap()
+                .layout(columns, &crate::Cancellation::test())
+                .unwrap();
+        PreviewCopyMode::host(layout, 0, 4).unwrap()
+    }
 
     #[test]
     fn preview_selection_preserves_syntax_colors_and_cursor_contrast() {
@@ -31,27 +35,12 @@ mod yank_paint_tests {
         ] {
             let ctx = Context::default();
             let appearance = Appearance::default();
-            let preview = Preview::StyledText(vec![vec![
-                PreviewCell {
-                    text: "a".into(),
-                    foreground: red,
-                    bold: true,
-                    ..Default::default()
-                },
-                PreviewCell {
-                    text: "b".into(),
-                    foreground: egui::Color32::BLACK,
-                    background: green,
-                    inverse: true,
-                    ..Default::default()
-                },
-                PreviewCell {
-                    text: "c".into(),
-                    foreground: red,
-                    ..Default::default()
-                },
-            ]]);
-            let mut copy = PreviewCopyMode::text(&preview, 0, 4).unwrap();
+            // Bold red "a", inverse "b" on green, red "c".
+            let mut copy = ansi(
+                "\x1b[1;38;2;220;80;90ma\x1b[0m\x1b[7;30;48;2;120;190;100mb\x1b[0m\
+                 \x1b[38;2;220;80;90mc\x1b[0m",
+                3,
+            );
             copy.mode.toggle_visual(visual);
             copy.mode.cursor = CellPosition { x: 2, y: 0 };
             let output = paint(&ctx, &mut copy, &[]);
@@ -98,13 +87,8 @@ mod yank_paint_tests {
         plain.input(&ctx, &[key(Key::K)], 4);
         assert_eq!(plain.mode.cursor, CellPosition { x: 2, y: 0 });
 
-        let mut wrapped = PreviewCopyMode::text(&preview, 0, 4).unwrap();
-        if let Document::Text { rows, .. } = &mut wrapped.document {
-            rows[0].text.wraps_to_next = true;
-            rows[3].text.wraps_to_next = true;
-        } else {
-            panic!("expected text document");
-        }
+        // The same rows, with the first and fourth soft-wrapping.
+        let mut wrapped = ansi("abcdefgh\nij\nklmnopqr", 4);
         wrapped.mode.cursor = CellPosition { x: 2, y: 1 };
         wrapped.input(&ctx, &[key(Key::J)], 4);
         assert_eq!(wrapped.mode.cursor, CellPosition { x: 1, y: 2 });
@@ -118,7 +102,7 @@ mod yank_paint_tests {
     fn host_documents_start_the_cursor_on_their_anchor_while_it_is_visible() {
         use crate::copy_document::{CopyDocument, DocumentMetadata, DocumentRow};
         use std::sync::Arc;
-        struct Anchored(Document, CellPosition);
+        struct Anchored(PinnedDocument, CellPosition);
         impl CopyDocument for Anchored {
             fn metadata(&self) -> Result<DocumentMetadata, String> {
                 Ok(DocumentMetadata {
@@ -128,10 +112,7 @@ mod yank_paint_tests {
                 })
             }
             fn text_row(&self, y: u64) -> Result<Option<DocumentRow>, String> {
-                Ok(self.0.row(y).map(|row| DocumentRow {
-                    text: row.text,
-                    widths: row.widths,
-                }))
+                Ok(self.0.row(y))
             }
             fn resolve_cell(
                 &self,
@@ -150,6 +131,9 @@ mod yank_paint_tests {
                 appearance: &Appearance,
             ) -> Result<Preview, String> {
                 self.0.grid(top, rows, appearance).ok_or("viewport".into())
+            }
+            fn line_number(&self, row: u64) -> Option<u64> {
+                self.0.handle.line_number(row)
             }
             fn anchor(&self) -> Option<CellPosition> {
                 Some(self.1)
@@ -176,7 +160,7 @@ mod yank_paint_tests {
             atomic::{AtomicBool, Ordering},
         };
         struct Host(
-            Document,
+            PinnedDocument,
             Arc<AtomicBool>,
             std::thread::ThreadId,
             Arc<AtomicBool>,
@@ -197,10 +181,7 @@ mod yank_paint_tests {
                 if std::thread::current().id() != self.2 {
                     self.3.store(true, Ordering::Relaxed);
                 }
-                Ok(self.0.row(y).map(|row| DocumentRow {
-                    text: row.text,
-                    widths: row.widths,
-                }))
+                Ok(self.0.row(y))
             }
             fn resolve_cell(
                 &self,
@@ -222,6 +203,9 @@ mod yank_paint_tests {
             ) -> Result<Preview, String> {
                 self.metadata()?;
                 self.0.grid(top, rows, appearance).ok_or("viewport".into())
+            }
+            fn line_number(&self, row: u64) -> Option<u64> {
+                self.0.handle.line_number(row)
             }
         }
         let mut lines = vec!["short"; 200];
@@ -413,9 +397,10 @@ mod yank_paint_tests {
         copy.mode.cursor.y = 0;
         copy.reveal(14);
         assert_eq!(copy.top, 0);
+        // 100 rows: the final line break adds no row.
         copy.mode.cursor.y = 100;
         copy.reveal(14);
-        assert_eq!(copy.top, 87);
+        assert_eq!(copy.top, 86);
         copy.top = 20;
         copy.mode.cursor.y = 20;
         copy.reveal(2);
@@ -437,19 +422,11 @@ mod yank_paint_tests {
         let ctx = Context::default();
         let appearance = Appearance::default();
         let syntax = egui::Color32::from_rgb(220, 80, 90);
-        let preview = Preview::StyledText(vec![
-            "word"
-                .chars()
-                .map(|ch| PreviewCell {
-                    text: ch.to_string(),
-                    foreground: syntax,
-                    background: egui::Color32::BLACK,
-                    inverse: ch == 'r',
-                    ..Default::default()
-                })
-                .collect(),
-        ]);
-        let mut copy = PreviewCopyMode::text(&preview, 0, 4).unwrap();
+        // "word" in syntax red on black, with an inverse "r".
+        let mut copy = ansi(
+            "\x1b[38;2;220;80;90;48;2;0;0;0mwo\x1b[7mr\x1b[27md\x1b[0m",
+            4,
+        );
         let _ = paint(&ctx, &mut copy, &[]);
         assert!(copy.open_quick_select(true, 4));
         let output = paint(&ctx, &mut copy, &[]);
@@ -791,17 +768,14 @@ mod yank_paint_tests {
             let ctx = Context::default();
             ctx.set_pixels_per_point(scale);
             let appearance = Appearance::default();
-            for document in [
-                Preview::Text("one 猫\nsecond".into()),
-                Preview::StyledText(vec![vec![PreviewCell {
-                    text: "styled 猫".into(),
-                    bold: true,
-                    ..Default::default()
-                }]]),
+            for mut copy in [
+                PreviewCopyMode::text(&Preview::Text("one 猫\nsecond".into()), 0, 4).unwrap(),
+                ansi("\x1b[1mstyled 猫\x1b[0m", 9),
             ] {
-                let mut copy = PreviewCopyMode::text(&document, 0, 4).unwrap();
+                // The unfocused preview paints the document's page.
+                let page = copy.viewport(4, &appearance).unwrap();
                 let mut before = ctx.run_ui(egui::RawInput::default(), |ui| {
-                    preview::paint(ui, &document, &appearance, 4, 0);
+                    preview::paint(ui, &page, &appearance, 4);
                 });
                 let mut after = ctx.run_ui(egui::RawInput::default(), |ui| {
                     copy.paint(ui, &appearance, 4);
@@ -840,7 +814,8 @@ mod yank_paint_tests {
             .map(|cell| cell.text.as_str())
             .collect();
         assert_eq!(text.trim_end(), "third");
-        assert_eq!(cells[0].background, egui::Color32::TRANSPARENT);
+        // The plain document background: no cursor cell is drawn.
+        assert_eq!(cells[0].background, appearance.palette.background);
     }
 
     fn paint(ctx: &Context, copy: &mut PreviewCopyMode, events: &[Event]) -> egui::FullOutput {
@@ -1057,166 +1032,51 @@ mod yank_paint_tests {
     }
 }
 
+/// The copy document behind a viewport, pinned to the metadata it was opened
+/// with: `valid` compares it against the live document, and searches walk the
+/// pinned row count. Reads used for painting treat errors as nothing to draw;
+/// navigation goes through `handle` so `CopyController` records them.
 #[derive(Clone)]
-enum Document {
-    Host {
-        handle: std::sync::Arc<dyn crate::copy_document::CopyDocument>,
-        metadata: crate::copy_document::DocumentMetadata,
-    },
-    Text {
-        rows: Vec<Row>,
-        styled: Vec<Vec<PreviewCell>>,
-        columns: u32,
-    },
+struct PinnedDocument {
+    handle: std::sync::Arc<dyn crate::copy_document::CopyDocument>,
+    metadata: crate::copy_document::DocumentMetadata,
 }
 
-impl Document {
+impl PinnedDocument {
     fn columns(&self) -> u32 {
-        match self {
-            Self::Host { metadata, .. } => metadata.columns,
-            Self::Text { columns, .. } => *columns,
-        }
+        self.metadata.columns
     }
     fn rows(&self) -> u64 {
-        match self {
-            Self::Host { metadata, .. } => metadata.total_rows,
-            Self::Text { rows, .. } => rows.len() as u64,
-        }
+        self.metadata.total_rows
     }
-    fn row(&self, y: u64) -> Option<Row> {
-        match self {
-            Self::Host { handle, .. } => handle.text_row(y).ok()?.map(|row| Row {
-                text: row.text,
-                widths: row.widths,
-            }),
-            Self::Text { rows, .. } => rows.get(usize::try_from(y).ok()?).cloned(),
-        }
+    fn row(&self, y: u64) -> Option<DocumentRow> {
+        self.handle.text_row(y).ok().flatten()
     }
-    fn resolve(&self, mut cell: CellPosition, right: bool) -> Option<CellPosition> {
-        if let Self::Host { handle, .. } = self {
-            return handle.resolve_cell(cell, right).ok();
-        }
-        cell.y = cell.y.min(self.rows().checked_sub(1)?);
-        cell.x = cell.x.min(self.columns().checked_sub(1)?);
-        let row = self.row(cell.y)?;
-        if row.widths.get(cell.x as usize) == Some(&0) {
-            if right
-                && cell.x + 1 == self.columns()
-                && row.text.wraps_to_next
-                && cell.y + 1 < self.rows()
-            {
-                return self.resolve(
-                    CellPosition {
-                        x: 0,
-                        y: cell.y + 1,
-                    },
-                    false,
-                );
-            }
-            let mut left = cell.x;
-            while left > 0 && row.widths[left as usize] == 0 {
-                left -= 1;
-            }
-            let end = left + u32::from(row.widths[left as usize]);
-            cell.x = if right && end < self.columns() && row.widths.get(end as usize) != Some(&0) {
-                end
-            } else {
-                left
-            };
-        }
-        Some(cell)
+    fn resolve(&self, cell: CellPosition, right: bool) -> Option<CellPosition> {
+        self.handle.resolve_cell(cell, right).ok()
     }
     fn selection_text(&self, selection: &CopySelection) -> Option<String> {
-        if let Self::Host { handle, .. } = self {
-            return handle.selection_text(selection).ok();
-        }
-        let mut result = String::new();
-        let range = selection.range;
-        for y in range.start.y..=range.end.y {
-            let row = self.row(y)?;
-            let left = if selection.rectangle || y == range.start.y {
-                range.start.x
-            } else {
-                0
-            };
-            let right = if selection.rectangle || y == range.end.y {
-                range.end.x
-            } else {
-                self.columns() - 1
-            };
-            let mut line = String::new();
-            for (byte, grapheme) in row.text.text.grapheme_indices(true) {
-                let x = row.text.columns[byte];
-                if x <= right && x + u32::from(row.widths[x as usize]) > left {
-                    line.push_str(grapheme);
-                }
-            }
-            if selection.trim {
-                line.truncate(line.trim_end_matches(' ').len());
-            }
-            result.push_str(&line);
-            if y != range.end.y {
-                result.push('\n');
-            }
-        }
-        if selection.linewise {
-            result.push('\n');
-        }
-        Some(result)
+        self.handle.selection_text(selection).ok()
     }
     fn grid(&self, top: u64, rows: usize, appearance: &Appearance) -> Option<Preview> {
-        match self {
-            Self::Host { handle, .. } => handle.viewport(top, rows, appearance).ok(),
-            Self::Text {
-                styled, columns, ..
-            } => {
-                let mut cells = Vec::new();
-                for y in top..(top + rows as u64).min(self.rows()) {
-                    let mut row = styled[y as usize].clone();
-                    row.resize(*columns as usize, PreviewCell::default());
-                    cells.extend(row);
-                }
-                Some(Preview::Grid {
-                    columns: *columns as usize,
-                    cells,
-                    total_rows: self.rows() as usize,
-                })
-            }
-        }
+        self.handle.viewport(top, rows, appearance).ok()
     }
 }
 
-impl crate::copy_controller::CopyNavigationDocument for Document {
-    fn text_row(&self, y: u64) -> Result<Option<TextRow>, String> {
-        if let Self::Host { handle, .. } = self {
-            return handle.text_row(y).map(|row| row.map(|row| row.text));
-        }
-        if y >= self.rows() {
-            return Ok(None);
-        }
-        self.row(y)
-            .map(|row| Some(row.text))
-            .ok_or_else(|| "Unable to read preview row".into())
-    }
-    fn resolve_cell(&self, cell: CellPosition, right: bool) -> Result<CellPosition, String> {
-        if let Self::Host { handle, .. } = self {
-            return handle.resolve_cell(cell, right);
-        }
-        self.resolve(cell, right)
-            .ok_or_else(|| "Unable to resolve preview cell".into())
-    }
-    fn selection_text(&self, selection: &CopySelection) -> Result<String, String> {
-        if let Self::Host { handle, .. } = self {
-            return handle.selection_text(selection);
-        }
-        self.selection_text(selection)
-            .ok_or_else(|| "Unable to copy preview selection".into())
-    }
+/// A line-number gutter entry; `current` marks the focused cursor's line.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct GutterNumber {
+    pub(crate) text: String,
+    pub(crate) current: bool,
+    /// Hybrid numbering left-aligns the cursor line's absolute number, as
+    /// Vim does with `number` and `relativenumber`, so it stands apart from
+    /// the right-aligned distances.
+    pub(crate) left_aligned: bool,
 }
 
 pub(crate) struct PreviewCopyMode {
     pub(crate) mode: CopyMode,
-    document: Document,
+    document: PinnedDocument,
     pub(crate) top: u64,
     left: u32,
     quick_select: Option<crate::quick_select::QuickSelect>,
@@ -1240,6 +1100,7 @@ impl PreviewCopyMode {
             columns,
             cells,
             total_rows,
+            lines,
         } = self.document.grid(self.top, rows, appearance)?
         else {
             return None;
@@ -1252,6 +1113,7 @@ impl PreviewCopyMode {
                 .flat_map(|row| row.iter().skip(left).cloned())
                 .collect(),
             total_rows,
+            lines,
         })
     }
 
@@ -1324,11 +1186,64 @@ impl PreviewCopyMode {
         !quick.from_copy
     }
 
-    pub(crate) fn valid(&self) -> bool {
-        if let Document::Host { handle, metadata } = &self.document {
-            return handle.metadata().is_ok_and(|current| current == *metadata);
+    /// Zero-based logical line containing `row`.
+    fn line_of(&self, row: u64) -> Option<u64> {
+        if row >= self.document.rows() {
+            return None;
         }
-        true
+        self.document.handle.line_number(row)
+    }
+
+    /// Logical lines in the document.
+    pub(crate) fn line_count(&self) -> u64 {
+        self.document
+            .rows()
+            .checked_sub(1)
+            .and_then(|last| self.line_of(last))
+            .map_or(0, |line| line + 1)
+    }
+
+    /// Gutter numbers for each of the `rows` viewport rows. Only a line's first
+    /// row is numbered; continuations and rows past the end are None. Relative
+    /// numbers follow the cursor only while `focused`.
+    pub(crate) fn line_numbers(
+        &self,
+        rows: usize,
+        style: crate::picker::PreviewLineNumbers,
+        focused: bool,
+    ) -> Vec<Option<GutterNumber>> {
+        use crate::picker::PreviewLineNumbers as Style;
+        let cursor = if focused {
+            self.line_of(self.mode.cursor.y)
+        } else {
+            None
+        };
+        let mut previous = self.top.checked_sub(1).and_then(|y| self.line_of(y));
+        let mut numbers = Vec::with_capacity(rows);
+        for y in self.top..self.top.saturating_add(rows as u64) {
+            let line = self.line_of(y);
+            let starts = line != previous;
+            previous = line;
+            numbers.push(line.filter(|_| starts).map(|line| {
+                let current = cursor == Some(line);
+                let number = match (style, cursor) {
+                    (Style::Relative, Some(cursor)) => line.abs_diff(cursor),
+                    (Style::Hybrid, Some(cursor)) if !current => line.abs_diff(cursor),
+                    _ => line + 1,
+                };
+                GutterNumber {
+                    text: number.to_string(),
+                    current,
+                    left_aligned: current && style == Style::Hybrid,
+                }
+            }));
+        }
+        numbers
+    }
+
+    pub(crate) fn valid(&self) -> bool {
+        let PinnedDocument { handle, metadata } = &self.document;
+        handle.metadata().is_ok_and(|current| current == *metadata)
     }
 
     pub(crate) fn copy_all(&self, ctx: &Context) {
@@ -1360,7 +1275,7 @@ impl PreviewCopyMode {
         }
         let anchor = handle.anchor();
         let mut copy = Self::new(
-            Document::Host { handle, metadata },
+            PinnedDocument { handle, metadata },
             metadata.revision,
             top,
             rows,
@@ -1378,90 +1293,19 @@ impl PreviewCopyMode {
         Some(copy)
     }
 
-    pub(crate) fn text_grid(
-        preview: &Preview,
-        top: usize,
-        rows: usize,
-        appearance: &Appearance,
-    ) -> Option<Preview> {
-        Self::text(preview, top, rows)?
-            .document
-            .grid(top as u64, rows, appearance)
-    }
-
+    /// A viewport on text, paged as the preview worker pages `Preview::Text`.
+    #[cfg(test)]
     pub(crate) fn text(preview: &Preview, top: usize, rows: usize) -> Option<Self> {
-        let lines: Vec<Vec<PreviewCell>> = match preview {
-            Preview::Text(text) => text
-                .split('\n')
-                .map(|line| {
-                    vec![PreviewCell {
-                        text: line.trim_end_matches('\r').into(),
-                        ..Default::default()
-                    }]
-                })
-                .collect(),
-            Preview::StyledText(lines) => lines.clone(),
-            _ => return None,
+        let Preview::Text(text) = preview else {
+            return None;
         };
-        let mut styled = Vec::new();
-        let mut text_rows = Vec::new();
-        let mut columns = 1;
-        for line in lines {
-            let mut cells = Vec::new();
-            let mut text = String::new();
-            let mut mapping = Vec::new();
-            let mut widths = Vec::new();
-            for span in line {
-                for grapheme in span.text.graphemes(true) {
-                    let width = grapheme.width().max(1).min(2);
-                    let x = cells.len() as u32;
-                    text.push_str(grapheme);
-                    mapping.resize(text.len(), x);
-                    cells.push(PreviewCell {
-                        text: grapheme.into(),
-                        ..span.clone()
-                    });
-                    widths.push(width as u8);
-                    for _ in 1..width {
-                        cells.push(PreviewCell {
-                            text: String::new(),
-                            ..span.clone()
-                        });
-                        widths.push(0);
-                    }
-                }
-            }
-            columns = columns.max(cells.len() as u32);
-            styled.push(cells);
-            text_rows.push(Row {
-                text: TextRow {
-                    text,
-                    columns: mapping,
-                    wraps_to_next: false,
-                },
-                widths,
-            });
-        }
-        for row in &mut text_rows {
-            for x in row.widths.len()..columns as usize {
-                row.text.text.push(' ');
-                row.text.columns.push(x as u32);
-                row.widths.push(1);
-            }
-        }
-        Some(Self::new(
-            Document::Text {
-                rows: text_rows,
-                styled,
-                columns,
-            },
-            1,
-            top,
-            rows,
-        ))
+        let layout = crate::styled_document::StyledDocument::from_text(text)
+            .text_layout(preview::MAX_TEXT_COLUMNS, &crate::Cancellation::never())
+            .ok()?;
+        Self::host(layout, top, rows)
     }
 
-    fn new(document: Document, revision: u64, top: usize, rows: usize) -> Self {
+    fn new(document: PinnedDocument, revision: u64, top: usize, rows: usize) -> Self {
         let top = (top as u64).min(document.rows().saturating_sub(rows as u64));
         let view = View {
             cursor: CellPosition { x: 0, y: top },
@@ -1523,38 +1367,37 @@ impl PreviewCopyMode {
             self.mode.adopt_search(self.search_revision, Vec::new());
             return;
         }
-        if matches!(self.document, Document::Host { .. })
-            && self.pending_search_highlights.is_none()
-        {
-            self.pending_search_highlights = Some(self.mode.search_matches().to_vec());
-        }
-        self.mode.begin_search(self.search_revision, forward, count);
-        if matches!(self.document, Document::Host { .. }) {
-            let service = self.search_service.get_or_insert_with(|| {
-                let ctx = ctx.clone();
-                crate::search_service::SearchService::new(move || ctx.request_repaint())
-            });
-            match service.submit(
-                self.mode.generation.unwrap_or(0),
-                std::sync::Arc::new(self.document.clone()),
-                pattern.to_owned(),
-                regex,
-            ) {
-                Ok(ticket) => {
-                    self.search_revision = ticket.query_revision;
-                    self.mode.begin_search(self.search_revision, forward, count);
-                    self.search_job = Some(SearchJob {
-                        revision: ticket.query_revision,
-                        cancel: ticket.cancellation(),
-                        _ticket: ticket,
-                    });
-                }
-                Err(error) => self.finish_search_result(self.search_revision, Err(error)),
-            }
-        } else {
+        if self.document.handle.search_synchronously() {
+            self.mode.begin_search(self.search_revision, forward, count);
             let cancel = std::sync::atomic::AtomicBool::new(false);
             let result = search_matches(&self.document, pattern, regex, &cancel);
             self.finish_search_result(self.search_revision, result);
+            return;
+        }
+        if self.pending_search_highlights.is_none() {
+            self.pending_search_highlights = Some(self.mode.search_matches().to_vec());
+        }
+        self.mode.begin_search(self.search_revision, forward, count);
+        let service = self.search_service.get_or_insert_with(|| {
+            let ctx = ctx.clone();
+            crate::search_service::SearchService::new(move || ctx.request_repaint())
+        });
+        match service.submit(
+            self.mode.generation.unwrap_or(0),
+            std::sync::Arc::new(self.document.clone()),
+            pattern.to_owned(),
+            regex,
+        ) {
+            Ok(ticket) => {
+                self.search_revision = ticket.query_revision;
+                self.mode.begin_search(self.search_revision, forward, count);
+                self.search_job = Some(SearchJob {
+                    revision: ticket.query_revision,
+                    cancel: ticket.cancellation(),
+                    _ticket: ticket,
+                });
+            }
+            Err(error) => self.finish_search_result(self.search_revision, Err(error)),
         }
     }
     fn finish_search_result(&mut self, revision: u64, result: Result<Vec<CellRange>, String>) {
@@ -1575,8 +1418,12 @@ impl PreviewCopyMode {
         }
         self.pending_search_highlights = None;
         let view = self.view(1); // The next paint/input reveals using its actual height.
-        match crate::copy_controller::CopyController::new(&mut self.mode, &self.document, view)
-            .finish_search(revision, matches, Some(self.search_anchor))
+        match crate::copy_controller::CopyController::new(
+            &mut self.mode,
+            &*self.document.handle,
+            view,
+        )
+        .finish_search(revision, matches, Some(self.search_anchor))
         {
             Ok(_) => {}
             Err(error) => self.search_error = Some(error),
@@ -1633,7 +1480,7 @@ impl PreviewCopyMode {
                         let view = self.view(rows);
                         let update = match crate::copy_controller::CopyController::new(
                             &mut self.mode,
-                            &self.document,
+                            &*self.document.handle,
                             view,
                         )
                         .select_quick(quick.purpose(), cell)
@@ -1755,7 +1602,7 @@ impl PreviewCopyMode {
                     let forward = *forward;
                     // Host-backed searches complete asynchronously. Keep the
                     // displayed match until the replacement result arrives.
-                    if query.is_empty() || !matches!(self.document, Document::Host { .. }) {
+                    if query.is_empty() || self.document.handle.search_synchronously() {
                         if let Some((mode, top, left)) = &self.search_origin {
                             self.mode = mode.clone();
                             self.top = *top;
@@ -1803,7 +1650,7 @@ impl PreviewCopyMode {
             let view = self.view(rows);
             let update = match crate::copy_controller::CopyController::new(
                 &mut self.mode,
-                &self.document,
+                &*self.document.handle,
                 view,
             )
             .execute(action)
@@ -1885,8 +1732,12 @@ impl PreviewCopyMode {
 
     pub(crate) fn scroll(&mut self, delta: isize, rows: usize) {
         let view = self.view(rows);
-        match crate::copy_controller::CopyController::new(&mut self.mode, &self.document, view)
-            .scroll(delta)
+        match crate::copy_controller::CopyController::new(
+            &mut self.mode,
+            &*self.document.handle,
+            view,
+        )
+        .scroll(delta)
         {
             Ok(update) => {
                 if let Some(top) = update.viewport_top {
@@ -1915,7 +1766,7 @@ impl PreviewCopyMode {
             .max(1.0) as u32;
         if !decorations {
             if let Some(document) = self.viewport(rows, appearance) {
-                preview::paint(ui, &document, appearance, rows, 0);
+                preview::paint(ui, &document, appearance, rows);
             }
             return;
         }
@@ -1945,6 +1796,7 @@ impl PreviewCopyMode {
             columns,
             mut cells,
             total_rows,
+            ..
         }) = self.document.grid(self.top, rows, appearance)
         else {
             return;
@@ -2013,10 +1865,10 @@ impl PreviewCopyMode {
                     columns: visible,
                     cells,
                     total_rows,
+                    lines: None,
                 },
                 appearance,
                 rows,
-                0,
             );
             let galley = ui.painter().layout_no_wrap(
                 status,
@@ -2213,10 +2065,10 @@ impl PreviewCopyMode {
                 columns: visible,
                 cells,
                 total_rows,
+                lines: None,
             },
             appearance,
             rows,
-            0,
         );
         let rect = egui::Rect::from_min_size(
             start,
@@ -2270,7 +2122,7 @@ impl Drop for SearchJob {
             .store(true, std::sync::atomic::Ordering::Release);
     }
 }
-impl crate::search_service::SearchDocument for Document {
+impl crate::search_service::SearchDocument for PinnedDocument {
     fn visit_text(
         &self,
         visitor: &mut dyn FnMut(&[u8], &[CellPosition], bool) -> Result<(), String>,
@@ -2298,7 +2150,7 @@ impl crate::search_service::SearchDocument for Document {
 }
 
 fn search_matches(
-    document: &Document,
+    document: &PinnedDocument,
     pattern: &str,
     regex: bool,
     cancel: &std::sync::atomic::AtomicBool,
@@ -2306,4 +2158,117 @@ fn search_matches(
     crate::search_service::search_document(document, pattern, regex, Default::default(), &|| {
         cancel.load(std::sync::atomic::Ordering::Relaxed)
     })
+}
+
+#[cfg(test)]
+mod line_number_tests {
+    use super::*;
+    use crate::picker::PreviewLineNumbers as Style;
+    use crate::styled_document::{DocumentLayout, StyledDocument};
+    use std::sync::Arc;
+
+    fn key(key: Key) -> Event {
+        Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers::NONE,
+        }
+    }
+
+    fn texts(numbers: &[Option<GutterNumber>]) -> Vec<Option<&str>> {
+        numbers
+            .iter()
+            .map(|number| number.as_ref().map(|number| number.text.as_str()))
+            .collect()
+    }
+
+    /// Rows at four columns: one | abcd efgh ij | thre e | four
+    fn layout() -> Arc<DocumentLayout> {
+        StyledDocument::from_ansi(b"one\nabcdefghij\nthree\nfour", 1 << 20, 100)
+            .unwrap()
+            .layout(4, &crate::Cancellation::test())
+            .unwrap()
+    }
+
+    #[test]
+    fn numbers_logical_lines_and_relative_distances_match_line_motions() {
+        let ctx = Context::default();
+        let mut copy = PreviewCopyMode::host(layout(), 0, 7).unwrap();
+        assert_eq!(copy.line_count(), 4);
+        let absolute = copy.line_numbers(7, Style::Absolute, false);
+        assert_eq!(
+            texts(&absolute),
+            [Some("1"), Some("2"), None, None, Some("3"), None, Some("4")]
+        );
+        assert!(absolute.iter().flatten().all(|number| !number.current));
+        // Unfocused previews have no visible cursor to measure from.
+        assert_eq!(copy.line_numbers(7, Style::Relative, false), absolute);
+        assert_eq!(copy.line_numbers(7, Style::Hybrid, false), absolute);
+
+        assert_eq!(copy.mode.cursor, CellPosition { x: 0, y: 0 });
+        let relative = copy.line_numbers(7, Style::Relative, true);
+        assert_eq!(
+            texts(&relative),
+            [Some("0"), Some("1"), None, None, Some("2"), None, Some("3")]
+        );
+        assert!(relative[0].as_ref().unwrap().current);
+        // The relative number is the count that reaches the line.
+        copy.input(&ctx, &[key(Key::Num2), key(Key::J)], 7);
+        assert_eq!(copy.mode.cursor.y, 4);
+        assert_eq!(copy.top, 0);
+        let hybrid = copy.line_numbers(7, Style::Hybrid, true);
+        assert_eq!(
+            texts(&hybrid),
+            [Some("2"), Some("1"), None, None, Some("3"), None, Some("1")]
+        );
+        let current: Vec<bool> = hybrid
+            .iter()
+            .map(|number| number.as_ref().is_some_and(|number| number.current))
+            .collect();
+        assert_eq!(current, [false, false, false, false, true, false, false]);
+        // Only hybrid's absolute cursor-line number is left-aligned.
+        let left: Vec<bool> = hybrid
+            .iter()
+            .map(|number| number.as_ref().is_some_and(|number| number.left_aligned))
+            .collect();
+        assert_eq!(left, current);
+        for style in [Style::Absolute, Style::Relative] {
+            assert!(
+                copy.line_numbers(7, style, true)
+                    .iter()
+                    .flatten()
+                    .all(|number| !number.left_aligned)
+            );
+        }
+        // A focused absolute gutter still marks the cursor line.
+        assert!(
+            copy.line_numbers(7, Style::Absolute, true)[4]
+                .as_ref()
+                .unwrap()
+                .current
+        );
+    }
+
+    #[test]
+    fn viewport_starting_inside_a_wrapped_line_and_past_the_end_is_unnumbered() {
+        let mut copy = PreviewCopyMode::host(layout(), 0, 7).unwrap();
+        copy.top = 2;
+        assert_eq!(
+            texts(&copy.line_numbers(7, Style::Absolute, false)),
+            [None, None, Some("3"), None, Some("4"), None, None]
+        );
+    }
+
+    #[test]
+    fn text_previews_number_every_row() {
+        let preview = Preview::Text("a\nb\nc".into());
+        let copy = PreviewCopyMode::text(&preview, 1, 2).unwrap();
+        assert_eq!(copy.line_count(), 3);
+        assert_eq!(
+            texts(&copy.line_numbers(2, Style::Absolute, false)),
+            [Some("2"), Some("3")]
+        );
+    }
 }

@@ -24,10 +24,10 @@ pub use nfm_search_core::search::SearchSortMode;
 pub use nfm_search_core::{fuzzy_search_session::SearchSnapshotProvider, store::ItemsSource};
 pub use picker::{
     Layout, Picker, PickerAction, PickerBinding, PickerConfig, PickerEvent, PickerOutput,
-    PickerTrigger, Selection,
+    PickerTrigger, PreviewLineNumbers, Selection,
 };
 pub use placement::{Placement, Position};
-pub use preview::{Cancellation, Preview, PreviewCell, PreviewProvider, PreviewRequest};
+pub use preview::{Cancellation, GridLines, Preview, PreviewCell, PreviewProvider, PreviewRequest};
 pub use session::SearchTimings;
 pub mod byte_preview;
 pub mod styled_document;

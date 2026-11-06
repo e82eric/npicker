@@ -272,11 +272,65 @@ impl StyledDocument {
             byte: source.start + byte - self.lines[source.line].start,
         })
     }
+    /// Unstyled text, one logical line per `\n` (a `\r` before it is dropped).
+    /// Escape sequences stay literal text. A final line break ends the last
+    /// line rather than starting another.
+    pub fn from_text(text: &str) -> Arc<Self> {
+        let text = text
+            .strip_suffix('\n')
+            .map_or(text, |text| text.strip_suffix('\r').unwrap_or(text));
+        let mut builder = DocumentBuilder::default();
+        let mut columns = Vec::new();
+        for line in text.split('\n') {
+            let line = line.strip_suffix('\r').unwrap_or(line);
+            columns.clear();
+            let mut x = 0;
+            for grapheme in line.graphemes(true) {
+                columns.extend(std::iter::repeat_n(x, grapheme.len()));
+                x += UnicodeWidthStr::width(grapheme).max(1) as u32;
+            }
+            builder
+                .push_row(line, &columns, false, &[])
+                .expect("plain rows are ordered and unstyled");
+        }
+        builder.finish()
+    }
+    /// Layout for plain text: lines up to `max_columns` cells wide never
+    /// wrap, so the page scrolls sideways; longer lines wrap at that width.
+    /// Copy-mode search reads it on the UI thread, within the same frame.
+    pub(crate) fn text_layout(
+        self: &Arc<Self>,
+        max_columns: usize,
+        cancel: &Cancellation,
+    ) -> Result<Arc<DocumentLayout>, String> {
+        let mut widest = 1;
+        for range in &self.lines {
+            if cancel.is_cancelled() {
+                return Err("preview cancelled".into());
+            }
+            let width = self
+                .text(range.clone())
+                .graphemes(true)
+                .map(|grapheme| UnicodeWidthStr::width(grapheme).max(1))
+                .sum::<usize>();
+            widest = widest.max(width.min(max_columns));
+        }
+        let mut layout = self.build_layout(widest, cancel)?;
+        layout.synchronous_search = true;
+        Ok(Arc::new(layout))
+    }
     pub fn layout(
         self: &Arc<Self>,
         columns: usize,
         cancel: &Cancellation,
     ) -> Result<Arc<DocumentLayout>, String> {
+        self.build_layout(columns, cancel).map(Arc::new)
+    }
+    fn build_layout(
+        self: &Arc<Self>,
+        columns: usize,
+        cancel: &Cancellation,
+    ) -> Result<DocumentLayout, String> {
         if columns == 0 {
             return Err("Invalid document width".into());
         }
@@ -317,13 +371,14 @@ impl StyledDocument {
             });
         }
         static REVISION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-        Ok(Arc::new(DocumentLayout {
+        Ok(DocumentLayout {
             document: self.clone(),
             columns,
             rows,
             line_rows,
             revision: REVISION.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-        }))
+            synchronous_search: false,
+        })
     }
 }
 
@@ -424,6 +479,8 @@ pub struct DocumentLayout {
     rows: Vec<LayoutRow>,
     line_rows: Vec<usize>,
     revision: u64,
+    /// Set for plain-text layouts; see `StyledDocument::text_layout`.
+    synchronous_search: bool,
 }
 impl DocumentLayout {
     pub fn columns(&self) -> usize {
@@ -535,10 +592,23 @@ impl DocumentLayout {
                 x += 1;
             }
         }
+        let last = first.saturating_add(count).min(self.rows.len()).max(first);
+        let starts = (first..last)
+            .map(|y| {
+                self.line_rows
+                    .binary_search(&y)
+                    .ok()
+                    .map(|line| line as u64)
+            })
+            .collect();
         Preview::Grid {
             columns: self.columns,
             cells,
             total_rows: self.rows.len(),
+            lines: Some(crate::preview::GridLines {
+                starts,
+                total: self.line_rows.len() as u64,
+            }),
         }
     }
 }
@@ -584,6 +654,16 @@ impl CopyDocument for DocumentLayout {
     }
     fn text_row(&self, row: u64) -> Result<Option<DocumentRow>, String> {
         Ok(self.row(row as usize))
+    }
+    fn line_number(&self, row: u64) -> Option<u64> {
+        if row >= self.rows.len() as u64 {
+            return None;
+        }
+        let line = self.line_rows.partition_point(|&first| first as u64 <= row);
+        Some(line.checked_sub(1)? as u64)
+    }
+    fn search_synchronously(&self) -> bool {
+        self.synchronous_search
     }
     fn resolve_cell(
         &self,
@@ -712,6 +792,9 @@ impl CopyDocument for SelectedDocument {
     fn anchor(&self) -> Option<CellPosition> {
         self.highlight.map(|(start, _, _)| start)
     }
+    fn line_number(&self, row: u64) -> Option<u64> {
+        self.layout.line_number(row)
+    }
 }
 type Resolver<T> = dyn Fn(&crate::Selection<T>) -> Result<(Arc<StyledDocument>, Option<DocumentRange>), String>
     + Send
@@ -823,6 +906,48 @@ impl<T: Clone + Send + 'static> PreviewProvider<T> for DocumentPreviewProvider<T
     }
     fn page_step(&self, rows: usize) -> usize {
         (rows / 2).max(1)
+    }
+}
+
+#[cfg(test)]
+mod text_tests {
+    use super::*;
+
+    #[test]
+    fn plain_text_scrolls_sideways_keeps_escapes_and_searches_in_frame() {
+        let cancel = Cancellation::test();
+        let document = StyledDocument::from_text("a猫b\r\n\x1b[31m\n");
+        let layout = document.text_layout(4096, &cancel).unwrap();
+        // A final line break adds no line; the widest line sets the width.
+        assert_eq!(layout.total_rows(), 2);
+        assert_eq!(layout.columns(), 5);
+        let row = layout.text_row(0).unwrap().unwrap();
+        assert_eq!(row.text.text.trim_end(), "a猫b");
+        assert_eq!(&row.widths[..4], &[1, 2, 0, 1]);
+        // Escape sequences are text, not styles.
+        let row = layout.text_row(1).unwrap().unwrap();
+        assert!(row.text.text.starts_with("\x1b[31m"));
+        assert!(layout.search_synchronously());
+        assert!(!document.layout(4, &cancel).unwrap().search_synchronously());
+
+        // Lines wider than the limit wrap at it and share one number.
+        let layout = StyledDocument::from_text("abcdef\nxy")
+            .text_layout(4, &cancel)
+            .unwrap();
+        assert_eq!(layout.columns(), 4);
+        assert_eq!(layout.total_rows(), 3);
+        assert_eq!(
+            (0..3)
+                .map(|row| layout.line_number(row))
+                .collect::<Vec<_>>(),
+            [Some(0), Some(0), Some(1)]
+        );
+        let Preview::Grid { lines, .. } =
+            layout.grid(0, 3, egui::Color32::WHITE, egui::Color32::BLACK, None)
+        else {
+            panic!("layouts page as grids");
+        };
+        assert_eq!(lines.unwrap().starts, [Some(0), None, Some(1)]);
     }
 }
 

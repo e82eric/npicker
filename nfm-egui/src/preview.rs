@@ -1,3 +1,4 @@
+use crate::styled_document::{DocumentLayout, StyledDocument};
 use crate::{Appearance, Selection};
 use crossbeam_channel::{Sender, bounded};
 use egui::{Color32, Context};
@@ -40,17 +41,42 @@ impl Default for PreviewCell {
 
 #[derive(Clone, Debug)]
 pub enum Preview {
+    /// Plain text. The preview worker lays it out as a `StyledDocument` that
+    /// pages, copies and numbers its lines like any other. Lines scroll
+    /// sideways rather than wrap, up to 4096 cells wide.
     Text(String),
-    /// Styled spans per line; scrolling is handled by the control.
-    StyledText(Vec<Vec<PreviewCell>>),
     Image(Arc<PreviewImage>),
     /// A viewport of styled terminal cells, already scrolled by the provider.
     Grid {
         columns: usize,
         cells: Vec<PreviewCell>,
         total_rows: usize,
+        /// The rows' logical lines, for the line-number gutter. None leaves the
+        /// page unnumbered, as for pages cut from a larger host snapshot.
+        lines: Option<GridLines>,
     },
     Empty,
+}
+
+/// Logical lines of a grid page's rows.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct GridLines {
+    /// One entry per page row: the zero-based logical line that row starts,
+    /// or None for a soft-wrapped continuation row.
+    pub starts: Vec<Option<u64>>,
+    /// Logical lines in the whole document; sizes the gutter.
+    pub total: u64,
+}
+impl GridLines {
+    /// Lines of a page of `rows` rows from `first`, in a document of `total`
+    /// rows that never wrap.
+    pub fn unwrapped(first: usize, rows: usize, total: usize) -> Self {
+        let end = first.saturating_add(rows).min(total).max(first);
+        Self {
+            starts: (first..end).map(|row| Some(row as u64)).collect(),
+            total: total as u64,
+        }
+    }
 }
 
 pub struct PreviewImage {
@@ -173,6 +199,40 @@ struct ResultUpdate {
     selection: (u64, usize),
     result: Result<Preview, String>,
     scroll_offset: usize,
+    text: Option<Arc<DocumentLayout>>,
+}
+
+/// Widest `Preview::Text` line shown without wrapping; longer lines wrap.
+pub(crate) const MAX_TEXT_COLUMNS: usize = 4096;
+
+/// Run the provider, turning text into a page of a text layout. Returns the
+/// page, its first row and, for text, the layout behind it.
+fn render<T: 'static>(
+    provider: &dyn PreviewProvider<T>,
+    request: PreviewRequest<T>,
+    cancel: Cancellation,
+) -> (Result<Preview, String>, usize, Option<Arc<DocumentLayout>>) {
+    let rows = usize::from(request.rows);
+    let (foreground, background) = (request.foreground, request.background);
+    let scroll_offset = request.scroll_offset;
+    let text = match provider.preview_viewport(request, cancel.clone()) {
+        Ok(PreviewViewport {
+            document: Preview::Text(text),
+            ..
+        }) => text,
+        Ok(page) => return (Ok(page.document), page.first_row, None),
+        Err(error) => return (Err(error), scroll_offset, None),
+    };
+    let layout = match StyledDocument::from_text(&text).text_layout(MAX_TEXT_COLUMNS, &cancel) {
+        Ok(layout) => layout,
+        Err(error) => return (Err(error), scroll_offset, None),
+    };
+    let first = layout.first_row(scroll_offset, rows);
+    (
+        Ok(layout.grid(first, rows, foreground, background, None)),
+        first,
+        Some(layout),
+    )
 }
 
 pub(crate) struct PreviewWorker<T> {
@@ -182,7 +242,10 @@ pub(crate) struct PreviewWorker<T> {
     pending: Arc<Mutex<Option<Job<T>>>>,
     latest: Arc<Mutex<Option<ResultUpdate>>>,
     wake: Sender<()>,
+    /// The presented page; text results arrive as pages of `text`.
     pub document: Option<Result<Preview, String>>,
+    /// The layout behind a text result's pages.
+    text: Option<Arc<DocumentLayout>>,
     pub loading: bool,
     pub document_scroll_offset: usize,
     pub document_selection: Option<(u64, usize)>,
@@ -215,16 +278,15 @@ impl<T: Clone + Send + 'static> PreviewWorker<T> {
                     stopped: worker_stopped.clone(),
                 };
                 let selection = (job.request.document_version, job.request.selection.index);
-                let scroll_offset = job.request.scroll_offset;
-                let result = worker_provider.preview_viewport(job.request, cancel.clone());
-                let scroll_offset = result.as_ref().map_or(scroll_offset, |page| page.first_row);
-                let result = result.map(|page| page.document);
+                let (result, scroll_offset, text) =
+                    render(&*worker_provider, job.request, cancel.clone());
                 if !cancel.is_cancelled() {
                     *worker_latest.lock().unwrap() = Some(ResultUpdate {
                         revision: job.revision,
                         selection,
                         result,
                         scroll_offset,
+                        text,
                     });
                     ctx.request_repaint();
                 }
@@ -238,6 +300,7 @@ impl<T: Clone + Send + 'static> PreviewWorker<T> {
             latest,
             wake,
             document: None,
+            text: None,
             loading: false,
             document_scroll_offset: 0,
             document_selection: None,
@@ -247,6 +310,7 @@ impl<T: Clone + Send + 'static> PreviewWorker<T> {
         self.stop();
         let mut next = Self::new(self.provider.clone(), ctx);
         next.document = self.document.clone();
+        next.text = self.text.clone();
         next.document_scroll_offset = self.document_scroll_offset;
         next
     }
@@ -260,6 +324,7 @@ impl<T: Clone + Send + 'static> PreviewWorker<T> {
         self.revision.fetch_add(1, Ordering::AcqRel);
         *self.pending.lock().unwrap() = None;
         self.document = None;
+        self.text = None;
         self.document_selection = None;
         self.loading = false;
     }
@@ -270,6 +335,7 @@ impl<T: Clone + Send + 'static> PreviewWorker<T> {
             self.document_selection = Some(update.selection);
             self.document_scroll_offset = update.scroll_offset;
             self.document = Some(update.result);
+            self.text = update.text;
             self.loading = false;
         }
     }
@@ -281,6 +347,9 @@ impl<T: Clone + Send + 'static> PreviewWorker<T> {
         };
         if self.loading {
             return Ok(None);
+        }
+        if let Some(text) = &self.text {
+            return Ok(Some(text.clone()));
         }
         self.provider.copy_document(version, index)
     }
@@ -299,23 +368,12 @@ impl<T> Drop for PreviewWorker<T> {
     }
 }
 
-pub(crate) fn paint(
-    ui: &mut egui::Ui,
-    preview: &Preview,
-    appearance: &Appearance,
-    rows: usize,
-    scroll_offset: usize,
-) {
+/// Paint a page. Text never reaches here: the worker pages it as a grid.
+pub(crate) fn paint(ui: &mut egui::Ui, preview: &Preview, appearance: &Appearance, rows: usize) {
     let typography = &appearance.typography;
-    let grid = if matches!(preview, Preview::Text(_) | Preview::StyledText(_)) {
-        crate::preview_copy::PreviewCopyMode::text_grid(preview, scroll_offset, rows, appearance)
-    } else {
-        None
-    };
-    let preview = grid.as_ref().unwrap_or(preview);
     let row_height = typography.preview_row_height(ui.ctx());
     match preview {
-        Preview::Empty => {}
+        Preview::Empty | Preview::Text(_) => {}
         Preview::Image(image) => {
             let texture = image.texture.get_or_init(|| {
                 ui.ctx().load_texture(
@@ -337,72 +395,6 @@ pub(crate) fn paint(
                 egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
                 Color32::WHITE,
             );
-        }
-        Preview::StyledText(lines) => {
-            for spans in lines.iter().skip(scroll_offset).take(rows) {
-                let (rect, _) = ui.allocate_exact_size(
-                    egui::vec2(ui.available_width(), row_height),
-                    egui::Sense::hover(),
-                );
-                let mut job = egui::text::LayoutJob::default();
-                job.wrap.max_width = f32::INFINITY;
-                for span in spans {
-                    let (fg, bg) = if span.inverse {
-                        (span.background, span.foreground)
-                    } else {
-                        (span.foreground, span.background)
-                    };
-                    let mut format = egui::TextFormat {
-                        font_id: if span.bold {
-                            typography.bold.clone()
-                        } else {
-                            typography.normal.clone()
-                        },
-                        color: if span.invisible {
-                            bg
-                        } else if span.faint {
-                            fg.gamma_multiply(0.6)
-                        } else {
-                            fg
-                        },
-                        background: bg,
-                        italics: span.italic,
-                        ..Default::default()
-                    };
-                    if span.underline {
-                        format.underline = egui::Stroke::new(1.0, span.underline_color);
-                    }
-                    if span.strikethrough {
-                        format.strikethrough = egui::Stroke::new(1.0, fg);
-                    }
-                    job.append(&span.text, 0.0, format);
-                }
-                let galley = ui.fonts_mut(|fonts| fonts.layout_job(job));
-                ui.painter()
-                    .with_clip_rect(rect.intersect(ui.clip_rect()))
-                    .galley(
-                        egui::pos2(rect.left(), rect.center().y - galley.size().y / 2.0),
-                        galley,
-                        appearance.palette.text,
-                    );
-            }
-        }
-        Preview::Text(text) => {
-            for line in text.lines().skip(scroll_offset).take(rows) {
-                let (rect, _) = ui.allocate_exact_size(
-                    egui::vec2(ui.available_width(), row_height),
-                    egui::Sense::hover(),
-                );
-                ui.painter()
-                    .with_clip_rect(rect.intersect(ui.clip_rect()))
-                    .text(
-                        rect.left_center(),
-                        egui::Align2::LEFT_CENTER,
-                        line,
-                        typography.normal.clone(),
-                        appearance.palette.text,
-                    );
-            }
         }
         Preview::Grid { columns, cells, .. } => {
             if *columns == 0 {
@@ -517,27 +509,31 @@ mod tests {
     use super::*;
     use std::time::{Duration, Instant};
     #[test]
-    fn image_texture_is_uploaded_once_and_styled_text_scrolls() {
+    fn image_texture_is_uploaded_once_and_grid_rows_are_limited() {
         let ctx = Context::default();
         let image = Arc::new(PreviewImage::new(egui::ColorImage::new(
             [64, 32],
             vec![Color32::RED; 64 * 32],
         )));
         let preview = Preview::Image(image.clone());
-        let styled = Preview::StyledText(vec![
-            vec![PreviewCell {
-                text: "hidden first line".into(),
-                ..Default::default()
-            }],
-            vec![PreviewCell {
-                text: "visible red line".into(),
-                foreground: Color32::RED,
-                ..Default::default()
-            }],
-        ]);
+        let row = |text: &str| -> Vec<PreviewCell> {
+            text.chars()
+                .map(|ch| PreviewCell {
+                    text: ch.into(),
+                    foreground: Color32::RED,
+                    ..Default::default()
+                })
+                .collect()
+        };
+        let styled = Preview::Grid {
+            columns: 16,
+            cells: [row("visible red line"), row("hidden last line")].concat(),
+            total_rows: 2,
+            lines: None,
+        };
         let frame = ctx.run_ui(egui::RawInput::default(), |ui| {
-            paint(ui, &preview, &Appearance::default(), 5, 0);
-            paint(ui, &styled, &Appearance::default(), 1, 1);
+            paint(ui, &preview, &Appearance::default(), 5);
+            paint(ui, &styled, &Appearance::default(), 1);
         });
         let id = image.texture.get().unwrap().id();
         assert!(
@@ -562,7 +558,7 @@ mod tests {
         assert_eq!(painted.trim_end(), "visible red line");
         frame.drop_without_applying_deltas();
         let frame = ctx.run_ui(egui::RawInput::default(), |ui| {
-            paint(ui, &preview, &Appearance::default(), 5, 0)
+            paint(ui, &preview, &Appearance::default(), 5)
         });
         assert!(
             !frame
@@ -619,7 +615,8 @@ mod tests {
             assert!(Instant::now() < deadline);
             std::thread::sleep(Duration::from_millis(5));
         }
-        assert!(matches!(&worker.document, Some(Ok(Preview::Text(text))) if text == "1"));
+        let page = worker.document.as_ref().unwrap().as_ref().unwrap();
+        assert_eq!(plain_text(page).as_deref(), Some("1"));
         let (started, rx) = bounded(1);
         let provider = Arc::new(move |_: PreviewRequest<usize>, cancel: Cancellation| {
             started.send(cancel).unwrap();
@@ -664,8 +661,18 @@ mod retention_tests {
                 started.send(()).unwrap();
                 gate.recv().unwrap();
             }
-            Ok(Preview::Text(request.selection.text))
+            // Rows "<item>0".."<item>19", so a page can start at row 1.
+            Ok(Preview::Text(
+                (0..20)
+                    .map(|row| format!("{}{row}", request.selection.text))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            ))
         });
+        let first_row = |worker: &PreviewWorker<usize>| {
+            let page = worker.document.as_ref().unwrap().as_ref().unwrap();
+            plain_text(page).unwrap().lines().next().unwrap().to_owned()
+        };
         let mut worker = PreviewWorker::new(provider, Context::default());
         worker.request(request(0));
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -677,7 +684,7 @@ mod retention_tests {
         worker.request(request(1));
         rx.recv_timeout(Duration::from_secs(5)).unwrap();
         assert!(worker.loading);
-        assert!(matches!(&worker.document, Some(Ok(Preview::Text(text))) if text == "0"));
+        assert_eq!(first_row(&worker), "00");
         assert_eq!(worker.document_scroll_offset, 0);
         release.send(()).unwrap();
         while worker.loading {
@@ -685,8 +692,79 @@ mod retention_tests {
             assert!(Instant::now() < deadline);
             std::thread::sleep(Duration::from_millis(5));
         }
-        assert!(matches!(&worker.document, Some(Ok(Preview::Text(text))) if text == "1"));
+        assert_eq!(first_row(&worker), "11");
         assert_eq!(worker.document_scroll_offset, 1);
+    }
+}
+
+#[cfg(test)]
+mod text_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+    fn request(scroll_offset: usize) -> PreviewRequest<usize> {
+        PreviewRequest {
+            document_version: 1,
+            initial_page: false,
+            selection: Selection {
+                item: 0,
+                text: "0".into(),
+                index: 0,
+                source_version: 1,
+                snapshot: Arc::new(()),
+            },
+            columns: 40,
+            rows: 3,
+            scroll_offset,
+            foreground: Color32::RED,
+            background: Color32::BLACK,
+        }
+    }
+    fn wait(worker: &mut PreviewWorker<usize>) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while worker.loading {
+            worker.poll();
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+    #[test]
+    fn text_is_paged_numbered_and_copied_as_a_document() {
+        let provider = Arc::new(move |_: PreviewRequest<usize>, _: Cancellation| {
+            Ok(Preview::Text("one\ntwo\nthree\nfour\nfive".into()))
+        });
+        let mut worker = PreviewWorker::new(provider, Context::default());
+        worker.request(request(1));
+        wait(&mut worker);
+        let Some(Ok(Preview::Grid {
+            cells,
+            total_rows,
+            lines,
+            ..
+        })) = &worker.document
+        else {
+            panic!("text should arrive as a grid page");
+        };
+        assert_eq!(*total_rows, 5);
+        assert_eq!(cells[0].foreground, Color32::RED);
+        assert_eq!(
+            lines.as_ref().unwrap(),
+            &GridLines {
+                starts: vec![Some(1), Some(2), Some(3)],
+                total: 5,
+            }
+        );
+        let page = worker.document.as_ref().unwrap().as_ref().unwrap();
+        assert_eq!(plain_text(page).as_deref(), Some("two\nthree\nfour"));
+        let document = worker.copy_document().unwrap().unwrap();
+        assert_eq!(document.metadata().unwrap().total_rows, 5);
+        assert_eq!(document.line_number(4), Some(4));
+
+        // Scrolling past the end clamps to the last page.
+        worker.request(request(9));
+        wait(&mut worker);
+        let page = worker.document.as_ref().unwrap().as_ref().unwrap();
+        assert_eq!(plain_text(page).as_deref(), Some("three\nfour\nfive"));
+        assert_eq!(worker.document_scroll_offset, 2);
     }
 }
 
@@ -695,17 +773,6 @@ mod retention_tests {
 pub(crate) fn plain_text(preview: &Preview) -> Option<String> {
     match preview {
         Preview::Text(text) => Some(text.clone()),
-        Preview::StyledText(lines) => Some(
-            lines
-                .iter()
-                .map(|line| {
-                    line.iter()
-                        .map(|cell| cell.text.as_str())
-                        .collect::<String>()
-                })
-                .collect::<Vec<_>>()
-                .join("\n"),
-        ),
         Preview::Grid { columns, cells, .. } if *columns > 0 => Some(
             cells
                 .chunks(*columns)

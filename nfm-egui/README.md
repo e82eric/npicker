@@ -109,9 +109,18 @@ replace or reorder their items; those updates are fully searched safely.
 Install an `Arc<dyn PreviewProvider<Item>>` using `set_preview_provider`.
 Closures implement the trait too. Requests contain the owned selection, viewport
 columns/rows, document scroll offset, and default foreground/background colors.
-Return `Preview::Text`, `Preview::Grid`, or `Preview::Empty`, or return an error
-string for presentation. Grid cells support Unicode graphemes, backgrounds,
-bold/italic, underline, strike, inverse, invisible and faint attributes.
+Return `Preview::Text`, `Preview::Grid`, `Preview::Image` or `Preview::Empty`,
+or return an error string for presentation. Grid cells support Unicode
+graphemes, backgrounds, bold/italic, underline, strike, inverse, invisible and
+faint attributes. The worker lays `Preview::Text` out as a `StyledDocument`
+(`StyledDocument::from_text`; escape sequences stay literal): lines scroll
+sideways rather than wrap, up to 4096 cells, scrolling pages the laid-out
+document without calling the provider, and copy mode, search and line numbers
+treat it like any other document. Other re-requests for the same item, such as
+query edits, resizes or theme changes, run the provider again, so it should be
+cheap. Its copy-mode search runs within the
+frame. Return styled content as a `Grid` page of a document, as
+`DocumentPreviewProvider` and `BytePreviewProvider` do.
 
 A single preview worker processes the latest pending request. New selection,
 viewport, appearance or scrolling requests cancel the previous generation and
@@ -222,8 +231,6 @@ only in the separate demo package and do not enter shared-control builds.
 For an OpenGL screenshot after the stream settles, pass `--screenshot target/picker.png`.
 The demo captures its framebuffer and closes automatically.
 
-Styled text providers may return `Preview::StyledText`, preserving foreground,
-background and ANSI text decorations while the control handles line scrolling.
 `Preview::Image` takes an `Arc<preview::PreviewImage>` containing a decoded egui
 ColorImage; the control fits it to the preview area and uploads its texture once.
 The image document should be used with the egui context that paints it.
@@ -256,9 +263,7 @@ The host owns native preview handles and must hide/release them when absent.
 `show(ctx, placement, appearance, disabled)` lets the host mark an inactive pane
 as disabled. Pass `true` to paint without taking focus or consuming input; pass
 `false` for an interactive picker. Disabled controls use the middle layer and
-disabled result widgets, preserving the previous background rendering behavior. Hosts with their own preview workers can call
-`set_external_preview_document(document, loading)` each frame to use NFM’s shared
-preview painter and copy action while retaining snapshot ownership and paging.
+disabled result widgets, preserving the previous background rendering behavior.
 
 
 ### Complete bytes and paged host snapshots
@@ -405,6 +410,21 @@ The cursor scroll margin defaults to two rows. Hosts can set it with
 setting on `CopyMode` controls viewport positioning and scrolling. Ghostty
 applies its top-level Lua `cursor_scroll_padding` value to both terminal copy
 mode and NFM previews, including after config reload.
+
+Preview line numbers are off by default. Set `PickerConfig::preview_line_numbers`
+or call `Picker::set_preview_line_numbers` with `PreviewLineNumbers::Absolute`,
+`Relative` or `Hybrid` (Vim's `number` + `relativenumber`). Numbers count
+logical lines, so soft-wrapped continuation rows are blank and a relative
+number is the count `j`/`k` needs to reach that line. Relative numbers follow
+the copy cursor only while the preview is focused; unfocused previews show
+absolute numbers. The gutter is painted beside the content rather than in it,
+so copying, search and Quick Select never see it. It reserves at least three
+digits plus a separator, and widens for longer documents; the provider is
+asked for correspondingly fewer columns. Host `CopyDocument`s number their
+rows with the required `line_number(row)`. Providers that return `Preview::Grid` pages fill
+its `lines` (`GridLines`: the logical line each row starts, and the document's
+line count) so the page is numbered while no copy viewport exists, such as
+while the next selection's preview loads. `None` leaves the page unnumbered.
 
 Host-backed preview search and terminal search use `search_service::SearchService`.
 Hosts implement `SearchDocument::visit_text`, supplying UTF-8 chunks with a cell

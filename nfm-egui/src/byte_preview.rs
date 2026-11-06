@@ -277,8 +277,13 @@ impl<T: Clone + Send + 'static> PreviewProvider<T> for BytePreviewProvider<T> {
                 request.scroll_offset = 0;
                 let mut document =
                     parse_ansi(bounded(&page.page.bytes, self.max_bytes)?, &request)?;
-                if let Preview::Grid { total_rows, .. } = &mut document {
+                // The page alone cannot tell where the snapshot's lines start.
+                if let Preview::Grid {
+                    total_rows, lines, ..
+                } = &mut document
+                {
                     *total_rows = page.total_rows;
+                    *lines = None;
                 }
                 (document, page.page.first_row)
             }
@@ -343,10 +348,13 @@ impl<T: Clone + Send + 'static> PreviewProvider<T> for BytePreviewProvider<T> {
                 request.scroll_offset = 0;
                 let mut document = parse_ansi(bounded(&page.bytes, self.max_bytes)?, &request)?;
                 if let Preview::Grid {
-                    total_rows: total, ..
+                    total_rows: total,
+                    lines,
+                    ..
                 } = &mut document
                 {
                     *total = *total_rows;
+                    *lines = None;
                 }
                 (document, page.first_row)
             }
@@ -456,6 +464,7 @@ mod tests {
             columns,
             cells,
             total_rows,
+            ..
         } = page.document
         else {
             panic!("expected grid")
@@ -780,6 +789,7 @@ mod tests {
             columns,
             cells,
             total_rows,
+            ..
         } = page.document
         else {
             panic!()
