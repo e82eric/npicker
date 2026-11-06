@@ -9,7 +9,7 @@ use std::{
     thread::JoinHandle,
 };
 
-const CHUNK_BYTES: usize = 64 * 1024;
+pub(crate) const CHUNK_BYTES: usize = 64 * 1024;
 const BOM: &[u8] = b"\xEF\xBB\xBF";
 
 pub struct FileSourceOptions {
@@ -64,7 +64,7 @@ fn cancelled(control: &StreamControl) -> bool {
     control.cancelled.load(Ordering::Acquire)
 }
 
-fn read_forward<T: Copy + Default>(
+pub(crate) fn read_forward<T: Copy + Default>(
     file: &mut impl Read,
     chunk: usize,
     records: &mut Records<T>,
@@ -98,7 +98,7 @@ fn read_forward<T: Copy + Default>(
 /// Lines are gathered into a group until the line before it does not end with
 /// the continuation marker; the group then goes through `records` in file
 /// order, so values match a forward read exactly.
-fn read_reverse<T: Copy + Default>(
+pub(crate) fn read_reverse<T: Copy + Default>(
     file: &mut (impl Read + Seek),
     chunk: usize,
     records: &mut Records<T>,

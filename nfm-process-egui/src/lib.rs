@@ -148,6 +148,20 @@ where
         placement: Placement,
         appearance: &Appearance,
     ) -> bool {
+        matches!(
+            self.show_event(ctx, placement, appearance),
+            Some(PickerEvent::Accepted(_)) | Some(PickerEvent::Cancelled)
+        )
+    }
+    /// Like [`Self::show`], but returns the accepted selection, cancellation or
+    /// custom action to hosts that act on the chosen process themselves. Copy
+    /// requests are handled here and never returned.
+    pub fn show_event(
+        &mut self,
+        ctx: &egui::Context,
+        placement: Placement,
+        appearance: &Appearance,
+    ) -> Option<PickerEvent<S::Item>> {
         if let Some(result) = self
             .pending
             .as_ref()
@@ -217,13 +231,12 @@ where
             }
         }
         match output.event {
-            Some(PickerEvent::Accepted(_)) | Some(PickerEvent::Cancelled) => true,
             Some(PickerEvent::CopyRequested(selection)) => {
                 self.picker.notify_copied_value(ctx, &selection.text);
                 ctx.copy_text(selection.text);
-                false
+                None
             }
-            Some(PickerEvent::CustomAction { .. }) | None => false,
+            event => event,
         }
     }
 }

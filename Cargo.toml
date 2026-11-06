@@ -8,6 +8,7 @@ members = [
     "nfm-search-core",
     "nfm-egui",
     "nfm-egui-demo",
+    "nfm-cli",
     "nfm-preview-command",
     "nfm-preview-file",
     "nfm-preview-text",

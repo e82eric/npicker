@@ -1,5 +1,8 @@
 //! Command stdout as incrementally published picker candidates.
-use crate::records::{spawn, Records, StreamControl, StreamSink};
+use crate::{
+    file::{read_reverse, CHUNK_BYTES},
+    records::{spawn, Records, StreamControl, StreamSink},
+};
 use nfm_preview_command::Stream;
 pub use nfm_preview_command::{no_match_exit, CommandEvent, CommandObserver, CommandSpec};
 use std::{sync::atomic::Ordering, thread::JoinHandle};
@@ -8,6 +11,9 @@ pub struct CommandSourceOptions {
     pub command: CommandSpec,
     pub line_continuation: Option<String>,
     pub unique: bool,
+    /// Publish records last line first. Stdout is buffered until the process
+    /// exits, since the end is not known until then.
+    pub reverse: bool,
     pub success_exit_codes: Vec<i32>,
     /// Bound one physical line or joined continuation record, not total output.
     pub max_record_bytes: usize,
@@ -23,6 +29,7 @@ impl CommandSourceOptions {
             command,
             line_continuation: None,
             unique: false,
+            reverse: false,
             success_exit_codes: codes,
             max_record_bytes: 4 * 1024 * 1024,
         }
@@ -51,11 +58,16 @@ pub fn start<T: Copy + Default + Send + Sync + 'static>(
         control,
         move |records, control| {
             let mut parse_error = None;
+            let mut buffered = Vec::new();
             let output = nfm_preview_command::run_streaming(
                 &options.command,
                 || control.cancelled.load(Ordering::Acquire),
                 |stream, bytes| {
                     if stream == Stream::Stdout {
+                        if options.reverse {
+                            buffered.extend_from_slice(bytes);
+                            return true;
+                        }
                         if let Err(error) = records.push(bytes) {
                             parse_error = Some(error);
                             return false;
@@ -72,7 +84,17 @@ pub fn start<T: Copy + Default + Send + Sync + 'static>(
                 return Err(format!("{}\n{error}", options.command.describe()));
             }
             let output = output?;
-            records.finish()?;
+            if options.reverse {
+                read_reverse(
+                    &mut std::io::Cursor::new(buffered),
+                    CHUNK_BYTES,
+                    records,
+                    control,
+                )
+                .map_err(|error| format!("{}\n{error}", options.command.describe()))?;
+            } else {
+                records.finish()?;
+            }
             if !output
                 .status
                 .code()
@@ -155,6 +177,36 @@ mod tests {
             .join()
             .unwrap();
         assert!(error.lock().unwrap().is_none());
+    }
+    #[cfg(windows)]
+    #[test]
+    fn reverse_publishes_last_line_first_and_still_reports_failures() {
+        let sink = new_sink();
+        let store = sink.store.clone();
+        let error = sink.error.clone();
+        let mut options = CommandSourceOptions::new(shell("echo a& echo b& echo c"));
+        options.reverse = true;
+        start(options, sink, StreamControl::default())
+            .unwrap()
+            .join()
+            .unwrap();
+        assert_eq!(text(&store), ["c", "b", "a"]);
+        assert!(error.lock().unwrap().is_none());
+
+        let sink = new_sink();
+        let store = sink.store.clone();
+        let error = sink.error.clone();
+        let mut options =
+            CommandSourceOptions::new(shell("echo a& echo b& echo diagnostic 1>&2 & exit /b 2"));
+        options.reverse = true;
+        start(options, sink, StreamControl::default())
+            .unwrap()
+            .join()
+            .unwrap();
+        assert!(store.is_done());
+        assert_eq!(text(&store), ["b", "a"]);
+        let error = error.lock().unwrap().clone().unwrap();
+        assert!(error.contains("diagnostic") && error.contains("exited"));
     }
     #[test]
     fn child_fixture() {
