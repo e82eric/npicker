@@ -29,7 +29,7 @@ impl FileSourceOptions {
             reverse: false,
             line_continuation: None,
             unique: false,
-            max_record_bytes: 4 * 1024 * 1024,
+            max_record_bytes: crate::records::DEFAULT_MAX_RECORD_BYTES,
         }
     }
 }
@@ -109,11 +109,15 @@ pub(crate) fn read_reverse<T: Copy + Default>(
         limit: records.limit(),
         group: VecDeque::new(),
         group_bytes: 0,
+        overflowed: false,
     };
     let mut position = file.seek(SeekFrom::End(0)).map_err(|e| e.to_string())?;
     // The bytes of the line that continues into the previously read chunk.
     let mut carry = Vec::new();
     let mut at_end = true;
+    // The line in `carry` grew past the limit; its bytes are being dropped
+    // until its start is found.
+    let mut oversized = false;
     while position > 0 {
         if cancelled(control) {
             return Ok(());
@@ -128,21 +132,29 @@ pub(crate) fn read_reverse<T: Copy + Default>(
         let mut end = data.len();
         while let Some(newline) = data[..end].iter().rposition(|&b| b == b'\n') {
             let line = &data[newline + 1..end];
-            // A file that ends with a newline has no line after it.
-            if !(std::mem::take(&mut at_end) && line.is_empty()) {
+            if std::mem::take(&mut oversized) {
+                // The start of an overlong line: leave the whole line out.
+                grouper.skip_line(records)?;
+            } else if !(std::mem::take(&mut at_end) && line.is_empty()) {
+                // A file that ends with a newline has no line after it.
                 grouper.line(line, records)?;
             }
             end = newline;
         }
-        if end > grouper.limit {
-            return Err("Picker line exceeds its byte limit".into());
+        if oversized || end > grouper.limit {
+            oversized = true;
+            at_end = false;
+            data.clear();
+        } else {
+            data.truncate(end);
         }
-        data.truncate(end);
         carry = data;
         records.flush(control.changed.as_ref());
     }
     let first = carry.strip_prefix(BOM).unwrap_or(&carry);
-    if !(at_end && first.is_empty()) {
+    if oversized {
+        grouper.skip_line(records)?;
+    } else if !(at_end && first.is_empty()) {
         grouper.line(first, records)?;
     }
     grouper.emit(records)?;
@@ -156,8 +168,24 @@ struct Grouper {
     /// Physical lines of the record being gathered, in file order.
     group: VecDeque<Vec<u8>>,
     group_bytes: usize,
+    /// The record being gathered grew past the limit; its earlier lines are
+    /// dropped as they arrive, and it is counted as skipped once complete.
+    overflowed: bool,
 }
 impl Grouper {
+    fn gathering(&self) -> bool {
+        !self.group.is_empty() || self.overflowed
+    }
+    /// Leave out an overlong physical line as a record of its own. Its end,
+    /// which would say whether it continues into the record after it, is
+    /// not kept, so that record is finished first.
+    fn skip_line<T: Copy + Default>(&mut self, records: &mut Records<T>) -> Result<(), String> {
+        if self.gathering() {
+            self.emit(records)?;
+        }
+        records.skip_record();
+        Ok(())
+    }
     fn continues(&self, line: &[u8]) -> bool {
         let line = line.strip_suffix(b"\r").unwrap_or(line);
         self.marker
@@ -169,17 +197,30 @@ impl Grouper {
         line: &[u8],
         records: &mut Records<T>,
     ) -> Result<(), String> {
-        if !self.group.is_empty() && !self.continues(line) {
+        if self.gathering() && !self.continues(line) {
             self.emit(records)?;
+        }
+        if self.overflowed {
+            // This line continues into the overlong record being dropped.
+            return Ok(());
         }
         self.group_bytes = self.group_bytes.saturating_add(line.len() + 1);
         if self.group_bytes > self.limit {
-            return Err("Picker continuation record exceeds its byte limit".into());
+            self.group.clear();
+            self.group_bytes = 0;
+            self.overflowed = true;
+            return Ok(());
         }
         self.group.push_front(line.to_vec());
         Ok(())
     }
     fn emit<T: Copy + Default>(&mut self, records: &mut Records<T>) -> Result<(), String> {
+        if std::mem::take(&mut self.overflowed) {
+            self.group.clear();
+            self.group_bytes = 0;
+            records.skip_record();
+            return Ok(());
+        }
         for mut line in self.group.drain(..) {
             line.push(b'\n');
             records.push(&line)?;
@@ -290,15 +331,40 @@ mod tests {
         assert_eq!(displays, ["b", "c", "a"]);
     }
     #[test]
-    fn record_limits_apply_in_reverse() {
-        let sink = new_sink();
-        let control = StreamControl::default();
-        let mut records = Records::with(None, false, 8, &sink);
-        let mut file = Cursor::new(b"ok\n123456789012\n".to_vec());
-        assert!(read_reverse(&mut file, 4, &mut records, &control).is_err());
-        let mut records = Records::with(Some("`".into()), false, 8, &sink);
-        let mut file = Cursor::new(b"abc`\nabc`\nabc\n".to_vec());
-        assert!(read_reverse(&mut file, 4, &mut records, &control).is_err());
+    fn overlong_records_are_skipped_the_same_in_both_directions() {
+        // (display, skipped) for an 8-byte limit.
+        let run = |input: &str, reverse: bool, chunk: usize| {
+            let sink = new_sink();
+            let control = StreamControl::default();
+            let mut records = Records::with(Some("`".into()), false, 8, &sink);
+            let mut file = Cursor::new(input.as_bytes().to_vec());
+            if reverse {
+                read_reverse(&mut file, chunk, &mut records, &control).unwrap();
+            } else {
+                read_forward(&mut file, chunk, &mut records, &control).unwrap();
+            }
+            (text(&sink.store), sink.store.skipped())
+        };
+        let inputs = [
+            ("ok\n123456789012\nnext\n", vec!["ok", "next"], 1),
+            ("abc`\nabc`\nabc\nlast\n", vec!["last"], 1),
+            ("0123456789\nok", vec!["ok"], 1),
+            ("ok\n0123456789", vec!["ok"], 1),
+            ("a\n0123456789\nb\nabcdefghijk\nc\n", vec!["a", "b", "c"], 2),
+        ];
+        for (input, expected, skipped) in inputs {
+            let expected: Vec<String> = expected.into_iter().map(String::from).collect();
+            assert_eq!(run(input, false, 3), (expected.clone(), skipped), "forward {input:?}");
+            let mut reversed = expected.clone();
+            reversed.reverse();
+            for chunk in 1..=input.len() + 1 {
+                assert_eq!(
+                    run(input, true, chunk),
+                    (reversed.clone(), skipped),
+                    "reverse {input:?} chunk {chunk}"
+                );
+            }
+        }
     }
     #[test]
     fn worker_reads_a_file_and_reports_a_missing_one() {

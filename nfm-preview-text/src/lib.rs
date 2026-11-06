@@ -154,11 +154,71 @@ impl TextPreviewOptions {
         Ok(())
     }
 }
+#[derive(Clone)]
 struct Row {
     text: String,
     cells: Vec<PreviewCell>,
+    /// Cell of each byte of `text`.
     mapping: Vec<u32>,
     widths: Vec<u8>,
+    /// Zero-based source line this row shows part of.
+    line: usize,
+    /// The source line continues on the next row.
+    wraps: bool,
+}
+impl Row {
+    fn new(text: String, line: usize) -> Self {
+        Self {
+            text,
+            cells: Vec::new(),
+            mapping: Vec::new(),
+            widths: Vec::new(),
+            line,
+            wraps: false,
+        }
+    }
+    /// Split into rows of at most `columns` cells, breaking between
+    /// graphemes. A grapheme wider than `columns` gets a row of its own.
+    fn wrap(&self, columns: usize, out: &mut Vec<Row>) {
+        if self.cells.len() <= columns {
+            out.push(self.clone());
+            return;
+        }
+        let total = self.widths.len() as u32;
+        // (byte, cell) where each row starts.
+        let mut starts = vec![(0usize, 0u32)];
+        for (byte, grapheme) in self.text.grapheme_indices(true) {
+            let x = self.mapping[byte];
+            // The cell after this grapheme.
+            let next = self
+                .mapping
+                .get(byte + grapheme.len())
+                .copied()
+                .unwrap_or(total);
+            let (_, start) = *starts.last().unwrap();
+            if x > start && next - start > columns as u32 {
+                starts.push((byte, x));
+            }
+        }
+        for (i, &(byte, x)) in starts.iter().enumerate() {
+            let (end_byte, end_x) = starts
+                .get(i + 1)
+                .copied()
+                .unwrap_or((self.text.len(), total));
+            let (x, end_x) = (x as usize, end_x as usize);
+            out.push(Row {
+                text: self.text[byte..end_byte].to_owned(),
+                cells: self.cells[x..end_x.min(self.cells.len())].to_vec(),
+                mapping: self.mapping[byte..end_byte]
+                    .iter()
+                    .map(|cell| cell - x as u32)
+                    .collect(),
+                widths: self.widths[x..end_x].to_vec(),
+                line: self.line,
+                wraps: i + 1 < starts.len(),
+            });
+        }
+    }
 }
 pub struct TextDocument {
     rows: Vec<Row>,
@@ -166,14 +226,35 @@ pub struct TextDocument {
     highlight_line: Option<usize>,
 }
 impl TextDocument {
+    /// This document with rows of at most `columns` cells. Line numbers,
+    /// highlighting and copied text still follow source lines.
+    pub fn wrapped(&self, columns: usize) -> Arc<TextDocument> {
+        let columns = columns.max(1);
+        let mut rows = Vec::with_capacity(self.rows.len());
+        for row in &self.rows {
+            row.wrap(columns, &mut rows);
+        }
+        Arc::new(TextDocument {
+            rows,
+            columns: self.columns.min(columns),
+            highlight_line: self.highlight_line,
+        })
+    }
+    /// First row showing zero-based source `line`.
+    fn line_row(&self, line: usize) -> usize {
+        self.rows.partition_point(|row| row.line < line)
+    }
     fn grid(&self, top: usize, rows: usize, columns: usize) -> Preview {
         let columns = columns.max(1);
         let mut cells = Vec::new();
+        let mut starts = Vec::new();
         for (index, row) in self.rows.iter().enumerate().skip(top).take(rows) {
+            let continuation = index > 0 && self.rows[index - 1].wraps;
+            starts.push((!continuation).then_some(row.line as u64));
             let mut line = Vec::new();
             line.extend(row.cells.iter().cloned());
             line.truncate(columns);
-            if self.highlight_line == Some(index + 1) {
+            if self.highlight_line == Some(row.line + 1) {
                 for cell in &mut line {
                     cell.background = Color32::from_rgb(75, 65, 40);
                 }
@@ -187,8 +268,10 @@ impl TextDocument {
             columns,
             cells,
             total_rows: self.rows.len(),
-            // Rows never wrap; each row is one source line.
-            lines: Some(GridLines::unwrapped(top, rows, self.rows.len())),
+            lines: Some(GridLines {
+                starts,
+                total: self.rows.last().map_or(0, |row| row.line as u64 + 1),
+            }),
         }
     }
     fn selected_text(&self, selection: &CopySelection) -> Result<String, String> {
@@ -226,10 +309,12 @@ impl TextDocument {
                     text.push_str(grapheme);
                 }
             }
-            if y > start.y {
+            // A wrapped line's rows join back into one line.
+            if y > start.y && !self.rows[y as usize - 1].wraps {
                 result.push('\n');
             }
-            result.push_str(if selection.trim {
+            // Trim only at the end of a source line, not at a wrap point.
+            result.push_str(if selection.trim && !row.wraps {
                 text.trim_end()
             } else {
                 &text
@@ -242,9 +327,8 @@ impl TextDocument {
     }
 }
 impl CopyDocument for TextDocument {
-    // Rows never wrap; each row is one source line.
     fn line_number(&self, row: u64) -> Option<u64> {
-        (row < self.rows.len() as u64).then_some(row)
+        self.rows.get(row as usize).map(|row| row.line as u64)
     }
     fn metadata(&self) -> Result<DocumentMetadata, String> {
         Ok(DocumentMetadata {
@@ -280,7 +364,7 @@ impl CopyDocument for TextDocument {
                 text: TextRow {
                     text,
                     columns,
-                    wraps_to_next: false,
+                    wraps_to_next: row.wraps,
                 },
                 widths: row.widths.clone(),
             }
@@ -392,12 +476,7 @@ pub fn render_document(
         let spans = highlighter
             .highlight_line(line, ss)
             .map_err(|e| e.to_string())?;
-        let mut row = Row {
-            text: content.into(),
-            cells: Vec::new(),
-            mapping: Vec::new(),
-            widths: Vec::new(),
-        };
+        let mut row = Row::new(content.into(), rows.len());
         let mut offset = 0;
         let mut styles = Vec::new();
         for (style, span) in spans {
@@ -470,8 +549,8 @@ pub fn render_document(
     }
     if truncated {
         columns = columns.max(warning.len());
+        let line = rows.len();
         rows.push(Row {
-            text: warning.into(),
             cells: warning
                 .chars()
                 .map(|ch| PreviewCell {
@@ -482,15 +561,11 @@ pub fn render_document(
                 .collect(),
             mapping: (0..warning.len() as u32).collect(),
             widths: vec![1; warning.len()],
+            ..Row::new(warning.into(), line)
         });
     }
     if rows.is_empty() {
-        rows.push(Row {
-            text: String::new(),
-            cells: vec![],
-            mapping: vec![],
-            widths: vec![],
-        });
+        rows.push(Row::new(String::new(), 0));
     }
     Ok(Arc::new(TextDocument {
         rows,
@@ -505,6 +580,11 @@ struct Cached {
     key: (u64, usize, String),
     document: Option<Arc<TextDocument>>,
     request: Option<TextPreviewRequest>,
+    /// `document` wrapped at a width, kept for the last width shown.
+    wrapped: Option<(usize, Arc<TextDocument>)>,
+    /// The document behind the last page: `document` or the wrapped one.
+    /// Copy mode reads it so its rows match the page.
+    shown: Option<Arc<TextDocument>>,
 }
 pub struct TextPreviewProvider<T> {
     options: TextPreviewOptions,
@@ -562,6 +642,8 @@ impl<T: 'static> PreviewProvider<T> for TextPreviewProvider<T> {
                 key,
                 document,
                 request: text,
+                wrapped: None,
+                shown: None,
             };
             *self
                 .cache
@@ -569,12 +651,34 @@ impl<T: 'static> PreviewProvider<T> for TextPreviewProvider<T> {
                 .map_err(|_| "Text preview cache poisoned")? = Some(cached.clone());
             cached
         };
-        let Some(document) = &cached.document else {
+        let Some(source) = cached.document.clone() else {
             return Ok(PreviewViewport {
                 document: Preview::Empty,
                 first_row: 0,
             });
         };
+        let width = usize::from(request.columns).max(1);
+        let document = if request.wrap_text && source.columns > width {
+            match &cached.wrapped {
+                Some((columns, wrapped)) if *columns == width => wrapped.clone(),
+                _ => source.wrapped(width),
+            }
+        } else {
+            source
+        };
+        cancelled(&|| cancel.is_cancelled())?;
+        if let Some(entry) = self
+            .cache
+            .lock()
+            .map_err(|_| "Text preview cache poisoned")?
+            .as_mut()
+            .filter(|c| c.key == cached.key)
+        {
+            if !Arc::ptr_eq(&document, cached.document.as_ref().unwrap()) {
+                entry.wrapped = Some((width, document.clone()));
+            }
+            entry.shown = Some(document.clone());
+        }
         let max_top = document.rows.len().saturating_sub(request.rows as usize);
         let first_row = if request.initial_page {
             cached
@@ -582,7 +686,8 @@ impl<T: 'static> PreviewProvider<T> for TextPreviewProvider<T> {
                 .as_ref()
                 .and_then(|r| r.center_line)
                 .map(|line| {
-                    line.saturating_sub(1)
+                    document
+                        .line_row(line.saturating_sub(1))
                         .saturating_sub(request.rows as usize / 2)
                 })
                 .unwrap_or(request.scroll_offset)
@@ -607,7 +712,7 @@ impl<T: 'static> PreviewProvider<T> for TextPreviewProvider<T> {
         Ok(cache
             .as_ref()
             .filter(|c| c.key.0 == version && c.key.1 == index)
-            .and_then(|c| c.document.clone())
+            .and_then(|c| c.shown.clone().or_else(|| c.document.clone()))
             .map(|doc| doc as Arc<dyn CopyDocument>))
     }
 }
@@ -615,6 +720,85 @@ impl<T: 'static> PreviewProvider<T> for TextPreviewProvider<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn plain(text: &str) -> Arc<TextDocument> {
+        let mut request = TextPreviewRequest::snapshot(text);
+        request.syntax = Some(SyntaxChoice::PlainText);
+        render_document(&request, &TextPreviewOptions::default(), &|| false).unwrap()
+    }
+    fn row_text(document: &TextDocument) -> Vec<String> {
+        document
+            .rows
+            .iter()
+            .map(|row| row.cells.iter().map(|cell| cell.text.as_str()).collect())
+            .collect()
+    }
+    #[test]
+    fn wrapping_splits_long_lines_and_keeps_source_lines() {
+        let document = plain("abcdefghij\nxy\n猫猫猫");
+        let wrapped = document.wrapped(4);
+        assert_eq!(row_text(&wrapped), ["abcd", "efgh", "ij", "xy", "猫猫", "猫"]);
+        assert_eq!(wrapped.columns, 4);
+        let lines: Vec<_> = (0..6).map(|row| wrapped.line_number(row).unwrap()).collect();
+        assert_eq!(lines, [0, 0, 0, 1, 2, 2]);
+        let wraps: Vec<_> = wrapped.rows.iter().map(|row| row.wraps).collect();
+        assert_eq!(wraps, [true, true, false, false, true, false]);
+        // Continuation rows are not numbered, and the gutter counts source lines.
+        let Preview::Grid { lines: Some(lines), .. } = wrapped.grid(1, 4, 4) else {
+            panic!()
+        };
+        assert_eq!(lines.starts, [None, None, Some(1), Some(2)]);
+        assert_eq!(lines.total, 3);
+        // Copying across a wrap point gives back the source line.
+        let range = |start: (u32, u64), end: (u32, u64)| CopySelection {
+            range: nfm_egui::copy_mode::CellRange {
+                start: CellPosition { x: start.0, y: start.1 },
+                end: CellPosition { x: end.0, y: end.1 },
+            },
+            linewise: false,
+            rectangle: false,
+            trim: true,
+        };
+        assert_eq!(wrapped.selected_text(&range((2, 0), (1, 3))).unwrap(), "cdefghij\nxy");
+        // Narrow lines are left alone.
+        assert_eq!(row_text(&document.wrapped(80)), ["abcdefghij", "xy", "猫猫猫"]);
+    }
+    #[test]
+    fn provider_wraps_on_request_and_copy_mode_reads_the_shown_rows() {
+        let provider = TextPreviewProvider::new(TextPreviewOptions::default(), |_: &Selection<()>| {
+            Ok(Some(TextPreviewRequest::snapshot(format!("{}\nend", "x".repeat(25)))))
+        })
+        .unwrap();
+        let request = |wrap_text: bool| PreviewRequest {
+            selection: Selection {
+                item: (),
+                text: "a".into(),
+                index: 0,
+                source_version: 1,
+                snapshot: Arc::new(()),
+            },
+            document_version: 1,
+            initial_page: true,
+            columns: 10,
+            rows: 8,
+            scroll_offset: 0,
+            foreground: Color32::WHITE,
+            background: Color32::BLACK,
+            wrap_text,
+        };
+        let shape = |wrap_text: bool| {
+            let page = provider
+                .preview_viewport(request(wrap_text), Cancellation::never())
+                .unwrap();
+            let Preview::Grid { total_rows, .. } = page.document else {
+                panic!()
+            };
+            let copy = provider.copy_document(1, 0).unwrap().unwrap();
+            (total_rows, copy.metadata().unwrap().total_rows)
+        };
+        assert_eq!(shape(true), (4, 4));
+        assert_eq!(shape(false), (2, 2));
+        assert_eq!(shape(true), (4, 4));
+    }
     #[test]
     fn highlighted_rows_do_not_color_viewport_padding() {
         let mut request = TextPreviewRequest::snapshot("猫\ttext\nlonger line in the document");

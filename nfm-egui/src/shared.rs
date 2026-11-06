@@ -113,6 +113,9 @@ where
     fn subscribe_updates(&self, wake: crossbeam_channel::Sender<()>) -> bool {
         self.source.subscribe_updates(wake)
     }
+    fn skipped_items(&self) -> usize {
+        self.source.skipped_items()
+    }
 }
 pub fn provider<S, P>(source: Arc<P>) -> Arc<impl SearchSnapshotProvider<SharedSource>>
 where

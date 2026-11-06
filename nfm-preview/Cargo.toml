@@ -7,6 +7,7 @@ description = "File-type routing for path previews: ffmpeg/ffprobe media and hig
 [dependencies]
 nfm-egui = { path = "../nfm-egui" }
 nfm-preview-file = { path = "../nfm-preview-file" }
+tracing = "0.1"
 
 [dev-dependencies]
 image = { version = "0.25", default-features = false, features = ["png"] }

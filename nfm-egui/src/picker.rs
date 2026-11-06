@@ -65,6 +65,8 @@ pub enum PickerAction {
     /// Show or hide relative line numbers, like Vim's `relativenumber`.
     /// With line numbers on, this switches between absolute and hybrid.
     ToggleRelativePreviewLineNumbers,
+    /// Wrap plain-text previews at the pane width, or scroll them sideways.
+    TogglePreviewWrap,
     ToggleFullPane,
     /// Bind a chord to this to remove its default command.
     Unbind,
@@ -72,7 +74,7 @@ pub enum PickerAction {
 }
 impl PickerAction {
     /// Every built-in command, in command palette order.
-    pub const BUILT_IN: [PickerAction; 13] = [
+    pub const BUILT_IN: [PickerAction; 14] = [
         Self::ToggleCommandPalette,
         Self::TogglePreview,
         Self::TogglePreviewFocus,
@@ -85,6 +87,7 @@ impl PickerAction {
         Self::ScrollPreviewLineDown,
         Self::TogglePreviewLineNumbers,
         Self::ToggleRelativePreviewLineNumbers,
+        Self::TogglePreviewWrap,
         Self::ToggleFullPane,
     ];
     /// Stable name for host configuration, such as `"TogglePreview"`. `Unbind`
@@ -103,6 +106,7 @@ impl PickerAction {
             Self::ScrollPreviewLineDown => "ScrollPreviewLineDown",
             Self::TogglePreviewLineNumbers => "TogglePreviewLineNumbers",
             Self::ToggleRelativePreviewLineNumbers => "ToggleRelativePreviewLineNumbers",
+            Self::TogglePreviewWrap => "TogglePreviewWrap",
             Self::ToggleFullPane => "ToggleFullPane",
             Self::Unbind => "None",
             Self::Custom(_) => return None,
@@ -130,6 +134,7 @@ impl PickerAction {
             Self::ScrollPreviewLineDown => "Scroll preview down a line",
             Self::TogglePreviewLineNumbers => "Toggle line numbers",
             Self::ToggleRelativePreviewLineNumbers => "Toggle relative line numbers",
+            Self::TogglePreviewWrap => "Toggle preview line wrap",
             Self::ToggleFullPane => "Toggle full-pane picker",
             Self::Unbind | Self::Custom(_) => return None,
         })
@@ -143,6 +148,7 @@ impl PickerAction {
             Self::ToggleFullPane
                 | Self::TogglePreviewLineNumbers
                 | Self::ToggleRelativePreviewLineNumbers
+                | Self::TogglePreviewWrap
                 | Self::Unbind
                 | Self::Custom(_)
         )
@@ -213,6 +219,8 @@ pub fn default_bindings() -> Vec<PickerBinding> {
         (Key::ArrowUp, Modifiers::CTRL, ScrollPreviewLineUp),
         (Key::ArrowDown, Modifiers::CTRL, ScrollPreviewLineDown),
         (Key::L, ctrl_shift, TogglePreviewLineNumbers),
+        // As in VS Code's word wrap toggle.
+        (Key::Z, Modifiers::ALT, TogglePreviewWrap),
         (Key::F, ctrl_shift, ToggleFullPane),
     ]
     .into_iter()
@@ -315,6 +323,10 @@ pub struct PickerConfig {
     pub preview_rows: usize,
     pub preview_visible: bool,
     pub preview_line_numbers: PreviewLineNumbers,
+    /// Wrap plain-text previews at the pane width. Off, lines up to 4096
+    /// cells scroll sideways. Providers that lay out their own pages, such as
+    /// terminal output, are unaffected.
+    pub preview_wrap: bool,
     pub sort: SearchSortMode,
 }
 impl Default for PickerConfig {
@@ -329,6 +341,7 @@ impl Default for PickerConfig {
             preview_rows: 12,
             preview_visible: true,
             preview_line_numbers: PreviewLineNumbers::Off,
+            preview_wrap: true,
             sort: SearchSortMode::Score,
         }
     }
@@ -828,6 +841,21 @@ where
         self.config.preview_line_numbers
     }
 
+    /// Wrap plain-text previews at the pane width, or let them scroll sideways.
+    /// Changing it lays the preview out again from its first row.
+    pub fn set_preview_wrap(&mut self, ctx: &Context, wrap: bool) {
+        if self.config.preview_wrap == wrap {
+            return;
+        }
+        self.config.preview_wrap = wrap;
+        self.reset_preview_layout(ctx);
+    }
+
+    /// Whether plain-text previews wrap; the wrap command changes it.
+    pub fn preview_wrap(&self) -> bool {
+        self.config.preview_wrap
+    }
+
     /// Gutter width in cells: the widest line number plus a separator column.
     fn preview_gutter_columns(&self) -> usize {
         if self.config.preview_line_numbers == PreviewLineNumbers::Off {
@@ -1266,6 +1294,7 @@ where
                     (true, true) => Style::Hybrid,
                 });
             }
+            TogglePreviewWrap => self.set_preview_wrap(ctx, !self.config.preview_wrap),
             ToggleFullPane => {
                 self.placement_override = if self.placement_override.is_some() {
                     None
@@ -1498,6 +1527,7 @@ where
                 scroll_offset: self.scroll_offset,
                 foreground,
                 background,
+                wrap_text: self.config.preview_wrap,
             });
         }
     }
@@ -1660,6 +1690,13 @@ where
             });
             return;
         }
+        // Rows are rebuilt every frame. Input lines are capped (16 KiB by
+        // default), so text and match positions for the visible rows are
+        // cheap enough not to cache. The query is the same for every row.
+        let effective_query = self
+            .displayed
+            .as_ref()
+            .map(|displayed| displayed.snapshot.effective_query(&displayed.query));
         let mut first_rect = None;
         for slot in 0..self.visible_result_rows {
             let index = if self.config.layout == Layout::QueryBottom {
@@ -1693,15 +1730,33 @@ where
                     .snapshot
                     .display_text(result.node_index, &displayed.query)
                     .unwrap_or_else(|| result.path.clone());
-                let job = result_layout(
+                let mut positions =
+                    resolve_match_positions(effective_query.as_deref().unwrap_or(""), &display);
+                positions.sort_unstable();
+                positions.dedup();
+                let text_left = rect.left() + 12.0;
+                let available = (rect.right() - text_left - RESULT_RIGHT_PADDING).max(0.0);
+                let typography = &appearance.typography;
+                let window = ui.fonts_mut(|fonts| {
+                    result_window(&display, &positions, available, |c, matched| {
+                        let font = if matched {
+                            &typography.bold
+                        } else {
+                            &typography.normal
+                        };
+                        fonts.glyph_width(font, c)
+                    })
+                });
+                let job = result_window_layout(
                     &display,
-                    &displayed.snapshot.effective_query(&displayed.query),
+                    window,
+                    &positions,
                     index == self.selected,
                     appearance,
                 );
                 let galley = painter.layout_job(job);
                 painter.galley(
-                    egui::pos2(rect.left() + 12.0, rect.center().y - galley.size().y / 2.0),
+                    egui::pos2(text_left, rect.center().y - galley.size().y / 2.0),
                     galley,
                     appearance.palette.text,
                 );
@@ -1829,11 +1884,17 @@ where
             } else {
                 0
             };
-            let count = format!("{matched}/{total}");
+            // Left-out source records, such as overlong lines, are mentioned
+            // so missing results are not a silent surprise.
+            let skipped = match self.session.skipped() {
+                0 => String::new(),
+                skipped => format!(" · {skipped} skipped"),
+            };
+            let count = format!("{matched}/{total}{skipped}");
             let count_size = ui
                 .painter()
                 .layout_no_wrap(
-                    format!("{total}/{total}"),
+                    format!("{total}/{total}{skipped}"),
                     appearance.typography.normal.clone(),
                     appearance.palette.text,
                 )
@@ -2434,45 +2495,195 @@ fn paint_loading_indicator(ui: &egui::Ui, rect: egui::Rect, color: egui::Color32
     }
     ui.ctx().request_repaint_after(Duration::from_millis(80));
 }
-fn result_layout(
+/// Marks text hidden at either end of a result row.
+const RESULT_ELLIPSIS: char = '…';
+/// Most characters after the last match kept visible when a row is shifted.
+const RESULT_MATCH_CONTEXT: usize = 8;
+/// Gap between result text and the row's right edge.
+const RESULT_RIGHT_PADDING: f32 = 4.0;
+
+/// The part of a result row's text that is painted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ResultWindow {
+    /// Byte range of the visible text.
+    start: usize,
+    end: usize,
+    /// Text is hidden before `start`.
+    leading: bool,
+    /// Text is hidden after `end`.
+    trailing: bool,
+}
+
+/// Character painted for `c`: a row is one line, so control characters
+/// cannot be painted as they are.
+fn result_display_char(c: char) -> char {
+    if c == '\t' {
+        ' '
+    } else if c.is_control() {
+        char::REPLACEMENT_CHARACTER
+    } else {
+        c
+    }
+}
+
+/// Choose the part of `text` that fits in `available` points, given each
+/// character's width (`matched` characters use the bold font). Text that fits
+/// is shown whole. Otherwise the start is kept if the last match is visible
+/// there; if not, the text shifts left so the match ends near the right edge
+/// with a little following context, as fzf does. Ellipses mark hidden text and
+/// their width is reserved. Only characters near the window are measured.
+fn result_window(
     text: &str,
-    query: &str,
+    positions: &[usize],
+    available: f32,
+    mut width: impl FnMut(char, bool) -> f32,
+) -> ResultWindow {
+    let matched = |offset: usize| positions.binary_search(&offset).is_ok();
+    let ellipsis = width(RESULT_ELLIPSIS, false);
+    let mut used = 0.0;
+    // Longest prefix that leaves room for a trailing ellipsis.
+    let mut prefix_end = 0;
+    let mut fits = true;
+    for (offset, c) in text.char_indices() {
+        used += width(result_display_char(c), matched(offset));
+        if used > available {
+            fits = false;
+            break;
+        }
+        if used <= available - ellipsis {
+            prefix_end = offset + c.len_utf8();
+        }
+    }
+    if fits {
+        return ResultWindow {
+            start: 0,
+            end: text.len(),
+            leading: false,
+            trailing: false,
+        };
+    }
+    let start_kept = ResultWindow {
+        start: 0,
+        end: prefix_end,
+        leading: false,
+        trailing: true,
+    };
+    let Some(&last) = positions
+        .last()
+        .filter(|&&last| last < text.len() && text.is_char_boundary(last))
+    else {
+        return start_kept;
+    };
+    let match_end = last + text[last..].chars().next().map_or(0, char::len_utf8);
+    if match_end <= prefix_end {
+        return start_kept;
+    }
+    // Context after the match takes at most a quarter of the row.
+    let mut end = match_end;
+    let mut context = 0.0;
+    for c in text[match_end..].chars().take(RESULT_MATCH_CONTEXT) {
+        context += width(result_display_char(c), false);
+        if context > available / 4.0 {
+            break;
+        }
+        end += c.len_utf8();
+    }
+    let trailing = end < text.len();
+    let budget = available - ellipsis - if trailing { ellipsis } else { 0.0 };
+    let mut start = end;
+    let mut used = 0.0;
+    for (offset, c) in text[..end].char_indices().rev() {
+        used += width(result_display_char(c), matched(offset));
+        if used > budget {
+            break;
+        }
+        start = offset;
+    }
+    ResultWindow {
+        start,
+        end,
+        leading: start > 0,
+        trailing,
+    }
+}
+
+fn result_format(matched: bool, selected: bool, appearance: &Appearance) -> egui::TextFormat {
+    egui::TextFormat {
+        font_id: if matched {
+            appearance.typography.bold.clone()
+        } else {
+            appearance.typography.normal.clone()
+        },
+        color: if matched {
+            appearance.palette.match_highlight
+        } else if selected {
+            appearance.palette.selection_text
+        } else {
+            appearance.palette.text
+        },
+        ..Default::default()
+    }
+}
+
+/// Lay out `window` of `text`, one section per run of matched or unmatched
+/// characters. `positions` must be sorted.
+fn result_window_layout(
+    text: &str,
+    window: ResultWindow,
+    positions: &[usize],
     selected: bool,
     appearance: &Appearance,
 ) -> egui::text::LayoutJob {
-    let positions = resolve_match_positions(query, text);
-    highlighted_layout(text, &positions, selected, appearance)
+    let mut job = egui::text::LayoutJob::default();
+    let ellipsis = egui::TextFormat {
+        font_id: appearance.typography.normal.clone(),
+        color: appearance.palette.muted,
+        ..Default::default()
+    };
+    if window.leading {
+        job.append(&RESULT_ELLIPSIS.to_string(), 0.0, ellipsis.clone());
+    }
+    let mut next = positions.partition_point(|&p| p < window.start);
+    let mut run = String::new();
+    let mut run_matched = false;
+    for (offset, c) in text[window.start..window.end].char_indices() {
+        let offset = window.start + offset;
+        while positions.get(next).is_some_and(|&p| p < offset) {
+            next += 1;
+        }
+        let matched = positions.get(next) == Some(&offset);
+        if matched != run_matched && !run.is_empty() {
+            job.append(&run, 0.0, result_format(run_matched, selected, appearance));
+            run.clear();
+        }
+        run_matched = matched;
+        run.push(result_display_char(c));
+    }
+    if !run.is_empty() {
+        job.append(&run, 0.0, result_format(run_matched, selected, appearance));
+    }
+    if window.trailing {
+        job.append(&RESULT_ELLIPSIS.to_string(), 0.0, ellipsis);
+    }
+    job
 }
+
 fn highlighted_layout(
     text: &str,
     positions: &[usize],
     selected: bool,
     appearance: &Appearance,
 ) -> egui::text::LayoutJob {
-    let mut job = egui::text::LayoutJob::default();
-    for (offset, character) in text.char_indices() {
-        let matched = positions.contains(&offset);
-        job.append(
-            &character.to_string(),
-            0.0,
-            egui::TextFormat {
-                font_id: if matched {
-                    appearance.typography.bold.clone()
-                } else {
-                    appearance.typography.normal.clone()
-                },
-                color: if matched {
-                    appearance.palette.match_highlight
-                } else if selected {
-                    appearance.palette.selection_text
-                } else {
-                    appearance.palette.text
-                },
-                ..Default::default()
-            },
-        );
-    }
-    job
+    let mut positions = positions.to_vec();
+    positions.sort_unstable();
+    positions.dedup();
+    let whole = ResultWindow {
+        start: 0,
+        end: text.len(),
+        leading: false,
+        trailing: false,
+    };
+    result_window_layout(text, whole, &positions, selected, appearance)
 }
 #[cfg(test)]
 mod query_parity_tests {
@@ -2942,6 +3153,37 @@ mod query_parity_tests {
             event,
             Some(PickerEvent::CustomAction { action: 4, .. })
         ));
+    }
+
+    #[test]
+    fn alt_z_toggles_preview_wrap_and_requests_the_preview_again() {
+        let (ctx, mut picker) = make();
+        wait(&mut picker);
+        picker.config.preview_visible = true;
+        assert!(picker.preview_wrap());
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let record = seen.clone();
+        picker.set_preview_provider(
+            &ctx,
+            Arc::new(
+                move |request: PreviewRequest<nfm_picker_sources::structured::StructuredPickerItem>,
+                      _: crate::Cancellation| {
+                    record.lock().unwrap().push(request.wrap_text);
+                    Ok(Preview::Text("one\ntwo".into()))
+                },
+            ),
+        );
+        draw(&ctx, &mut picker, vec![]);
+        load_preview(&mut picker);
+        assert_eq!(seen.lock().unwrap().last(), Some(&true));
+        tap(&ctx, &mut picker, Key::Z, Modifiers::ALT);
+        assert!(!picker.preview_wrap());
+        // The toggle drops the old layout; the preview is asked for again unwrapped.
+        draw(&ctx, &mut picker, vec![]);
+        load_preview(&mut picker);
+        assert_eq!(seen.lock().unwrap().last(), Some(&false));
+        tap(&ctx, &mut picker, Key::Z, Modifiers::ALT);
+        assert!(picker.preview_wrap());
     }
 
     #[test]
@@ -4758,6 +5000,26 @@ mod tests {
         (ctx, store, picker)
     }
     #[test]
+    fn skipped_source_records_reach_the_counter() {
+        let (ctx, store, mut picker) = make();
+        assert_eq!(picker.session.skipped(), 0);
+        store.add_skipped(3);
+        assert_eq!(picker.session.skipped(), 3);
+        // The counter is painted with the note.
+        let frame = ctx.run_ui(egui::RawInput::default(), |ui| {
+            picker.show(
+                ui.ctx(),
+                crate::Placement::new(ui.ctx().content_rect()),
+                &crate::Appearance::default(),
+                false,
+            );
+        });
+        let mut frame = frame;
+        frame.textures_delta.clear();
+        let painted = format!("{:?}", frame.shapes);
+        assert!(painted.contains("3 skipped"));
+    }
+    #[test]
     fn results_retain_payloads_from_their_actual_snapshot() {
         let (_, store, mut picker) = make();
         wait(|| {
@@ -5328,5 +5590,178 @@ mod output_selection_tests {
             output.frame_selection = None;
             assert!(output.selection().is_none());
         }
+    }
+}
+
+#[cfg(test)]
+mod long_result_tests {
+    use super::*;
+    use nfm_search_core::{snapshot_store::SnapshotStore, store::FlatSnapshot};
+
+    /// One point per character; wide CJK characters take two.
+    fn cells(c: char, _matched: bool) -> f32 {
+        if c == '猫' { 2.0 } else { 1.0 }
+    }
+
+    fn window(start: usize, end: usize, leading: bool, trailing: bool) -> ResultWindow {
+        ResultWindow {
+            start,
+            end,
+            leading,
+            trailing,
+        }
+    }
+
+    #[test]
+    fn short_text_and_matches_near_the_start_keep_the_start() {
+        assert_eq!(
+            result_window("abc", &[], 3.0, cells),
+            window(0, 3, false, false)
+        );
+        // One cell is reserved for the trailing ellipsis.
+        assert_eq!(
+            result_window("abcdefghij", &[], 5.0, cells),
+            window(0, 4, false, true)
+        );
+        assert_eq!(
+            result_window("abcdefghij", &[1, 3], 5.0, cells),
+            window(0, 4, false, true)
+        );
+    }
+
+    #[test]
+    fn matches_past_the_edge_shift_the_text_and_keep_some_context() {
+        let text = format!("{}X{}", "a".repeat(20), "b".repeat(20));
+        let shifted = result_window(&text, &[20], 12.0, cells);
+        // Context is at most a quarter of the row: three cells here.
+        assert_eq!(shifted, window(14, 24, true, true));
+        assert_eq!(&text[shifted.start..shifted.end], "aaaaaaXbbb");
+
+        // A match at the very end needs no trailing ellipsis.
+        let text = format!("{}X", "a".repeat(20));
+        assert_eq!(
+            result_window(&text, &[20], 12.0, cells),
+            window(10, 21, true, false)
+        );
+
+        // Wide characters are measured in their own width.
+        let text = format!("{}X", "猫".repeat(10));
+        let wide = result_window(&text, &[30], 9.0, cells);
+        assert_eq!(wide, window(21, 31, true, false));
+        assert_eq!(&text[wide.start..wide.end], "猫猫猫X");
+    }
+
+    #[test]
+    fn positions_outside_the_text_fall_back_to_the_start() {
+        assert_eq!(
+            result_window("abcdefghij", &[99], 5.0, cells),
+            window(0, 4, false, true)
+        );
+    }
+
+    fn sections(job: &egui::text::LayoutJob) -> Vec<(&str, bool)> {
+        let appearance = Appearance::default();
+        job.sections
+            .iter()
+            .map(|section| {
+                (
+                    &job.text[section.byte_range.start.0..section.byte_range.end.0],
+                    section.format.color == appearance.palette.match_highlight,
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn layout_groups_matched_runs_and_marks_hidden_text() {
+        let appearance = Appearance::default();
+        let whole = highlighted_layout("abcdef", &[2, 1, 2], false, &appearance);
+        assert_eq!(
+            sections(&whole),
+            [("a", false), ("bc", true), ("def", false)]
+        );
+        let partial = result_window_layout(
+            "abcdef",
+            window(1, 4, true, true),
+            &[1, 2],
+            false,
+            &appearance,
+        );
+        assert_eq!(
+            sections(&partial),
+            [("…", false), ("bc", true), ("d", false), ("…", false)]
+        );
+        assert_eq!(partial.sections[0].format.color, appearance.palette.muted);
+    }
+
+    #[test]
+    fn control_characters_are_painted_on_one_line() {
+        let job = highlighted_layout("a\tb\u{7}\nc", &[], false, &Appearance::default());
+        assert_eq!(job.text, "a b\u{FFFD}\u{FFFD}c");
+    }
+
+    #[test]
+    fn long_results_show_their_match_between_ellipses() {
+        let ctx = Context::default();
+        let store = Arc::new(SnapshotStore::new());
+        let long = format!("{}needle{}", "x".repeat(400), "y".repeat(50));
+        store.publish(Arc::new(FlatSnapshot::from_items([(long.as_str(), 1u64)])));
+        store.complete();
+        let mut picker = Picker::new(
+            "long-results",
+            &ctx,
+            store,
+            PickerConfig {
+                preview_visible: false,
+                ..Default::default()
+            },
+        );
+        picker.set_query("needle");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !(picker.current_results() && picker.selection().is_some()) {
+            picker.poll();
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let appearance = Appearance::default();
+        let width = 600.0;
+        let mut paint = || {
+            let frame = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(width, 400.0),
+                    )),
+                    ..Default::default()
+                },
+                |ui| {
+                    picker.show(
+                        ui.ctx(),
+                        Placement::new(ui.ctx().content_rect()),
+                        &appearance,
+                        false,
+                    );
+                },
+            );
+            let row = frame
+                .shapes
+                .iter()
+                .find_map(|shape| match &shape.shape {
+                    egui::Shape::Text(text) if text.galley.text().contains("needle") => {
+                        Some((text.galley.text().to_owned(), text.visual_bounding_rect()))
+                    }
+                    _ => None,
+                })
+                .expect("painted result row");
+            frame.drop_without_applying_deltas();
+            row
+        };
+        let (text, rect) = paint();
+        assert!(text.starts_with('…'), "{text}");
+        assert!(text.ends_with('…'), "{text}");
+        assert!(text.len() < long.len());
+        assert!(rect.right() <= width, "row overflows: {rect:?}");
+        // Later frames rebuild the row and paint the same text.
+        assert_eq!(paint().0, text);
     }
 }

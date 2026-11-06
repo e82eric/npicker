@@ -1,12 +1,13 @@
 use crate::fuzzy_search_session::SearchSnapshotProvider;
 use crate::store::ItemsSource;
 use crossbeam_channel::{Sender, TrySendError};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 pub struct SnapshotStore<S: ItemsSource> {
     snapshot: RwLock<Option<Arc<S>>>,
     done: AtomicBool,
+    skipped: AtomicUsize,
     append_only: bool,
     subscribers: Mutex<Vec<Sender<()>>>,
 }
@@ -64,6 +65,7 @@ impl<S: ItemsSource> SnapshotStore<S> {
         Self {
             snapshot: RwLock::new(None),
             done: AtomicBool::new(false),
+            skipped: AtomicUsize::new(0),
             append_only: false,
             subscribers: Mutex::new(Vec::new()),
         }
@@ -111,6 +113,20 @@ impl<S: ItemsSource> SnapshotStore<S> {
     pub fn is_done(&self) -> bool {
         self.done.load(Ordering::Acquire)
     }
+
+    /// Count `count` source records that were left out, such as overlong
+    /// lines, so a picker can say so. Wakes subscribers like a publication.
+    pub fn add_skipped(&self, count: usize) {
+        if count > 0 {
+            self.skipped.fetch_add(count, Ordering::AcqRel);
+            self.notify();
+        }
+    }
+
+    /// Records left out so far.
+    pub fn skipped(&self) -> usize {
+        self.skipped.load(Ordering::Acquire)
+    }
 }
 impl<S> SearchSnapshotProvider<S> for SnapshotStore<S>
 where
@@ -129,6 +145,9 @@ where
     }
     fn is_done(&self) -> bool {
         SnapshotStore::is_done(self)
+    }
+    fn skipped_items(&self) -> usize {
+        SnapshotStore::skipped(self)
     }
     fn subscribe_updates(&self, wake: Sender<()>) -> bool {
         self.subscribers

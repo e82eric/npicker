@@ -24,7 +24,7 @@ impl Default for ReaderSourceOptions {
             reverse: false,
             line_continuation: None,
             unique: false,
-            max_record_bytes: 4 * 1024 * 1024,
+            max_record_bytes: crate::records::DEFAULT_MAX_RECORD_BYTES,
         }
     }
 }

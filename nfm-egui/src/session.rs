@@ -66,6 +66,7 @@ pub(crate) struct Session<S: ItemsSource + Send + Sync + 'static> {
     revision: u64,
     timings: Arc<Mutex<SearchTimings>>,
     wake_callback: Arc<Mutex<Option<WakeCallback>>>,
+    skipped: Box<dyn Fn() -> usize + Send + Sync>,
 }
 impl<S: ItemsSource + Send + Sync + 'static> Session<S> {
     pub fn new<P: SearchSnapshotProvider<S> + ?Sized>(
@@ -80,6 +81,7 @@ impl<S: ItemsSource + Send + Sync + 'static> Session<S> {
         }));
         let wake_callback: Arc<Mutex<Option<WakeCallback>>> = Arc::new(Mutex::new(None));
         let append_only = provider.is_append_only();
+        let skipped_provider = provider.clone();
         let (snapshot_provider, version_provider, done_provider, notification_provider) = (
             provider.clone(),
             provider.clone(),
@@ -141,7 +143,12 @@ impl<S: ItemsSource + Send + Sync + 'static> Session<S> {
             revision: 0,
             timings,
             wake_callback,
+            skipped: Box::new(move || skipped_provider.skipped_items()),
         }
+    }
+    /// Source records left out, such as overlong lines.
+    pub fn skipped(&self) -> usize {
+        (self.skipped)()
     }
     pub fn set_query(&mut self, query: String) -> u64 {
         self.revision += 1;

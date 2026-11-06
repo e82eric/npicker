@@ -608,6 +608,7 @@ mod tests {
             scroll_offset: offset,
             foreground: Color32::WHITE,
             background: Color32::BLACK,
+            wrap_text: true,
         }
     }
     fn first_line(document: &Preview) -> String {

@@ -113,6 +113,10 @@ pub struct PreviewRequest<T> {
     pub scroll_offset: usize,
     pub foreground: Color32,
     pub background: Color32,
+    /// Wrap long text lines at `columns` rather than scroll them sideways.
+    /// `Preview::Text` follows it; text providers that page their own grid
+    /// should too. Terminal output wraps at `columns` regardless.
+    pub wrap_text: bool,
 }
 
 /// Retain this token while reading host snapshots or running a child process.
@@ -202,17 +206,24 @@ struct ResultUpdate {
     text: Option<Arc<DocumentLayout>>,
 }
 
-/// Widest `Preview::Text` line shown without wrapping; longer lines wrap.
+/// Widest `Preview::Text` line shown without wrapping when wrapping is off;
+/// longer lines wrap.
 pub(crate) const MAX_TEXT_COLUMNS: usize = 4096;
 
 /// Run the provider, turning text into a page of a text layout. Returns the
-/// page, its first row and, for text, the layout behind it.
+/// page, its first row and, for text, the layout behind it. Text wraps at the
+/// request's columns when it asks to; otherwise it scrolls sideways.
 fn render<T: 'static>(
     provider: &dyn PreviewProvider<T>,
     request: PreviewRequest<T>,
     cancel: Cancellation,
 ) -> (Result<Preview, String>, usize, Option<Arc<DocumentLayout>>) {
     let rows = usize::from(request.rows);
+    let max_columns = if request.wrap_text {
+        usize::from(request.columns).clamp(1, MAX_TEXT_COLUMNS)
+    } else {
+        MAX_TEXT_COLUMNS
+    };
     let (foreground, background) = (request.foreground, request.background);
     let scroll_offset = request.scroll_offset;
     let text = match provider.preview_viewport(request, cancel.clone()) {
@@ -223,7 +234,7 @@ fn render<T: 'static>(
         Ok(page) => return (Ok(page.document), page.first_row, None),
         Err(error) => return (Err(error), scroll_offset, None),
     };
-    let layout = match StyledDocument::from_text(&text).text_layout(MAX_TEXT_COLUMNS, &cancel) {
+    let layout = match StyledDocument::from_text(&text).text_layout(max_columns, &cancel) {
         Ok(layout) => layout,
         Err(error) => return (Err(error), scroll_offset, None),
     };
@@ -585,6 +596,7 @@ mod tests {
             scroll_offset: 0,
             foreground: Color32::WHITE,
             background: Color32::BLACK,
+            wrap_text: true,
         }
     }
     #[test]
@@ -628,6 +640,26 @@ mod tests {
         drop(worker);
         assert!(token.is_cancelled());
     }
+    #[test]
+    fn text_wraps_at_the_pane_width_or_scrolls_sideways() {
+        let provider = |_: PreviewRequest<usize>, _: Cancellation| {
+            Ok(Preview::Text(format!("{}\nshort", "x".repeat(100))))
+        };
+        // The request is 40 columns wide.
+        let shape = |wrap_text: bool| match render(
+            &provider,
+            PreviewRequest {
+                wrap_text,
+                ..request(0)
+            },
+            Cancellation::never(),
+        ) {
+            (Ok(Preview::Grid { columns, total_rows, .. }), _, Some(_)) => (columns, total_rows),
+            other => panic!("expected a text page, got {:?}", other.0),
+        };
+        assert_eq!(shape(true), (40, 4));
+        assert_eq!(shape(false), (100, 2));
+    }
 }
 
 #[cfg(test)]
@@ -650,6 +682,7 @@ mod retention_tests {
             scroll_offset: index,
             foreground: Color32::WHITE,
             background: Color32::BLACK,
+            wrap_text: true,
         }
     }
     #[test]
@@ -717,6 +750,7 @@ mod text_tests {
             scroll_offset,
             foreground: Color32::RED,
             background: Color32::BLACK,
+            wrap_text: true,
         }
     }
     fn wait(worker: &mut PreviewWorker<usize>) {

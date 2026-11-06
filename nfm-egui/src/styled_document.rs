@@ -989,6 +989,7 @@ mod tests {
             scroll_offset: 0,
             foreground: egui::Color32::WHITE,
             background: egui::Color32::BLACK,
+            wrap_text: true,
         }
     }
     #[test]

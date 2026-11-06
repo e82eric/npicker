@@ -45,6 +45,7 @@ impl<S: ItemsSource + 'static> PathPreview<S> {
             scroll_offset: request.scroll_offset,
             foreground: request.foreground,
             background: request.background,
+            wrap_text: request.wrap_text,
         })
     }
 }

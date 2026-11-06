@@ -196,30 +196,84 @@ fn read_content(
     if !metadata.is_file() {
         return Err("File preview requires a regular file or directory".into());
     }
-    if metadata.len() > max_bytes as u64 {
-        return Err("File preview exceeds max_bytes".into());
-    }
+    let too_large = || {
+        format!(
+            "the file is larger than the {} preview limit",
+            format_size(max_bytes as u64)
+        )
+    };
+    let unreadable = |error: std::io::Error| {
+        Ok(fallback(path, metadata.len(), &format!("it could not be read: {error}")))
+    };
+    let mut file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) => return unreadable(error),
+    };
+    // Sniff the start for a NUL byte, as Git does, so a binary file of any
+    // size is reported as binary after one small read.
     let mut bytes = Vec::new();
-    fs::File::open(path)
-        .map_err(|e| e.to_string())?
-        .take(max_bytes as u64 + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|e| e.to_string())?;
+    if let Err(error) = file.by_ref().take(SNIFF_BYTES).read_to_end(&mut bytes) {
+        return unreadable(error);
+    }
     cancelled(cancel)?;
+    if bytes.contains(&0) {
+        return Ok(file_info("Binary file", path, metadata.len()));
+    }
+    if metadata.len() > max_bytes as u64 {
+        return Ok(fallback(path, metadata.len(), &too_large()));
+    }
+    let rest = (max_bytes as u64 + 1).saturating_sub(bytes.len() as u64);
+    if let Err(error) = file.take(rest).read_to_end(&mut bytes) {
+        return unreadable(error);
+    }
+    cancelled(cancel)?;
+    // The file grew after its size was read.
     if bytes.len() > max_bytes {
-        return Err("File preview exceeds max_bytes".into());
+        return Ok(fallback(path, metadata.len(), &too_large()));
     }
     match String::from_utf8(bytes) {
         Ok(text) if !text.contains('\0') => Ok(TextContent {
             text: text.trim_start_matches('\u{feff}').to_owned(),
             syntax: None::<SyntaxChoice>,
         }),
-        _ => Ok(TextContent::plain(format!(
-            "Binary file\n{}\n{} bytes",
-            path.display(),
-            metadata.len()
-        ))),
+        _ => Ok(file_info("Binary file", path, metadata.len())),
     }
+}
+
+/// Bytes read from the start of a file to tell binary files from text.
+const SNIFF_BYTES: u64 = 8 * 1024;
+
+/// A file's path and size under a heading, shown instead of its contents.
+fn file_info(heading: &str, path: &Path, size: u64) -> TextContent {
+    TextContent::plain(format!("{heading}\n{}\n{size} bytes", path.display()))
+}
+
+/// File info for a file whose contents cannot be previewed, saying why. The
+/// reason is also logged, since the preview would otherwise hide it.
+fn fallback(path: &Path, size: u64, reason: &str) -> TextContent {
+    tracing::warn!(
+        target: "nfm_preview",
+        path = %path.display(),
+        size,
+        "file preview fell back to file info: {reason}"
+    );
+    file_info(
+        &format!("Showing file info: {reason}"),
+        path,
+        size,
+    )
+}
+
+/// `bytes` in the largest whole binary unit, such as `10 MiB`.
+fn format_size(bytes: u64) -> String {
+    const UNITS: [&str; 4] = ["bytes", "KiB", "MiB", "GiB"];
+    let mut size = bytes;
+    let mut unit = 0;
+    while unit + 1 < UNITS.len() && size >= 1024 && size % 1024 == 0 {
+        size /= 1024;
+        unit += 1;
+    }
+    format!("{size} {}", UNITS[unit])
 }
 
 #[cfg(test)]
@@ -244,6 +298,7 @@ mod tests {
             scroll_offset: 0,
             foreground: nfm_egui::egui::Color32::WHITE,
             background: nfm_egui::egui::Color32::BLACK,
+            wrap_text: true,
         }
     }
 
@@ -307,8 +362,52 @@ mod tests {
                 .text
                 .starts_with("Binary file\n")
         );
-        assert!(read_content(&root.join("a.txt"), 2, never).is_err());
+        // Too large to preview: file info, saying why, instead of an error.
+        let large = read_content(&root.join("a.txt"), 2, never).unwrap();
+        assert_eq!(large.text.lines().count(), 3);
+        assert_eq!(
+            large.text.lines().next(),
+            Some("Showing file info: the file is larger than the 2 bytes preview limit")
+        );
+        assert!(large.text.ends_with("\n8 bytes"));
+        assert!(matches!(large.syntax, Some(SyntaxChoice::PlainText)));
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn binary_files_are_sniffed_before_the_size_limit() {
+        let root = temp_dir("sniff");
+        let never = &|| false;
+        // A binary over the limit is still reported as binary, not too large.
+        let mut object = vec![b'x'; 100];
+        object[10] = 0;
+        fs::write(root.join("big.o"), &object).unwrap();
+        assert_eq!(
+            read_content(&root.join("big.o"), 50, never).unwrap().text,
+            format!("Binary file\n{}\n100 bytes", root.join("big.o").display())
+        );
+        // Text longer than the sniffed prefix is read whole.
+        let text = "line of text\n".repeat(2000);
+        fs::write(root.join("long.txt"), &text).unwrap();
+        assert_eq!(read_content(&root.join("long.txt"), 1 << 20, never).unwrap().text, text);
+        // A NUL after the prefix is still caught once the file is read.
+        let mut late = vec![b'y'; SNIFF_BYTES as usize + 10];
+        late[SNIFF_BYTES as usize + 5] = 0;
+        fs::write(root.join("late.bin"), &late).unwrap();
+        assert!(
+            read_content(&root.join("late.bin"), 1 << 20, never)
+                .unwrap()
+                .text
+                .starts_with("Binary file\n")
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn sizes_use_the_largest_whole_unit() {
+        assert_eq!(format_size(10 * 1024 * 1024), "10 MiB");
+        assert_eq!(format_size(1536), "1536 bytes");
+        assert_eq!(format_size(4096), "4 KiB");
     }
 
     #[test]

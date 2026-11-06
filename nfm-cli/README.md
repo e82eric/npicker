@@ -31,6 +31,8 @@ Run `nfm --help` for every option.
 Line inputs also take `--unique`, `--reverse`, `--line-continuation`,
 `--delimiter` with `--text-field`/`--value-field`, and `--input-format csv`
 (filter columns with `/:size==2`, sort with `/!Descending==size`).
+Lines (and joined records) over 16 KiB are skipped; the counter shows how
+many, as `matched/total · N skipped`.
 
 ## Previews
 
@@ -41,6 +43,8 @@ Line inputs also take `--unique`, `--reverse`, `--line-continuation`,
   prints a profile name per item (or `--preview-default`).
 - With `--preview-file-field`, the built-in highlighted file preview is used,
   centered on `--preview-center-line-field`.
+- Long text preview lines wrap at the pane width; `--preview-wrap false` (or
+  Alt+Z) lets them scroll sideways instead.
 
 ## Keys and actions
 

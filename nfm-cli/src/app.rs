@@ -361,6 +361,7 @@ pub fn picker_config(options: &Options, preview_visible: bool) -> PickerConfig {
         bindings: Vec::new(),
         preview_rows: options.preview_rows.unwrap_or(DEFAULT_PREVIEW_ROWS),
         preview_visible,
+        preview_wrap: options.preview_wrap,
         sort: if options.sort_input {
             SearchSortMode::SourceOrder
         } else {

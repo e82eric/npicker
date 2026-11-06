@@ -27,6 +27,11 @@ where
     fn is_append_only(&self) -> bool {
         false
     }
+    /// Source records left out of the snapshot, such as lines over a length
+    /// limit. Pickers show a non-zero count beside the totals.
+    fn skipped_items(&self) -> usize {
+        0
+    }
 }
 
 #[derive(Clone, Debug)]

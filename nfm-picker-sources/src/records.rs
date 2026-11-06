@@ -14,6 +14,9 @@ use std::{
 };
 
 pub type StreamValues = Arc<Mutex<HashMap<usize, String>>>;
+/// Default cap on one physical line or joined continuation record. Longer
+/// records are skipped and counted rather than stopping the source.
+pub const DEFAULT_MAX_RECORD_BYTES: usize = 16 * 1024;
 pub struct StreamSink<T: Copy + Default> {
     pub store: Arc<SnapshotStore<StreamingItemSnapshotWithPayload<T>>>,
     pub payload: T,
@@ -60,6 +63,13 @@ fn finish_item(lines: &mut Vec<String>, continuation: Option<&str>) -> Option<Re
 /// by the command and file sources so both treat lines identically.
 pub(crate) struct Records<T: Copy + Default> {
     publisher: PublishingStreamingItemStoreWithPayload<T>,
+    store: Arc<SnapshotStore<StreamingItemSnapshotWithPayload<T>>>,
+    /// Records over `limit` that were left out.
+    skipped: usize,
+    /// Dropping the rest of an overlong physical line, up to its newline.
+    skipping_line: bool,
+    /// Dropping the remaining continuation lines of an overlong record.
+    discarding_record: bool,
     payload: T,
     values: Option<StreamValues>,
     continuation: Option<String>,
@@ -80,6 +90,10 @@ impl<T: Copy + Default> Records<T> {
     ) -> Self {
         Self {
             publisher: PublishingStreamingItemStoreWithPayload::new(sink.store.clone()),
+            store: sink.store.clone(),
+            skipped: 0,
+            skipping_line: false,
+            discarding_record: false,
             payload: sink.payload,
             values: sink.values.clone(),
             continuation: line_continuation.filter(|s| !s.is_empty()),
@@ -97,6 +111,14 @@ impl<T: Copy + Default> Records<T> {
     }
     pub(crate) fn limit(&self) -> usize {
         self.limit
+    }
+    /// Leave out the record being gathered, counting it on the store so the
+    /// picker can show how many were skipped.
+    pub(crate) fn skip_record(&mut self) {
+        self.lines.clear();
+        self.record_bytes = 0;
+        self.skipped += 1;
+        self.store.add_skipped(1);
     }
     fn publish_item(&mut self) {
         let Some(item) = finish_item(&mut self.lines, self.continuation.as_deref()) else {
@@ -126,6 +148,14 @@ impl<T: Copy + Default> Records<T> {
         let raw = std::mem::take(&mut self.line);
         let text = String::from_utf8_lossy(&raw);
         let text = text.trim_end_matches(['\r', '\n']);
+        let continued = self
+            .continuation
+            .as_ref()
+            .is_some_and(|suffix| text.ends_with(suffix));
+        if self.discarding_record {
+            self.discarding_record = continued;
+            return Ok(());
+        }
         if self.lines.is_empty() && text.is_empty() {
             return Ok(());
         }
@@ -134,12 +164,10 @@ impl<T: Copy + Default> Records<T> {
             .saturating_add(text.len())
             .saturating_add(1);
         if self.record_bytes > self.limit {
-            return Err("Picker continuation record exceeds its byte limit".into());
+            self.skip_record();
+            self.discarding_record = continued;
+            return Ok(());
         }
-        let continued = self
-            .continuation
-            .as_ref()
-            .is_some_and(|suffix| text.ends_with(suffix));
         self.lines.push(text.to_owned());
         if !continued {
             self.publish_item();
@@ -153,8 +181,22 @@ impl<T: Copy + Default> Records<T> {
                 .iter()
                 .position(|&b| b == b'\n')
                 .map_or(remaining.len(), |i| i + 1);
+            let ends_line = remaining[count - 1] == b'\n';
+            if self.skipping_line {
+                self.skipping_line = !ends_line;
+                remaining = &remaining[count..];
+                continue;
+            }
             if self.line.len().saturating_add(count) > self.limit {
-                return Err("Picker line exceeds its byte limit".into());
+                // Too long to keep: leave out this line and the record it
+                // belongs to. The record ends with this line, since its end
+                // (and any continuation marker) is not kept.
+                self.line.clear();
+                self.skip_record();
+                self.discarding_record = false;
+                self.skipping_line = !ends_line;
+                remaining = &remaining[count..];
+                continue;
             }
             self.line.extend_from_slice(&remaining[..count]);
             if remaining[count - 1] == b'\n' {
@@ -172,9 +214,11 @@ impl<T: Copy + Default> Records<T> {
         }
     }
     pub(crate) fn finish(&mut self) -> Result<(), String> {
+        self.skipping_line = false;
         if !self.line.is_empty() {
             self.finish_line()?;
         }
+        self.discarding_record = false;
         self.publish_item();
         Ok(())
     }
@@ -223,6 +267,16 @@ where
                         (control.failed)(&error)
                     }));
                 }
+            }
+            if records.skipped > 0 {
+                tracing::warn!(
+                    target: "nfm_picker_sources",
+                    skipped = records.skipped,
+                    limit = records.limit,
+                    "{kind} source skipped {} records longer than {} bytes",
+                    records.skipped,
+                    records.limit
+                );
             }
             records.publisher.complete();
             (control.changed)();
@@ -291,14 +345,19 @@ mod tests {
         assert_eq!(*sink.store.snapshot().unwrap().payload(0), 77);
     }
     #[test]
-    fn record_limit_stops_a_long_line_or_continuation_without_losing_old_items() {
+    fn overlong_lines_and_records_are_skipped_and_counted() {
         let sink = new_sink();
         let mut records = Records::with(Some("`".into()), false, 8, &sink);
-        records.push(b"ok\n").unwrap();
+        // A long line split across pushes is dropped up to its newline, and
+        // reading carries on.
+        records.push(b"ok\n123456").unwrap();
+        records.push(b"789abc\nnext\n").unwrap();
+        // A joined record over the limit is dropped with all of its lines.
+        records.push(b"abc`\nabc`\nabc\nlast").unwrap();
+        records.finish().unwrap();
         records.flush(&|| {});
-        assert!(records.push(b"123456789").is_err());
-        assert_eq!(text(&sink.store), ["ok"]);
-        let mut records = Records::with(Some("`".into()), false, 8, &sink);
-        assert!(records.push(b"abc`\nabc`\n").is_err());
+        assert_eq!(text(&sink.store), ["ok", "next", "last"]);
+        assert_eq!(records.skipped, 2);
+        assert_eq!(sink.store.skipped(), 2);
     }
 }

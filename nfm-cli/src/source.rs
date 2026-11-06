@@ -97,7 +97,7 @@ fn lines(options: &Options, repaint: Repaint) -> Result<Source, String> {
         changed: repaint.clone(),
         failed: Arc::new(move |_| repaint()),
     };
-    const MAX_RECORD: usize = 4 * 1024 * 1024;
+    const MAX_RECORD: usize = nfm_picker_sources::records::DEFAULT_MAX_RECORD_BYTES;
     match &options.command {
         Command::Stdin => {
             let stdin = std::io::stdin();
@@ -252,11 +252,14 @@ fn delimited(
                 if cancel.load(Ordering::Acquire) {
                     return;
                 }
-                bytes.clear();
-                match reader.read_until(b'\n', &mut bytes) {
-                    Ok(0) => break,
-                    Ok(_) => {}
-                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                match read_line_bounded(&mut reader, &mut bytes, MAX_RECORD_BYTES) {
+                    Ok(None) => break,
+                    Ok(Some(Line::Kept)) => {}
+                    Ok(Some(Line::TooLong)) => {
+                        first = false;
+                        shared.add_skipped(1);
+                        continue;
+                    }
                     Err(e) => {
                         *error.lock().unwrap_or_else(|e| e.into_inner()) = Some(e.to_string());
                         break;
@@ -282,6 +285,60 @@ fn delimited(
         },
         repaint,
     )
+}
+
+/// The same cap as plain line input: longer lines or CSV records are skipped
+/// and counted on the store, which the picker shows beside its totals.
+const MAX_RECORD_BYTES: usize = nfm_picker_sources::records::DEFAULT_MAX_RECORD_BYTES;
+
+enum Line {
+    Kept,
+    /// Longer than the limit; its bytes were dropped up to the newline.
+    TooLong,
+}
+
+/// Read one line, newline included, into `line`. A line longer than `limit`
+/// is not kept, so one huge line never has to fit in memory. None at the end
+/// of input.
+fn read_line_bounded(
+    reader: &mut impl BufRead,
+    line: &mut Vec<u8>,
+    limit: usize,
+) -> std::io::Result<Option<Line>> {
+    line.clear();
+    let mut read_any = false;
+    let mut too_long = false;
+    loop {
+        let (used, ended) = {
+            let available = match reader.fill_buf() {
+                Ok(available) => available,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
+            };
+            if available.is_empty() {
+                break;
+            }
+            read_any = true;
+            let (used, ended) = match available.iter().position(|&b| b == b'\n') {
+                Some(newline) => (newline + 1, true),
+                None => (available.len(), false),
+            };
+            if !too_long {
+                if line.len() + used > limit {
+                    too_long = true;
+                    line.clear();
+                } else {
+                    line.extend_from_slice(&available[..used]);
+                }
+            }
+            (used, ended)
+        };
+        reader.consume(used);
+        if ended {
+            break;
+        }
+    }
+    Ok(read_any.then_some(if too_long { Line::TooLong } else { Line::Kept }))
 }
 
 /// The byte range searched and displayed, or None to skip a line whose text
@@ -350,8 +407,13 @@ fn csv(
                         break;
                     }
                 };
-                if store.add_record(&record).is_err() {
+                // The csv crate reads a whole record before it can be measured,
+                // so this bounds what is kept, not what is read.
+                if record.as_slice().len() > MAX_RECORD_BYTES {
+                    shared.add_skipped(1);
+                } else if store.add_record(&record).is_err() {
                     skipped += 1;
+                    shared.add_skipped(1);
                 }
                 if store.len().is_multiple_of(BATCH) || published.elapsed() >= INTERVAL {
                     shared.publish(store.snapshot());
@@ -412,5 +474,37 @@ mod tests {
         let snapshot = feed.store.snapshot().unwrap();
         assert_eq!(snapshot.len(), 2);
         assert!(feed.error().is_none());
+        // The record with the wrong number of fields is counted as skipped.
+        assert_eq!(feed.store.skipped(), 1);
+    }
+
+    #[test]
+    fn bounded_lines_drop_overlong_ones_and_keep_reading() {
+        let input = "short\nthis line is too long\n\nlast";
+        // A tiny buffer makes lines span several fills.
+        let mut reader = BufReader::with_capacity(4, input.as_bytes());
+        let mut line = Vec::new();
+        let mut lines = Vec::new();
+        while let Some(kind) = read_line_bounded(&mut reader, &mut line, 8).unwrap() {
+            lines.push(match kind {
+                Line::Kept => String::from_utf8(line.clone()).unwrap(),
+                Line::TooLong => "<too long>".into(),
+            });
+        }
+        assert_eq!(lines, ["short\n", "<too long>", "\n", "last"]);
+    }
+
+    #[test]
+    fn delimited_input_skips_lines_over_the_cap() {
+        let options = Options {
+            delimiter: Some(':'),
+            ..Options::default()
+        };
+        let long = format!("a:{}\n", "x".repeat(MAX_RECORD_BYTES));
+        let input = format!("v1:one\n{long}v3:three\n");
+        let feed = delimited(&options, Box::new(std::io::Cursor::new(input)), None, Arc::new(|| {}));
+        feed.wait();
+        assert_eq!(feed.store.snapshot().unwrap().len(), 2);
+        assert_eq!(feed.store.skipped(), 1);
     }
 }

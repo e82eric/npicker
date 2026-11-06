@@ -31,7 +31,7 @@ impl CommandSourceOptions {
             unique: false,
             reverse: false,
             success_exit_codes: codes,
-            max_record_bytes: 4 * 1024 * 1024,
+            max_record_bytes: crate::records::DEFAULT_MAX_RECORD_BYTES,
         }
     }
 }

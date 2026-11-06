@@ -111,6 +111,8 @@ pub struct Options {
     /// None chooses: native file preview when `--preview-file-field` is set.
     pub preview_native: Option<bool>,
     pub preview_visible: Option<bool>,
+    /// Wrap plain-text previews at the pane width (default true).
+    pub preview_wrap: bool,
     pub window_preview: bool,
     // Actions
     pub accept_resolver: Option<Program>,
@@ -164,6 +166,7 @@ impl Default for Options {
             preview_default: None,
             preview_native: None,
             preview_visible: None,
+            preview_wrap: true,
             window_preview: false,
             accept_resolver: None,
             actions: BTreeMap::new(),
@@ -429,6 +432,7 @@ fn apply_value(
         "preview-type" => draft.preview_kind = Some(parse_kind(&flag, &value("text or image")?)?),
         "preview-cwd" => draft.preview_cwd = Some(value("a directory")?.into()),
         "preview-visible" => o.preview_visible = Some(parse_bool(&flag, &value("true or false")?)?),
+        "preview-wrap" => o.preview_wrap = parse_bool(&flag, &value("true or false")?)?,
         "preview-native" => {
             o.preview_native = parse_auto_bool(&flag, &value("auto, true or false")?)?
         }
@@ -896,6 +900,7 @@ Preview:
       --preview-resolver-arg <ARG>    Argument for the resolver
       --preview-native <auto|true|false>  Built-in file preview for --preview-file-field (default auto)
       --preview-visible <true|false>  Show the preview initially (Ctrl+P toggles)
+      --preview-wrap <true|false>     Wrap long text preview lines (default true; Alt+Z toggles)
       --preview-rows <N>              Preview height in rows when --height is not given
       --window-preview                Live window thumbnail (the default for windows)
   Preview programs also receive NFM_PREVIEW_ITEM and NFM_PREVIEW_LINE.
@@ -986,6 +991,13 @@ mod tests {
         assert!(run(&["--rows"]).is_err());
         assert!(run(&["--unique=true"]).is_err());
         assert!(run(&["--nope"]).is_err());
+    }
+
+    #[test]
+    fn preview_wrap_defaults_on() {
+        assert!(run(&[]).unwrap().preview_wrap);
+        assert!(!run(&["--preview-wrap", "false"]).unwrap().preview_wrap);
+        assert!(run(&["--preview-wrap=true"]).unwrap().preview_wrap);
     }
 
     #[test]

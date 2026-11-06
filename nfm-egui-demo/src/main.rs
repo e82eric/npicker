@@ -30,6 +30,8 @@ struct Demo {
     status: String,
     screenshot: Option<PathBuf>,
     screenshot_requested: bool,
+    /// Initial query, from `--query`.
+    query: String,
 }
 impl Demo {
     fn new(ctx: &egui::Context) -> Self {
@@ -85,6 +87,11 @@ impl Demo {
                 panic!("--line-numbers expects off|absolute|relative|hybrid, got {other}")
             }
         };
+        let mut args = std::env::args();
+        let query = args
+            .find(|arg| arg == "--query")
+            .and_then(|_| args.next())
+            .unwrap_or_default();
         let mut demo = Self {
             source,
             cancelled,
@@ -95,6 +102,7 @@ impl Demo {
             status: "Live stream: search or navigate while candidates arrive.".into(),
             screenshot,
             screenshot_requested: false,
+            query,
         };
         demo.open(ctx);
         demo
@@ -104,7 +112,10 @@ impl Demo {
             "demo-picker",
             ctx,
             self.source.clone(),
-            PickerConfig::default(),
+            PickerConfig {
+                initial_query: self.query.clone(),
+                ..Default::default()
+            },
         );
         picker.set_preview_line_numbers(self.line_numbers);
         // A document-backed provider gives copy mode (Ctrl+W) and line numbers
