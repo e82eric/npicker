@@ -20,3 +20,8 @@ retain their native HWND payload rather than depending on display text.
 For cross-workflow reuse without a host adapter, use `with_shared_picker` and
 pass the previous workflow's `into_picker()` result. This uses NFM's generic
 `SharedPicker`; built-in payload adaptation stays in the component.
+
+Windows are listed as a table under a `HWND  PID  Process  Title` header, like
+the process picker: filter a column with `/:Process==Code.exe` and sort with
+`/!Descending==PID`. `window_snapshot` builds the same table for other pickers
+of windows.

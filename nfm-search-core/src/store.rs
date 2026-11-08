@@ -89,6 +89,19 @@ pub trait ItemsSource {
     fn effective_query(&self, input: &str) -> String {
         input.to_owned()
     }
+
+    /// A card layout for results. When present, pickers paint each result as
+    /// a multi-line card from [`ItemsSource::row_fields`] instead of one line
+    /// of [`ItemsSource::display_text`]. The template must not change between
+    /// snapshots of a source.
+    fn row_template(&self) -> Option<&crate::row::RowTemplate> {
+        None
+    }
+
+    /// Field values for a card, indexed by the template's slot fields.
+    fn row_fields(&self, _node_index: usize) -> Option<crate::row::RowFields> {
+        None
+    }
 }
 
 #[derive(Clone, Copy, Debug)]

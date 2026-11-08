@@ -5,7 +5,9 @@ edition = "2024"
 description = "Host-owned embedded egui picker using NFM stores"
 
 [features]
-default = []
+# Bundles the Symbols Nerd Font (MIT, about 2.5 MB) for glyph icons in cards.
+default = ["symbols-font"]
+symbols-font = []
 opengl = ["dep:egui_glow", "dep:glow"]
 
 [dependencies]

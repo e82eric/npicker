@@ -361,7 +361,11 @@ fn csv(
     repaint: Repaint,
 ) -> Feed<StructuredStreamingSnapshot> {
     let columns = options.csv_columns.clone();
+    let types = options.csv_types.clone();
+    let formats = options.csv_formats.clone();
     let delimiter = options.csv_delimiter;
+    let row_template = options.row_template.clone();
+    let row_icon = options.row_icon.clone();
     let notify = repaint.clone();
     spawn_reader(
         child,
@@ -388,11 +392,39 @@ fn csv(
                     None => Err("CSV input has no header record".into()),
                 },
             };
+            // Types name columns, so they are applied once the header is known.
+            let schema = schema.and_then(|schema| match types.as_deref() {
+                Some(types) => schema
+                    .with_types(types)
+                    .map_err(|e| format!("--csv-types: {e}")),
+                None => Ok(schema),
+            });
+            // Formats are checked against the types, so they come after them.
+            let schema = schema.and_then(|schema| match formats.as_deref() {
+                Some(formats) => schema
+                    .with_formats(formats)
+                    .map_err(|e| format!("--csv-formats: {e}")),
+                None => Ok(schema),
+            });
             let schema = match schema {
                 Ok(schema) => schema,
                 Err(message) => return fail(message),
             };
+            // The template names columns, so it is checked once the header is known.
+            let template = match row_template
+                .as_deref()
+                .map(|spec| schema.row_template(spec, row_icon.as_deref()))
+                .transpose()
+            {
+                Ok(template) => template,
+                Err(e) => return fail(format!("--row-template: {e}")),
+            };
             let mut store = StructuredStreamingStore::new(schema);
+            if let Some(template) = template
+                && let Err(message) = store.set_row_template(template)
+            {
+                return fail(message);
+            }
             shared.publish(store.snapshot());
             let mut skipped = 0usize;
             let mut published = Instant::now();

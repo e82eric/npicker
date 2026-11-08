@@ -66,6 +66,12 @@ macro_rules! delegate {
         fn effective_query(&self, input: &str) -> String {
             self.$field.effective_query(input)
         }
+        fn row_template(&self) -> Option<&nfm_search_core::row::RowTemplate> {
+            self.$field.row_template()
+        }
+        fn row_fields(&self, index: usize) -> Option<nfm_search_core::row::RowFields> {
+            self.$field.row_fields(index)
+        }
     };
 }
 impl<S: ItemsSource + Send + Sync> ItemsSource for Mapped<S>

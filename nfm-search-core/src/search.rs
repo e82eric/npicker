@@ -529,17 +529,30 @@ where
 
     if fuzzy_query.is_empty() {
         let append_start = timing_enabled.then(Instant::now);
+        // A custom sort orders every included item before the limit applies,
+        // so the first results are the first in sort order, not in the source.
+        let sorted = plan.has_custom_sort();
         let mut included = Vec::with_capacity(RESULT_LIMIT.min(searched));
         let mut matched = 0;
         for index in start_index..end_index {
             if !filters_items || plan.includes(index) {
                 matched += 1;
-                if included.len() < RESULT_LIMIT {
+                if sorted || included.len() < RESULT_LIMIT {
                     included.push(index);
                 }
             }
         }
-        let mut output = SearchOutput {
+        if sorted {
+            let order = |left: &usize, right: &usize| {
+                plan.compare(*left, *right).then_with(|| left.cmp(right))
+            };
+            if included.len() > RESULT_LIMIT {
+                included.select_nth_unstable_by(RESULT_LIMIT, order);
+                included.truncate(RESULT_LIMIT);
+            }
+            included.sort_unstable_by(order);
+        }
+        let output = SearchOutput {
             results: materialize_indexes(
                 Arc::clone(&snapshot),
                 included.into_iter(),
@@ -550,7 +563,6 @@ where
             total,
             match_bitmap: None,
         };
-        apply_custom_sort(&mut output.results, plan.as_ref());
         let append_us = append_start.map_or(0, timing::elapsed_us);
         let total_us = total_start.map_or(0, timing::elapsed_us);
         timing::write_lazy(|| {

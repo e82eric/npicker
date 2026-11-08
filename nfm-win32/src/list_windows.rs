@@ -16,9 +16,15 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WS_EX_TOOLWINDOW, WS_VISIBLE,
 };
 
+/// A top-level window. `text` is the searchable line (handle, PID, process
+/// and title); the other fields are its parts, for card layouts.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct WindowListItem {
     pub text: String,
     pub hwnd: isize,
+    pub title: String,
+    pub process_name: String,
+    pub process_id: u32,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -57,6 +63,9 @@ pub fn list_windows() -> Result<Vec<WindowListItem>> {
                 window.hwnd.0 as usize, window.process_id, window.process_name, window.title,
             ),
             hwnd: window.hwnd.0 as isize,
+            title: window.title,
+            process_name: window.process_name,
+            process_id: window.process_id,
         })
         .collect())
 }
