@@ -257,7 +257,7 @@ impl View {
                     ctx.copy_text(value);
                     Shown::Nothing
                 }
-                Some(PickerEvent::CustomAction { .. }) | None => Shown::Nothing,
+                Some(PickerEvent::CustomAction { .. } | PickerEvent::Command { .. }) | None => Shown::Nothing,
             }
         }
         Ok(match self {

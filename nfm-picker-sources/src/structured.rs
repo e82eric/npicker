@@ -642,8 +642,9 @@ impl StructuredStreamingSnapshot {
             return [("/:", "Filter"), ("/!", "Sort"), ("/#", "Display columns")]
                 .into_iter()
                 .map(|(replacement, description)| SearchCompletion {
-                    text: format!("{replacement}   {description}"),
+                    text: replacement.into(),
                     positions: Vec::new(),
+                    detail: description.into(),
                     replacement: if replacement == "/#" {
                         "/#Display==".into()
                     } else {
@@ -890,6 +891,7 @@ fn suggestions_for(
             },
             replacement: replacement(&text),
             text,
+            detail: String::new(),
             replace: replace.clone(),
         })
         .collect()

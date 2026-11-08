@@ -1192,6 +1192,11 @@ impl PreviewCopyMode {
     }
 
     /// Zero-based logical line containing `row`.
+    /// Rows in the laid-out document.
+    pub(crate) fn total_rows(&self) -> u64 {
+        self.document.rows()
+    }
+
     fn line_of(&self, row: u64) -> Option<u64> {
         if row >= self.document.rows() {
             return None;

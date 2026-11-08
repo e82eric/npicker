@@ -47,6 +47,8 @@ const PUBLISH_ITEM_INTERVAL: usize = 1_000;
 pub struct SearchCompletion {
     pub text: String,
     pub positions: Vec<usize>,
+    /// Muted text after `text`, such as a description. Not matched.
+    pub detail: String,
     pub replacement: String,
     pub replace: Range<usize>,
 }

@@ -50,7 +50,9 @@ let frame = ctx.run_ui(egui::RawInput::default(), |ui| {
             assert!(selection.item == 101 || selection.item == 202);
         }
         Some(PickerEvent::CopyRequested(selection)) => ctx.copy_text(selection.text),
-        Some(PickerEvent::Cancelled) | Some(PickerEvent::CustomAction { .. }) | None => {}
+        Some(PickerEvent::Cancelled)
+        | Some(PickerEvent::CustomAction { .. } | PickerEvent::Command { .. })
+        | None => {}
     }
 });
 // A real host paints this output with its existing egui renderer.
@@ -121,6 +123,14 @@ query edits, resizes or theme changes, run the provider again, so it should be
 cheap. Its copy-mode search runs within the
 frame. Return styled content as a `Grid` page of a document, as
 `DocumentPreviewProvider` and `BytePreviewProvider` do.
+
+For output that is still arriving, such as a streamed answer, publish a new
+source version of the same result as it grows and call
+`set_preview_follows_end(true)`. A new version of the shown result then keeps
+the preview's place instead of starting again at the top, and moves to the new
+end while the end was in view, as a terminal does. Scrolling up stops
+following; scrolling back down to the end resumes it. Copy mode is not
+interrupted: the preview catches up when it is left.
 
 A single preview worker processes the latest pending request. New selection,
 viewport, appearance or scrolling requests cancel the previous generation and
@@ -247,6 +257,7 @@ run from the command palette, or run by the host:
 | `TogglePreviewLineNumbers` | Ctrl+Shift+L |
 | `ToggleRelativePreviewLineNumbers` | none |
 | `ToggleFullPane` | Ctrl+Shift+F |
+| `ToggleCommandMode` | Ctrl+; (with query commands registered) |
 
 The two line-number commands are independent switches, like Vim's `number` and
 `relativenumber`: line numbers alone are absolute, relative numbers alone are
@@ -285,6 +296,81 @@ here. The palette opens at the top of the picker, sized for the whole list or
 the space available, and keeps that size while filtering. Custom bindings
 without a `description` stay out of the palette. `set_keybinding_help` is
 deprecated and has no effect.
+
+### Query commands
+
+`Picker::set_query_commands` registers host commands that run from the query
+box in command mode. `ToggleCommandMode` (Ctrl+;) switches the query box
+between searching and a command line, and the prompt shows which: `>` in the
+accent color to search, `:` in the success color for a command line. Typing
+`> ` or `: ` into an empty search, or pasting a query that starts with one,
+also switches to command mode, with the rest as the command line. The command line
+`GrepClaudeSessions fn main` names the command `GrepClaudeSessions` and passes
+the rest of the line after one space, `fn main`, verbatim, with no quoting. Each
+`QueryCommand` has a name, a description and an optional `CommandArgument` with
+its own name, description and whether it is required. Hosts can switch modes
+with `set_command_mode` and ask with `command_mode`.
+
+- The results area lists the commands in place of results: those whose names
+  match what is typed, best first, or all of them before anything is typed.
+  Each row has a `:` icon in the success color, the signature
+  (`Name <argument>`, or `[argument]` when optional) with the matched letters
+  highlighted, and the description, muted. Up, Down, PageUp, PageDown and
+  Ctrl+N select a row. The count shows the listed and registered commands. The
+  column header and preview keep their space but stay empty. Result and
+  preview commands, such as copying the selection or custom commands, do not
+  apply.
+- Tab, Enter or a click on a row types its name, with the space after it for
+  a command with an argument. Enter or a click on a command without an
+  argument also runs it. Once the name is followed by a space, the list shows
+  only that command, with its argument's description, and an empty argument
+  shows `<argument>` as dim ghost text after the cursor. While a name is
+  typed, the rest of the selected command's name shows dim after it, and
+  Right arrow at the end of the line completes it, as Tab does.
+- Enter on a typed command line reports
+  `PickerEvent::Command { name, argument, alternate: false }`, and Ctrl+Enter
+  with `alternate: true`, for a command's second action such as copying its
+  result. An unknown name or an empty required argument shows the reason as
+  ghost text, in the error color, instead. The picker stays open; the host
+  decides what the command does.
+- Command mode does not search, and a `>` or `:` typed into an empty search
+  waits to see whether a space follows. Each mode keeps its text for the next
+  switch. Escape returns to the search, whose results and selection are as
+  they were.
+- A new source (`replace_source`) starts in search mode.
+- `set_command_rows` marks results that stand for query commands, such as a
+  commands list that lists its query commands too. Accepting one does what
+  completing its name does: a command with an argument enters command mode
+  with `Name ` typed, and one without reports `PickerEvent::Command`.
+  `start_command(ctx, line)` enters command mode with any line typed, and
+  `set_command_error(ctx, reason)` shows why the host could not run a line.
+- `set_command_preview` shows a `CommandHint` the host makes from a command
+  line as it is typed, such as a calculator's result: its `text` dim after
+  the cursor, and an optional `completion` that Right arrow at the end of the
+  line makes the argument. Its `choices` list under the command, as a
+  calculator lists a result in each base: Up and Down select one, Enter makes
+  its `value` the argument and Ctrl+Enter copies it, without reporting the
+  command. It gets the command's name and its non-empty argument, runs on
+  the UI thread once per line, and returns `None` to show nothing.
+  `notify_copied_value` confirms a copy over the listed commands, as it does
+  over results.
+- `show_command_output(ctx, output)` shows a command's output in the preview
+  pane, under the command line, such as an answer streaming in after Enter.
+  The host keeps calling `output.publish(document)` with a `StyledDocument`
+  from any thread, and calls `output.finish()` when no more is coming, which
+  stops the loading indicator. The pane opens if it was hidden and follows the
+  end as the output grows, until you scroll up. Ctrl+Up, Ctrl+Down and
+  Ctrl+PageUp/PageDown scroll it, Ctrl+W enters copy mode, and Ctrl+Shift+C copies
+  all of it. Ctrl+C does too while nothing on the command line is selected.
+  The line stays editable, and the next command's output replaces this one.
+  Escape dismisses the output and keeps the line. A second Escape leaves
+  command mode as usual, and the pane closes again if the output opened it.
+  The output is also dismissed when you leave command mode or the picker is
+  dropped. `output.on_close(f)` and `output.is_closed()` tell the host, so it
+  can stop whatever produces the output.
+
+Without registered commands there is no command mode: Ctrl+; does nothing, the
+palette leaves the command out, and `> ` and `: ` are ordinary search text.
 
 ## Demo and checks
 

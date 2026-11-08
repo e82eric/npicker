@@ -3,6 +3,7 @@
 //! See the crate README for the embedding and lifetime contracts.
 mod ansi;
 mod appearance;
+mod command_output;
 pub mod icons;
 pub mod copy_controller;
 pub mod copy_document;
@@ -12,6 +13,7 @@ mod picker;
 mod placement;
 pub mod preview;
 mod preview_copy;
+mod query_command;
 pub mod quick_select;
 #[cfg(feature = "opengl")]
 pub mod renderer;
@@ -20,14 +22,17 @@ mod session;
 pub mod shared;
 
 pub use appearance::{Appearance, FontFace, Palette, Typography};
+pub use command_output::CommandOutput;
 pub use egui;
 pub use nfm_search_core::search::SearchSortMode;
 pub use nfm_search_core::{fuzzy_search_session::SearchSnapshotProvider, store::ItemsSource};
 pub use picker::{
-    Layout, Picker, PickerAction, PickerBinding, PickerConfig, PickerEvent, PickerOutput,
-    PickerTrigger, PreviewLineNumbers, RowIcon, Selection, default_bindings, results_height,
+    CommandChoice, CommandHint, CommandPreview, CommandRows, Layout, Picker, PickerAction,
+    PickerBinding, PickerConfig, PickerEvent, PickerOutput, PickerTrigger, PreviewLineNumbers,
+    RowIcon, Selection, default_bindings, results_height,
 };
 pub use placement::{Placement, Position};
+pub use query_command::{CommandArgument, QueryCommand};
 pub use preview::{Cancellation, GridLines, Preview, PreviewCell, PreviewProvider, PreviewRequest};
 pub use session::SearchTimings;
 pub mod byte_preview;

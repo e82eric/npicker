@@ -9,6 +9,7 @@ use crate::{
 use egui::{Context, Id, Key, Modifiers};
 use nfm_picker_sources::structured::{StructuredStreamingSnapshot, structured_source};
 use crate::icons::{IconCache, IconResolver, paint_icon};
+use crate::query_command::{self, QueryCommand};
 use nfm_search_core::row::{
     RowAlign, RowFields, RowSlot, RowStyle, RowTemplate, SlotKind,
 };
@@ -72,13 +73,16 @@ pub enum PickerAction {
     /// Wrap plain-text previews at the pane width, or scroll them sideways.
     TogglePreviewWrap,
     ToggleFullPane,
+    /// Switch the query between searching and typing a query command (see
+    /// [`Picker::set_query_commands`]). Applies only with commands registered.
+    ToggleCommandMode,
     /// Bind a chord to this to remove its default command.
     Unbind,
     Custom(usize),
 }
 impl PickerAction {
     /// Every built-in command, in command palette order.
-    pub const BUILT_IN: [PickerAction; 14] = [
+    pub const BUILT_IN: [PickerAction; 15] = [
         Self::ToggleCommandPalette,
         Self::TogglePreview,
         Self::TogglePreviewFocus,
@@ -93,6 +97,7 @@ impl PickerAction {
         Self::ToggleRelativePreviewLineNumbers,
         Self::TogglePreviewWrap,
         Self::ToggleFullPane,
+        Self::ToggleCommandMode,
     ];
     /// Stable name for host configuration, such as `"TogglePreview"`. `Unbind`
     /// is `"None"`; custom commands have no name.
@@ -112,6 +117,7 @@ impl PickerAction {
             Self::ToggleRelativePreviewLineNumbers => "ToggleRelativePreviewLineNumbers",
             Self::TogglePreviewWrap => "TogglePreviewWrap",
             Self::ToggleFullPane => "ToggleFullPane",
+            Self::ToggleCommandMode => "ToggleCommandMode",
             Self::Unbind => "None",
             Self::Custom(_) => return None,
         })
@@ -140,6 +146,7 @@ impl PickerAction {
             Self::ToggleRelativePreviewLineNumbers => "Toggle relative line numbers",
             Self::TogglePreviewWrap => "Toggle preview line wrap",
             Self::ToggleFullPane => "Toggle full-pane picker",
+            Self::ToggleCommandMode => "Toggle command mode",
             Self::Unbind | Self::Custom(_) => return None,
         })
     }
@@ -150,6 +157,7 @@ impl PickerAction {
         !matches!(
             self,
             Self::ToggleFullPane
+                | Self::ToggleCommandMode
                 | Self::TogglePreviewLineNumbers
                 | Self::ToggleRelativePreviewLineNumbers
                 | Self::TogglePreviewWrap
@@ -191,6 +199,7 @@ impl PickerBinding {
         label.push_str(match self.trigger {
             PickerTrigger::Key(Key::Slash) => "/",
             PickerTrigger::Key(Key::Questionmark) => "?",
+            PickerTrigger::Key(Key::Semicolon) => ";",
             PickerTrigger::Key(Key::ArrowUp) => "Up",
             PickerTrigger::Key(Key::ArrowDown) => "Down",
             PickerTrigger::Key(Key::ArrowLeft) => "Left",
@@ -226,6 +235,7 @@ pub fn default_bindings() -> Vec<PickerBinding> {
         // As in VS Code's word wrap toggle.
         (Key::Z, Modifiers::ALT, TogglePreviewWrap),
         (Key::F, ctrl_shift, ToggleFullPane),
+        (Key::Semicolon, Modifiers::CTRL, ToggleCommandMode),
     ]
     .into_iter()
     .map(|(key, modifiers, action)| PickerBinding::key(key, modifiers, action))
@@ -382,6 +392,16 @@ pub enum PickerEvent<T> {
     },
     Cancelled,
     CopyRequested(Selection<T>),
+    /// Enter on a query command line (see [`Picker::set_query_commands`]).
+    /// The picker stays open with the command line as its query; the host
+    /// decides what happens next, such as replacing the source or closing.
+    Command {
+        name: String,
+        argument: String,
+        /// Run with Ctrl+Enter rather than Enter, for a command's second
+        /// action, such as copying a calculator's result instead of using it.
+        alternate: bool,
+    },
 }
 pub struct PickerOutput<T> {
     /// Content paint commands were built this frame; this is not GPU presentation.
@@ -416,6 +436,56 @@ impl<T> PickerOutput<T> {
 /// [`Picker::set_row_icon`]).
 pub type RowIcon<T> = Arc<dyn Fn(&T) -> Option<String> + Send + Sync>;
 
+/// Which query command a result stands for, if any (see
+/// [`Picker::set_command_rows`]).
+pub type CommandRows<T> = Arc<dyn Fn(&Selection<T>) -> Option<String> + Send + Sync>;
+
+/// What shows after a command line as it is typed, from the command's name
+/// and argument (see [`Picker::set_command_preview`]).
+pub type CommandPreview = Arc<dyn Fn(&str, &str) -> Option<CommandHint> + Send + Sync>;
+
+/// A host's preview of a command line, such as a calculator's result.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CommandHint {
+    /// Dim text after the cursor.
+    pub text: String,
+    /// What Right arrow at the end of the line makes the argument, such as
+    /// the result in place of the expression.
+    pub completion: Option<String>,
+    /// Rows under the command, such as a result in each base. Up and Down
+    /// select one; Enter makes its value the argument and Ctrl+Enter copies
+    /// it, without reporting the command.
+    pub choices: Vec<CommandChoice>,
+}
+
+/// One of a [`CommandHint`]'s choices.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CommandChoice {
+    /// The row, such as `0b1101_1101`.
+    pub text: String,
+    /// What Enter and Ctrl+Enter use, such as `0b11011101`.
+    pub value: String,
+}
+
+/// A command's output as the picker shows it. Dropping it dismisses the
+/// output, which tells the host.
+struct ShownOutput {
+    output: crate::CommandOutput,
+    /// The version, columns and rows the viewport was laid out for, and
+    /// whether that layout was empty.
+    laid_out: Option<(u64, u16, usize, bool)>,
+    /// The search preview's scroll position, for after the output.
+    search_scroll_offset: usize,
+    /// Showing the output opened the hidden preview; dismissing it hides
+    /// the preview again unless the user toggled it meanwhile.
+    opened_preview: bool,
+}
+impl Drop for ShownOutput {
+    fn drop(&mut self) {
+        self.output.close();
+    }
+}
+
 pub struct Picker<S: ItemsSource + Send + Sync + 'static> {
     id: Id,
     session: Session<S>,
@@ -438,6 +508,8 @@ pub struct Picker<S: ItemsSource + Send + Sync + 'static> {
     icons: IconCache,
     /// Icons beside one-line results.
     row_icon: Option<RowIcon<S::Item>>,
+    /// Results that stand for query commands.
+    command_rows: Option<CommandRows<S::Item>>,
     visible_preview_rows: usize,
     external_preview: bool,
     preview_rect: Option<egui::Rect>,
@@ -463,6 +535,32 @@ pub struct Picker<S: ItemsSource + Send + Sync + 'static> {
     cursor_scroll_padding: u32,
     /// Logical lines in the last numbered preview; sizes the gutter.
     preview_line_count: u64,
+    /// Commands typed in command mode; none leaves `> ` and `: ` as search text.
+    query_commands: Vec<QueryCommand>,
+    /// The query last sent to the search. Command mode leaves it alone and
+    /// restores it as the query on the way out.
+    searched_query: String,
+    /// Whether the query box holds a command line rather than a search.
+    command_mode: bool,
+    /// The command line kept while searching, restored in command mode.
+    command_line: String,
+    /// Why the last Enter on a command line did not run it. Cleared when
+    /// the query changes.
+    command_error: Option<String>,
+    /// The selected row of the commands command mode lists in place of
+    /// results.
+    command_selected: usize,
+    /// A listed command clicked this frame.
+    command_clicked: Option<usize>,
+    command_preview: Option<CommandPreview>,
+    /// The preview of the command line it was made for.
+    previewed_command: Option<(String, Option<CommandHint>)>,
+    /// See [`Picker::set_preview_follows_end`].
+    preview_follows_end: bool,
+    /// Whether a growing preview is showing its end, to keep it there.
+    preview_following: bool,
+    /// A query command's output, shown in the preview pane in command mode.
+    command_output: Option<ShownOutput>,
 }
 impl<S> Picker<S>
 where
@@ -477,6 +575,7 @@ where
     ) -> Self {
         let query = config.initial_query.clone();
         let query_cursor = query.len();
+        let searched_query = query.clone();
         config.bindings = resolved_bindings(config.bindings);
         Self {
             id: Id::new(id),
@@ -498,6 +597,7 @@ where
             visible_result_rows: 7,
             icons: IconCache::default(),
             row_icon: None,
+            command_rows: None,
             visible_preview_rows: 12,
             external_preview: false,
             preview_rect: None,
@@ -519,7 +619,308 @@ where
             result_actions_enabled: true,
             cursor_scroll_padding: crate::copy_mode::SCROLL_PADDING_ROWS,
             preview_line_count: 0,
+            query_commands: Vec::new(),
+            searched_query,
+            command_mode: false,
+            command_line: String::new(),
+            command_error: None,
+            command_selected: 0,
+            command_clicked: None,
+            command_preview: None,
+            previewed_command: None,
+            preview_follows_end: false,
+            preview_following: true,
+            command_output: None,
         }
+    }
+    /// Register the commands typed in command mode, such as
+    /// `GrepClaudeSessions fn main`. [`PickerAction::ToggleCommandMode`]
+    /// (Ctrl+;) switches the query box between searching and a command line,
+    /// as does typing `> ` or `: ` at the start of a search; the prompt shows
+    /// `:` in command mode. In command mode the results area lists the commands
+    /// whose names match what is typed; Up and Down select one and Tab or
+    /// Enter types its name. The rest of the line is the argument, verbatim.
+    /// Enter on a valid command line reports [`PickerEvent::Command`]
+    /// instead of accepting a result, and Ctrl+Enter reports it as the
+    /// command's alternate, for a second action such as copying. The search
+    /// before command mode, with its results and selection, comes back on
+    /// leaving it. With no commands, there is no command mode and `> ` and
+    /// `: ` are ordinary search text.
+    pub fn set_query_commands(&mut self, commands: Vec<QueryCommand>) {
+        self.query_commands = commands;
+        self.command_error = None;
+        if self.query_commands.is_empty() {
+            self.set_command_mode(false);
+        }
+    }
+    /// Mark results that stand for query commands, such as a commands list
+    /// that also lists its query commands: `rows` names the command a result
+    /// stands for. Accepting such a result does what completing the command's
+    /// name does: one with an argument enters command mode with `Name `
+    /// typed, ready for the argument, and one without reports
+    /// [`PickerEvent::Command`]. Other results are accepted as usual.
+    pub fn set_command_rows(&mut self, rows: Option<CommandRows<S::Item>>) {
+        self.command_rows = rows;
+    }
+    /// Show text after a command line as it is typed, such as a
+    /// calculator's result: `preview` gets the name of a registered command
+    /// and its argument, once the argument is not empty. It runs on the UI
+    /// thread when the line changes, so it must be quick; `None` shows
+    /// nothing. The hint's text is dim, after the cursor, as the argument
+    /// placeholder is, and Right arrow at the end of the line makes its
+    /// `completion` the argument.
+    pub fn set_command_preview(&mut self, preview: Option<CommandPreview>) {
+        self.command_preview = preview;
+        self.previewed_command = None;
+    }
+    /// The line Right arrow at its end completes to: the selected command's
+    /// name while a name is typed that starts it, or the host's completion
+    /// of the argument.
+    fn ghost_completion(&self) -> Option<String> {
+        if !self.command_mode || self.command_error.is_some() {
+            return None;
+        }
+        let line = query_command::parse(&self.query);
+        match line.argument {
+            None => {
+                let command = *self.listed_commands().get(self.command_selected)?;
+                name_rest(&command.name, line.name)?;
+                Some(if command.argument.is_some() {
+                    format!("{} ", command.name)
+                } else {
+                    command.name.clone()
+                })
+            }
+            Some(argument) if !argument.is_empty() => {
+                let (previewed, hint) = self.previewed_command.as_ref()?;
+                let completion = hint.as_ref()?.completion.as_ref()?;
+                (*previewed == self.query && completion != argument)
+                    .then(|| format!("{} {completion}", line.name))
+            }
+            Some(_) => None,
+        }
+    }
+    /// Keep a growing preview's end in view, as a terminal does, for a
+    /// preview of output that is still arriving, such as a streamed answer:
+    /// when the source publishes a new version of the selected result, the
+    /// preview keeps its place instead of starting again at the top, and
+    /// moves to the new end while it was showing the end. Scrolling up stops
+    /// following until the preview is scrolled back to the end.
+    pub fn set_preview_follows_end(&mut self, follow: bool) {
+        self.preview_follows_end = follow;
+    }
+    /// Show a command's output in the preview pane, below the command line,
+    /// such as an answer that streams in after Enter on
+    /// [`PickerEvent::Command`]. The pane opens if it was hidden, and the
+    /// output follows its end as it grows, as a preview with
+    /// [`Picker::set_preview_follows_end`] does. Ctrl+Up and Ctrl+Down scroll it,
+    /// Ctrl+W enters copy mode on it, Ctrl+Shift+C copies all of it, and
+    /// so does Ctrl+C while no command-line text is selected. The command
+    /// line stays editable: Enter runs it again, and its output replaces
+    /// this one. Esc dismisses the output and keeps the line, as does
+    /// leaving command mode. Outside command mode the output is dismissed
+    /// at once.
+    pub fn show_command_output(&mut self, ctx: &Context, output: crate::CommandOutput) {
+        if !self.command_mode {
+            output.close();
+            return;
+        }
+        // The output before this one is dismissed, and its state carried over.
+        let previous = self.command_output.take();
+        self.leave_preview_focus();
+        let opened_preview = match &previous {
+            Some(previous) => previous.opened_preview,
+            None => !std::mem::replace(&mut self.config.preview_visible, true),
+        };
+        let search_scroll_offset = previous
+            .as_ref()
+            .map_or(self.scroll_offset, |previous| previous.search_scroll_offset);
+        drop(previous);
+        output.attach(ctx);
+        self.command_output = Some(ShownOutput {
+            output,
+            laid_out: None,
+            search_scroll_offset,
+            opened_preview,
+        });
+        self.preview_following = true;
+        self.scroll_offset = 0;
+        ctx.request_repaint();
+    }
+    /// Whether a command's output is shown; see [`Picker::show_command_output`].
+    pub fn command_output_shown(&self) -> bool {
+        self.command_output.is_some()
+    }
+    /// Dismiss the command's output, if any, as Esc does.
+    pub fn dismiss_command_output(&mut self) {
+        let Some(shown) = self.command_output.take() else {
+            return;
+        };
+        self.leave_preview_focus();
+        self.scroll_offset = shown.search_scroll_offset;
+        self.preview_following = true;
+        if shown.opened_preview {
+            self.config.preview_visible = false;
+        }
+    }
+    /// Lay out the command's output for the preview pane when it changed, as
+    /// a viewport that stays at the end while following it.
+    fn refresh_command_output(&mut self, width: f32, appearance: &Appearance) {
+        let cell_width = appearance.typography.cell_width.max(1.0);
+        let width = width - self.preview_gutter_columns() as f32 * cell_width;
+        let columns = (width / cell_width).floor().clamp(1.0, 4096.0) as u16;
+        let rows = self.visible_preview_rows.max(1);
+        let Some(shown) = &mut self.command_output else {
+            return;
+        };
+        // Copy mode keeps the document it opened on until it is left.
+        if self.preview_focus {
+            return;
+        }
+        let (version, document, _) = shown.output.current();
+        let current = shown
+            .laid_out
+            .is_some_and(|(shown_version, shown_columns, shown_rows, empty)| {
+                (shown_version, shown_columns, shown_rows) == (version, columns, rows)
+                    && (empty || self.preview_viewport.is_some())
+            });
+        if current {
+            return;
+        }
+        let layout = document.and_then(|document| {
+            document
+                .layout(columns as usize, &crate::Cancellation::never())
+                .ok()
+        });
+        let total = layout.as_ref().map_or(0, |layout| layout.total_rows());
+        let last_page = total.saturating_sub(rows);
+        let top = if self.preview_following {
+            last_page
+        } else {
+            self.scroll_offset.min(last_page)
+        };
+        shown.laid_out = Some((version, columns, rows, total == 0));
+        self.scroll_offset = top;
+        self.preview_viewport = layout.and_then(|layout| {
+            let mut copy = crate::preview_copy::PreviewCopyMode::host(layout, top, rows)?;
+            copy.set_scroll_padding(self.cursor_scroll_padding);
+            Some(copy)
+        });
+    }
+    /// Copy all of the command's output, as Ctrl+Shift+C does.
+    fn copy_command_output(&mut self, ctx: &Context) -> bool {
+        let Some(viewport) = self
+            .preview_viewport
+            .as_ref()
+            .filter(|_| self.command_output.is_some())
+        else {
+            return false;
+        };
+        viewport.copy_all(ctx);
+        self.notify_copied_value(ctx, "");
+        self.copy_notice = "Copied the output".into();
+        true
+    }
+    /// Say why the host could not run the command line, as ghost text in the
+    /// error color, as for an unknown command, until the line changes.
+    pub fn set_command_error(&mut self, ctx: &Context, error: impl Into<String>) {
+        if self.command_mode {
+            self.command_error = Some(error.into());
+            ctx.request_repaint();
+        }
+    }
+    /// The preview of the command line, made once per line.
+    fn refresh_command_preview(&mut self) {
+        if self
+            .previewed_command
+            .as_ref()
+            .is_some_and(|(line, _)| *line == self.query)
+        {
+            return;
+        }
+        let hint = self.command_preview.as_ref().and_then(|preview| {
+            let (command, argument) = self.typed_command()?;
+            (!argument.is_empty())
+                .then(|| preview(&command.name, argument))
+                .flatten()
+        });
+        self.previewed_command = Some((self.query.clone(), hint));
+    }
+    /// Enter command mode with `line` typed and the cursor after it, as if
+    /// the user had typed it.
+    pub fn start_command(&mut self, ctx: &Context, line: impl Into<String>) {
+        self.set_command_mode(true);
+        if self.command_mode {
+            self.set_query(line);
+            self.store_query_cursor(ctx);
+            ctx.request_repaint();
+        }
+    }
+    /// Report accepting `selection`, or start the query command it stands for.
+    fn accept(&mut self, ctx: &Context, selection: Selection<S::Item>) -> Option<PickerEvent<S::Item>> {
+        let command = self
+            .command_rows
+            .as_ref()
+            .and_then(|rows| rows(&selection))
+            .and_then(|name| self.query_commands.iter().find(|command| command.name == name))
+            .cloned();
+        match command {
+            None => Some(PickerEvent::Accepted(selection)),
+            Some(command) if command.argument.is_some() => {
+                self.start_command(ctx, format!("{} ", command.name));
+                None
+            }
+            Some(command) => Some(PickerEvent::Command {
+                name: command.name,
+                argument: String::new(),
+                alternate: false,
+            }),
+        }
+    }
+    /// Whether the query box holds a command line rather than a search.
+    pub fn command_mode(&self) -> bool {
+        self.command_mode
+    }
+    /// Switch between searching and a command line, keeping each one's text
+    /// for the next switch. Command mode needs registered commands.
+    pub fn set_command_mode(&mut self, on: bool) {
+        if on == self.command_mode || (on && self.query_commands.is_empty()) {
+            return;
+        }
+        self.dismiss_command_output();
+        self.leave_preview_focus();
+        let restored = if on {
+            std::mem::take(&mut self.command_line)
+        } else {
+            self.command_line = std::mem::take(&mut self.query);
+            self.searched_query.clone()
+        };
+        self.command_mode = on;
+        self.command_error = None;
+        self.command_selected = 0;
+        self.dismissed_completion = None;
+        self.suggestions.clear();
+        self.suggestion_selected = 0;
+        self.focus_query = true;
+        // The search query is restored as it was searched, so this does not
+        // search again.
+        self.set_query(restored);
+        self.query_cursor = self.query.len();
+    }
+    fn search_query(&mut self) {
+        self.searched_query = self.query.clone();
+        self.revision = self.session.set_query(self.query.clone());
+        self.selected = 0;
+        self.visible_start = 0;
+        self.scroll_offset = 0;
+        if let Some(preview) = &mut self.preview {
+            preview.document_selection = None;
+        }
+        // Clearing the published document identity also invalidates its request key.
+        // The same selected item must be republished for copy/quick-select access.
+        self.preview_key = None;
+        // Keep old rows and preview painted while the new query runs.
+        // selection() still rejects acceptance until the revision matches.
     }
     /// Change sources without clearing the presented rows or preview. Stale
     /// selections remain disabled until the replacement has results or finishes.
@@ -531,9 +932,18 @@ where
     ) {
         self.leave_preview_focus();
         self.session.stop();
+        // A new source starts with a search.
+        self.command_mode = false;
         self.query = query.into();
         self.query_cursor = self.query.len();
-        self.session = Session::new(provider, self.query.clone(), self.config.sort, ctx.clone());
+        self.command_error = None;
+        self.searched_query = self.query.clone();
+        self.session = Session::new(
+            provider,
+            self.searched_query.clone(),
+            self.config.sort,
+            ctx.clone(),
+        );
         self.revision = 0;
         self.transition_pending = true;
         if let Some(displayed) = &mut self.displayed {
@@ -626,33 +1036,48 @@ where
     pub fn set_error(&mut self, error: Option<String>) {
         self.error = error;
     }
+    /// The query box's text: the search, or the command line in command mode.
     pub fn query(&self) -> &str {
         &self.query
     }
+    /// Set the query box's text. In command mode this is the command line.
+    /// With commands registered, a search becoming `> ` or `: ` (typed or pasted
+    /// into an empty query) switches to command mode, with what follows as
+    /// the command line.
     pub fn set_query(&mut self, query: impl Into<String>) {
         let query = query.into();
-        if query != self.query {
-            self.leave_preview_focus();
-            self.query = query;
-            self.query_cursor = self.query.len();
-            self.suggestion_selected = 0;
-            self.dismissed_completion = None;
-            self.revision = self.session.set_query(self.query.clone());
-            self.selected = 0;
-            self.visible_start = 0;
-            self.scroll_offset = 0;
-            if let Some(preview) = &mut self.preview {
-                preview.document_selection = None;
-            }
-            // Clearing the published document identity also invalidates its request key.
-            // The same selected item must be republished for copy/quick-select access.
-            self.preview_key = None;
-            // Keep old rows and preview painted while the new query runs.
-            // selection() still rejects acceptance until the revision matches.
+        if query == self.query {
+            return;
+        }
+        let shortcut = !self.command_mode
+            && !self.query_commands.is_empty()
+            && (self.query.is_empty() || query_command::shortcut_started(&self.query));
+        if shortcut && let Some(line) = query_command::strip_shortcut(&query) {
+            self.command_line = line.to_owned();
+            self.query = self.searched_query.clone();
+            self.set_command_mode(true);
+            return;
+        }
+        self.leave_preview_focus();
+        self.query = query;
+        self.query_cursor = self.query.len();
+        self.suggestion_selected = 0;
+        self.dismissed_completion = None;
+        self.command_error = None;
+        self.command_selected = 0;
+        // A `>` or `:` typed into an empty search may start a shortcut; it
+        // is searched once something other than a space follows.
+        let shortcut_started = shortcut && query_command::shortcut_started(&self.query);
+        if !self.command_mode && !shortcut_started && self.query != self.searched_query {
+            self.search_query();
         }
     }
     pub fn completions(&self, cursor: usize) -> Vec<nfm_search_core::store::SearchCompletion> {
         if !self.query.is_char_boundary(cursor) {
+            return Vec::new();
+        }
+        // Command mode lists its commands in the results area instead.
+        if self.command_mode() {
             return Vec::new();
         }
         self.completion_snapshot
@@ -660,6 +1085,95 @@ where
             .map_or_else(Vec::new, |snapshot| {
                 snapshot.completions(&self.query, cursor)
             })
+    }
+    /// The commands command mode lists: those whose names match the name
+    /// typed, best first, or once a space ends the name, the one it names.
+    fn listed_commands(&self) -> Vec<&QueryCommand> {
+        let line = query_command::parse(&self.query);
+        if line.argument.is_some() {
+            self.query_commands
+                .iter()
+                .filter(|command| command.name == line.name)
+                .collect()
+        } else {
+            query_command::matching(&self.query_commands, line.name)
+        }
+    }
+    /// The host's choices for the command line, listed under its command.
+    fn command_choices(&self) -> &[CommandChoice] {
+        self.previewed_command
+            .as_ref()
+            .filter(|(line, _)| *line == self.query)
+            .and_then(|(_, hint)| hint.as_ref())
+            .map_or(&[], |hint| hint.choices.as_slice())
+    }
+    /// Rows in command mode: the listed commands, then the choices.
+    fn command_rows_len(&self) -> usize {
+        self.listed_commands().len() + self.command_choices().len()
+    }
+    fn move_command_selection(&mut self, delta: isize) {
+        let len = self.command_rows_len();
+        self.command_selected = self
+            .command_selected
+            .saturating_add_signed(delta)
+            .min(len.saturating_sub(1));
+    }
+    /// Tab or Enter (`run`) on listed command `row`: type its name, then a
+    /// space when it takes an argument. Enter runs a command without one,
+    /// and runs the command line once the name is typed. Returns the event
+    /// and whether the command line should run.
+    fn pick_command(
+        &mut self,
+        ctx: &Context,
+        row: usize,
+        run: bool,
+        alternate: bool,
+    ) -> (Option<PickerEvent<S::Item>>, bool) {
+        let line = query_command::parse(&self.query);
+        let listed = self.listed_commands();
+        // A choice: Ctrl+Enter copies its value; Enter or Tab makes it the
+        // argument.
+        if let Some(choice) = row
+            .checked_sub(listed.len())
+            .and_then(|choice| self.command_choices().get(choice))
+            .cloned()
+        {
+            if alternate {
+                ctx.copy_text(choice.value.clone());
+                self.notify_copied_value(ctx, &choice.value);
+            } else {
+                self.set_query(format!("{} {}", line.name, choice.value));
+                self.store_query_cursor(ctx);
+                ctx.request_repaint();
+            }
+            return (None, false);
+        }
+        let command = line
+            .argument
+            .is_none()
+            .then(|| listed.get(row.min(listed.len().saturating_sub(1))).cloned())
+            .flatten()
+            .cloned();
+        match command {
+            None => (None, run),
+            Some(command) if command.argument.is_some() => {
+                self.set_query(format!("{} ", command.name));
+                self.store_query_cursor(ctx);
+                ctx.request_repaint();
+                (None, false)
+            }
+            Some(command) => {
+                self.set_query(command.name.clone());
+                self.store_query_cursor(ctx);
+                ctx.request_repaint();
+                let event = run.then(|| PickerEvent::Command {
+                    name: command.name,
+                    argument: String::new(),
+                    alternate,
+                });
+                (event, false)
+            }
+        }
     }
     pub fn apply_completion(
         &mut self,
@@ -728,7 +1242,7 @@ where
                 ctx.fonts_mut(|fonts| {
                     fonts
                         .layout_no_wrap(
-                            s.text.clone(),
+                            completion_label(s),
                             appearance.typography.normal.clone(),
                             appearance.palette.text,
                         )
@@ -801,12 +1315,22 @@ where
                                     appearance.palette.selection_background,
                                 );
                             }
-                            let job = highlighted_layout(
+                            let mut job = highlighted_layout(
                                 &suggestion.text,
                                 &suggestion.positions,
                                 selected,
                                 appearance,
                             );
+                            if !suggestion.detail.is_empty() {
+                                job.append(
+                                    &format!("{DETAIL_GAP}{}", suggestion.detail),
+                                    0.0,
+                                    egui::TextFormat::simple(
+                                        appearance.typography.normal.clone(),
+                                        appearance.palette.muted,
+                                    ),
+                                );
+                            }
                             let galley = ui.painter().layout_job(job);
                             ui.painter().with_clip_rect(rect.intersect(bounds)).galley(
                                 egui::pos2(rect.left(), rect.center().y - galley.size().y / 2.0),
@@ -832,6 +1356,54 @@ where
                 ctx.request_repaint();
             }
         }
+    }
+    /// The command a finished command-line name names.
+    fn typed_command(&self) -> Option<(&QueryCommand, &str)> {
+        if !self.command_mode() {
+            return None;
+        }
+        let line = query_command::parse(&self.query);
+        let argument = line.argument?;
+        let command = self
+            .query_commands
+            .iter()
+            .find(|command| command.name == line.name)?;
+        Some((command, argument))
+    }
+    /// Dim text after the command line: why Enter did not run it, in the
+    /// error color, the rest of the selected command's name while one is
+    /// typed, `<argument>` while a command's argument is empty, or the
+    /// host's preview of the line.
+    fn ghost_text(&self, appearance: &Appearance) -> Option<(String, egui::Color32)> {
+        if !self.command_mode {
+            return None;
+        }
+        if let Some(error) = &self.command_error {
+            // Apart from the text, unless it ends with the space after a name.
+            let gap = if self.query.is_empty() || self.query.ends_with(' ') {
+                ""
+            } else {
+                "  "
+            };
+            return Some((format!("{gap}{error}"), appearance.palette.error));
+        }
+        let line = query_command::parse(&self.query);
+        if line.argument.is_none() {
+            // The rest of the selected command's name, which Right completes.
+            let command = *self.listed_commands().get(self.command_selected)?;
+            let rest = name_rest(&command.name, line.name)?;
+            return Some((rest.to_owned(), appearance.palette.muted));
+        }
+        let (command, argument) = self.typed_command()?;
+        if !argument.is_empty() {
+            let (line, hint) = self.previewed_command.as_ref()?;
+            return (*line == self.query)
+                .then(|| hint.as_ref())
+                .flatten()
+                .map(|hint| (format!("  {}", hint.text), appearance.palette.muted));
+        }
+        let spec = command.argument.as_ref()?;
+        Some((format!("<{}>", spec.name), appearance.palette.muted))
     }
     /// Add host actions to the shared keyboard help overlay.
     /// True while keyboard input navigates and selects preview text.
@@ -953,7 +1525,8 @@ where
     }
 
     fn ensure_preview_viewport(&mut self) {
-        if self.preview_viewport.is_some() {
+        // A command's output is laid out with the pane's width when shown.
+        if self.preview_viewport.is_some() || self.command_mode {
             return;
         }
         if !self.config.preview_visible
@@ -1029,6 +1602,10 @@ where
         };
         let mut rows: Vec<PaletteRow> = PickerAction::BUILT_IN
             .into_iter()
+            // Command mode needs commands to type.
+            .filter(|action| {
+                *action != PickerAction::ToggleCommandMode || !self.query_commands.is_empty()
+            })
             .map(|action| PaletteRow {
                 keys: keys(action),
                 title: action.title().unwrap_or_default().into(),
@@ -1192,10 +1769,18 @@ where
             preview.stop();
         }
     }
+    /// Whether the shown results are for the search in the query box. In
+    /// command mode the box holds a command line, and the results are those
+    /// of the search before it.
     fn current_results(&self) -> bool {
+        let searching = if self.command_mode {
+            &self.searched_query
+        } else {
+            &self.query
+        };
         self.displayed
             .as_ref()
-            .is_some_and(|d| d.revision == self.revision && d.query == self.query)
+            .is_some_and(|d| d.revision == self.revision && &d.query == searching)
     }
     fn displayed_selection(&self) -> Option<Selection<S::Item>> {
         let displayed = self.displayed.as_ref()?;
@@ -1238,6 +1823,30 @@ where
     fn binding_applies(&self, action: PickerAction) -> bool {
         use PickerAction::*;
         let focused = self.preview_focused();
+        // A command's output takes the preview's keys, except copying a
+        // result, which there is none of.
+        if self.command_output.is_some() && matches!(action, CopySelection | Custom(_)) {
+            return false;
+        }
+        // Command mode shows commands, not the results and preview these
+        // act on; their keys go to the command line instead.
+        if self.command_mode
+            && self.command_output.is_none()
+            && matches!(
+                action,
+                TogglePreviewFocus
+                    | QuickSelect
+                    | CopySelection
+                    | CopyPreviewDocument
+                    | ScrollPreviewPageUp
+                    | ScrollPreviewPageDown
+                    | ScrollPreviewLineUp
+                    | ScrollPreviewLineDown
+                    | Custom(_)
+            )
+        {
+            return false;
+        }
         match action {
             CopySelection
             | ScrollPreviewPageUp
@@ -1245,6 +1854,7 @@ where
             | ScrollPreviewLineUp
             | ScrollPreviewLineDown => !focused,
             CopyPreviewDocument => focused,
+            ToggleCommandMode => !focused && !self.query_commands.is_empty(),
             // Ctrl+P moves to the previous match while copy-mode search is open.
             TogglePreview => {
                 !(focused
@@ -1280,6 +1890,9 @@ where
             TogglePreview => {
                 self.config.preview_visible = !self.config.preview_visible;
                 self.full_pane_preview = false;
+                if let Some(shown) = &mut self.command_output {
+                    shown.opened_preview = false;
+                }
                 if !self.config.preview_visible {
                     self.leave_preview_focus();
                     if let Some(preview) = &mut self.preview {
@@ -1291,6 +1904,13 @@ where
             TogglePreviewFocus => self.toggle_preview_focus(ctx),
             QuickSelect => self.quick_select(ctx),
             CopySelection => *copy = true,
+            CopyPreviewDocument if self.copy_command_output(ctx) => {
+                ctx.input_mut(|input| {
+                    input
+                        .events
+                        .retain(|event| !matches!(event, egui::Event::Copy))
+                });
+            }
             CopyPreviewDocument => {
                 self.ensure_preview_viewport();
                 if let Some(viewport) = &self.preview_viewport {
@@ -1331,6 +1951,11 @@ where
                 });
             }
             TogglePreviewWrap => self.set_preview_wrap(ctx, !self.config.preview_wrap),
+            ToggleCommandMode => {
+                self.set_command_mode(!self.command_mode);
+                self.store_query_cursor(ctx);
+                ctx.request_repaint();
+            }
             ToggleFullPane => {
                 self.placement_override = if self.placement_override.is_some() {
                     None
@@ -1343,7 +1968,7 @@ where
                 };
                 // Full pane gives its extra height to the preview, so show an
                 // available preview that is hidden, and hide it again on exit.
-                let has_preview = self.preview.is_some() || self.external_preview;
+                let has_preview = self.preview_available();
                 if self.effective_position(configured) == crate::Position::FullPane {
                     if has_preview && !self.config.preview_visible {
                         self.config.preview_visible = true;
@@ -1431,7 +2056,10 @@ where
                 .results
                 .get(self.selected)
                 .map(|r| r.node_index);
-            if old_index != new_index || !same_query || !stable_indices {
+            // A growing preview's new version stays in copy mode, which
+            // keeps the document it opened on until it is left.
+            let grows = self.preview_follows_end && same_query && old_index == new_index;
+            if old_index != new_index || !same_query || (!stable_indices && !grows) {
                 self.leave_preview_focus();
             }
             self.completion_snapshot = Some(update.snapshot.clone());
@@ -1486,21 +2114,45 @@ where
     /// Scroll the preview by `delta` rows, stopping at either end.
     fn scroll_preview_rows(&mut self, delta: isize) {
         let rows = self.visible_preview_rows.max(1);
+        let total = if self.command_mode {
+            self.preview_viewport
+                .as_ref()
+                .map(|viewport| viewport.total_rows() as usize)
+        } else {
+            match self.preview.as_ref().and_then(|p| p.document.as_ref()) {
+                Some(Ok(Preview::Grid { total_rows, .. })) => Some(*total_rows),
+                _ => None,
+            }
+        };
         if let Some(viewport) = &mut self.preview_viewport {
             viewport.scroll(delta, rows);
             self.scroll_offset = viewport.top as usize;
+        } else if let Some(total) = total {
+            self.scroll_offset = self
+                .scroll_offset
+                .saturating_add_signed(delta)
+                .min(total.saturating_sub(rows));
+        } else {
             return;
         }
-        let Some(Ok(Preview::Grid { total_rows, .. })) =
-            self.preview.as_ref().and_then(|p| p.document.as_ref())
-        else {
-            return;
-        };
-        let total = *total_rows;
-        self.scroll_offset = self
-            .scroll_offset
-            .saturating_add_signed(delta)
-            .min(total.saturating_sub(rows));
+        // Scrolling up leaves a growing preview's end; scrolling down to it
+        // follows again. Copy-mode scrolling stops a row short of the end.
+        if delta < 0 {
+            self.preview_following = false;
+        } else if total.is_some_and(|total| self.scroll_offset + rows + 1 >= total) {
+            self.preview_following = true;
+        }
+    }
+    /// Whether a growing preview has a newer version than the one shown, as
+    /// after copy mode, which keeps the document it opened on.
+    fn preview_grew(&self) -> bool {
+        self.preview_follows_end
+            && self
+                .preview_key
+                .zip(self.selection())
+                .is_some_and(|(key, selection)| {
+                    key.0 != 0 && key.1 == selection.index && key.0 != selection.source_version
+                })
     }
     fn refresh_preview(&mut self, width: f32, appearance: &Appearance) {
         let cell_width = appearance.typography.cell_width.max(1.0);
@@ -1512,9 +2164,10 @@ where
             // cache must not suppress width-aware provider requests on resize.
             if self.preview_focus
                 || self.preview.is_none()
-                || self
+                || (self
                     .preview_key
                     .is_some_and(|key| key.2 == columns && key.3 == rows)
+                    && !self.preview_grew())
             {
                 return;
             }
@@ -1543,6 +2196,21 @@ where
         } else {
             selection.source_version
         };
+        // A new version of the shown result continues its preview: from the
+        // same place, or from the new end while the end was in view.
+        let continues = self.preview_follows_end
+            && preview
+                .document_selection
+                .is_some_and(|(shown, index)| index == selection.index && shown != version);
+        if continues {
+            if self.preview_following {
+                // The provider stops at the last page.
+                self.scroll_offset = usize::MAX / 2;
+            }
+        } else if preview.document_selection != Some((version, selection.index)) {
+            // Another result's preview starts out following.
+            self.preview_following = true;
+        }
         let key = (
             version,
             selection.index,
@@ -1555,7 +2223,8 @@ where
         if self.preview_key != Some(key) {
             self.preview_key = Some(key);
             preview.request(PreviewRequest {
-                initial_page: preview.document_selection != Some((version, selection.index)),
+                initial_page: !continues
+                    && preview.document_selection != Some((version, selection.index)),
                 document_version: version,
                 selection,
                 columns,
@@ -1567,7 +2236,23 @@ where
             });
         }
     }
+    /// Whether the picker has a preview pane to show: in command mode, the
+    /// pane keeps its space even with no command's output in it.
+    fn preview_available(&self) -> bool {
+        self.preview.is_some()
+            || self.external_preview
+            || (self.command_mode && self.command_output.is_some())
+    }
     fn busy(&self) -> bool {
+        if self.command_mode {
+            // Listed commands never load; a command's output does until it
+            // is finished.
+            return !self.closed
+                && self
+                    .command_output
+                    .as_ref()
+                    .is_some_and(|shown| !shown.output.current().2);
+        }
         !self.closed
             && (!self.current_results()
                 || self.displayed.as_ref().is_none_or(|d| !d.done)
@@ -1579,6 +2264,11 @@ where
         // query and selected row never move when asynchronous content arrives.
         let height =
             self.visible_preview_rows as f32 * appearance.typography.preview_row_height(ui.ctx());
+        if self.command_mode && self.command_output.is_none() {
+            // Nothing previews a command; the pane keeps its space.
+            ui.allocate_exact_size(egui::vec2(ui.available_width(), height), egui::Sense::hover());
+            return;
+        }
         self.preview_rect = Some(
             egui::Rect::from_min_size(ui.cursor().min, egui::vec2(ui.available_width(), height))
                 .intersect(ui.clip_rect()),
@@ -1633,6 +2323,9 @@ where
     }
     /// Lines of the worker's page, which is painted while there is no viewport.
     fn page_lines(&self) -> Option<&crate::preview::GridLines> {
+        if self.command_mode {
+            return None;
+        }
         match self.preview.as_ref()?.document.as_ref()? {
             Ok(Preview::Grid { lines, .. }) => lines.as_ref(),
             _ => None,
@@ -1656,6 +2349,10 @@ where
             }
             self.preview_line_count = copy.line_count();
             return copy.line_numbers(rows, numbers, self.preview_focus);
+        }
+        if self.command_mode {
+            // A command's output with nothing in it yet.
+            return Vec::new();
         }
         match self
             .preview
@@ -1736,6 +2433,10 @@ where
                         );
                     });
             });
+            return;
+        }
+        if self.command_mode {
+            self.command_list_ui(ui, appearance);
             return;
         }
         // Rows are rebuilt every frame. Input lines are capped (16 KiB by
@@ -1935,34 +2636,12 @@ where
                 );
             }
         }
-        if self
-            .copied_until
-            .is_some_and(|until| until > Instant::now())
-            && let Some(top) = first_rect
-        {
+        if let Some(top) = first_rect {
             let results_rect = egui::Rect::from_min_size(
                 top.min,
                 egui::vec2(top.width(), self.visible_result_rows as f32 * result_height),
             );
-            let galley = ui.painter().layout(
-                self.copy_notice.clone(),
-                appearance.typography.normal.clone(),
-                appearance.palette.success,
-                (results_rect.width() - 32.0).max(1.0),
-            );
-            let toast = egui::Rect::from_center_size(
-                results_rect.center(),
-                galley.size() + egui::vec2(16.0, 6.0),
-            );
-            let painter = ui
-                .painter()
-                .with_clip_rect(results_rect.intersect(ui.clip_rect()));
-            painter.rect_filled(toast, 3, appearance.palette.selection_background);
-            painter.galley(
-                toast.min + egui::vec2(8.0, 3.0),
-                galley,
-                appearance.palette.success,
-            );
+            self.paint_copy_notice(ui, results_rect, appearance);
         }
         let hovered = first_rect.is_some_and(|first| {
             ui.rect_contains_pointer(egui::Rect::from_min_size(
@@ -1984,6 +2663,184 @@ where
             self.move_selection(if wheel > 0.0 { 1 } else { -1 });
         }
     }
+    /// The "Copied" notice, centered over `results_rect`, while it lasts.
+    fn paint_copy_notice(&self, ui: &egui::Ui, results_rect: egui::Rect, appearance: &Appearance) {
+        if self.copied_until.is_none_or(|until| until <= Instant::now()) {
+            return;
+        }
+        let galley = ui.painter().layout(
+            self.copy_notice.clone(),
+            appearance.typography.normal.clone(),
+            appearance.palette.success,
+            (results_rect.width() - 32.0).max(1.0),
+        );
+        let toast = egui::Rect::from_center_size(
+            results_rect.center(),
+            galley.size() + egui::vec2(16.0, 6.0),
+        );
+        let painter = ui
+            .painter()
+            .with_clip_rect(results_rect.intersect(ui.clip_rect()));
+        painter.rect_filled(toast, 3, appearance.palette.selection_background);
+        painter.galley(
+            toast.min + egui::vec2(8.0, 3.0),
+            galley,
+            appearance.palette.success,
+        );
+    }
+    /// Command mode's results: the listed commands, one per result slot so
+    /// the layout stays as it was. Each row shows the command's signature,
+    /// with the typed letters highlighted, and its description; once the
+    /// name is typed, also its argument's.
+    fn command_list_ui(&mut self, ui: &mut egui::Ui, appearance: &Appearance) {
+        let line = query_command::parse(&self.query);
+        let named = line.argument.is_some();
+        let typed = line.name.to_lowercase();
+        let commands: Vec<QueryCommand> = self.listed_commands().into_iter().cloned().collect();
+        let choices = self.command_choices().to_vec();
+        let rows = commands.len() + choices.len();
+        let slot_height = self.result_row_height(ui.ctx(), appearance);
+        let row_height = appearance.typography.preview_row_height(ui.ctx());
+        let visible = self.visible_result_rows.max(1);
+        self.command_selected = self.command_selected.min(rows.saturating_sub(1));
+        let first = self
+            .command_selected
+            .saturating_sub(visible - 1)
+            .min(rows.saturating_sub(visible));
+        let results_rect = egui::Rect::from_min_size(
+            ui.cursor().min,
+            egui::vec2(ui.available_width(), visible as f32 * slot_height),
+        );
+        for slot in 0..visible {
+            let index = if self.config.layout == Layout::QueryBottom {
+                first + visible - 1 - slot
+            } else {
+                first + slot
+            };
+            let (rect, _) = ui.allocate_exact_size(
+                egui::vec2(ui.available_width(), slot_height),
+                egui::Sense::hover(),
+            );
+            let painter = ui.painter().with_clip_rect(rect.intersect(ui.clip_rect()));
+            let selected = index == self.command_selected;
+            let paint_selection = |painter: &egui::Painter| {
+                painter.rect_filled(rect, 4, appearance.palette.selection_background);
+                painter.rect_filled(
+                    egui::Rect::from_center_size(
+                        egui::pos2(rect.left() + 1.5, rect.center().y),
+                        egui::vec2(3.0, 16.0),
+                    ),
+                    1.5,
+                    appearance.palette.accent,
+                );
+            };
+            let icon_size = (row_height - 2.0).max(1.0);
+            if let Some(choice) = index
+                .checked_sub(commands.len())
+                .and_then(|choice| choices.get(choice))
+            {
+                // A choice, lined up with the command's text above it.
+                if selected {
+                    paint_selection(&painter);
+                }
+                painter.text(
+                    egui::pos2(rect.left() + 12.0 + icon_size + CARD_ICON_GAP, rect.center().y),
+                    egui::Align2::LEFT_CENTER,
+                    &choice.text,
+                    appearance.typography.normal.clone(),
+                    if selected {
+                        appearance.palette.selection_text
+                    } else {
+                        appearance.palette.text
+                    },
+                );
+                let response =
+                    ui.interact(rect, self.id.with(("command_choice", index)), egui::Sense::click());
+                if response.clicked() {
+                    self.command_selected = index;
+                    self.command_clicked = Some(index);
+                    self.focus_query = true;
+                }
+                continue;
+            }
+            let Some(command) = commands.get(index) else {
+                // Where the best match would be.
+                if commands.is_empty() && index == 0 {
+                    painter.text(
+                        rect.left_center() + egui::vec2(12.0, 0.0),
+                        egui::Align2::LEFT_CENTER,
+                        format!("No command matches {}", line.name),
+                        appearance.typography.normal.clone(),
+                        appearance.palette.muted,
+                    );
+                }
+                continue;
+            };
+            if selected {
+                paint_selection(&painter);
+            }
+            // The command prompt marks a command, as hosts mark command rows.
+            let size = icon_size;
+            painter.text(
+                egui::pos2(rect.left() + 12.0 + size / 2.0, rect.center().y),
+                egui::Align2::CENTER_CENTER,
+                COMMAND_PROMPT,
+                appearance.typography.normal.clone(),
+                appearance.palette.success,
+            );
+            let positions = if typed.is_empty() || named {
+                Vec::new()
+            } else {
+                resolve_match_positions(&typed, &command.name)
+            };
+            let mut job = highlighted_layout(&command.signature(), &positions, selected, appearance);
+            let mut detail = command.description.clone();
+            if named
+                && let Some(argument) = &command.argument
+                && !argument.description.is_empty()
+            {
+                if !detail.is_empty() {
+                    detail.push_str("  ·  ");
+                }
+                detail.push_str(&format!("<{}> {}", argument.name, argument.description));
+            }
+            if !detail.is_empty() {
+                job.append(
+                    &format!("{DETAIL_GAP}{detail}"),
+                    0.0,
+                    egui::TextFormat::simple(
+                        appearance.typography.normal.clone(),
+                        appearance.palette.muted,
+                    ),
+                );
+            }
+            let galley = painter.layout_job(job);
+            painter.galley(
+                egui::pos2(
+                    rect.left() + 12.0 + size + CARD_ICON_GAP,
+                    rect.center().y - galley.size().y / 2.0,
+                ),
+                galley,
+                appearance.palette.text,
+            );
+            let response = ui.interact(rect, self.id.with(("command", index)), egui::Sense::click());
+            response.widget_info(|| {
+                egui::WidgetInfo::selected(
+                    egui::WidgetType::Button,
+                    ui.is_enabled(),
+                    selected,
+                    command.signature(),
+                )
+            });
+            if response.clicked() {
+                self.command_selected = index;
+                self.command_clicked = Some(index);
+                self.focus_query = true;
+            }
+        }
+        // Hosts confirm what a command copied, such as a calculator result.
+        self.paint_copy_notice(ui, results_rect, appearance);
+    }
     fn query_ui(
         &mut self,
         ui: &mut egui::Ui,
@@ -1995,20 +2852,33 @@ where
     ) {
         let before = self.query.clone();
         let row_height = appearance.typography.preview_row_height(ctx);
+        let command_mode = self.command_mode;
         ui.horizontal(|ui| {
-            let prompt_width =
-                ui.fonts_mut(|fonts| fonts.glyph_width(&appearance.typography.normal, '>'));
+            // The prompt shows the mode: `>` to search, `:` for a command line.
+            let (prompt, color) = if command_mode {
+                (COMMAND_PROMPT, appearance.palette.success)
+            } else {
+                (SEARCH_PROMPT, appearance.palette.accent)
+            };
+            let prompt_width = ui.fonts_mut(|fonts| {
+                fonts
+                    .glyph_width(&appearance.typography.normal, SEARCH_PROMPT)
+                    .max(fonts.glyph_width(&appearance.typography.normal, COMMAND_PROMPT))
+            });
             let (prompt_rect, _) =
                 ui.allocate_exact_size(egui::vec2(prompt_width, row_height), egui::Sense::hover());
             ui.painter().text(
                 prompt_rect.left_center(),
                 egui::Align2::LEFT_CENTER,
-                ">",
+                prompt,
                 appearance.typography.normal.clone(),
-                appearance.palette.accent,
+                color,
             );
             let total = self.displayed.as_ref().map_or(0, |d| d.output.total);
-            let matched = if self.current_results() {
+            let matched = if command_mode {
+                // Listed commands; the status keeps the search count's width.
+                self.listed_commands().len()
+            } else if self.current_results() {
                 self.displayed.as_ref().map_or(0, |d| d.output.matched)
             } else {
                 0
@@ -2019,7 +2889,11 @@ where
                 0 => String::new(),
                 skipped => format!(" · {skipped} skipped"),
             };
-            let count = format!("{matched}/{total}{skipped}");
+            let count = if command_mode {
+                format!("{matched}/{}", self.query_commands.len())
+            } else {
+                format!("{matched}/{total}{skipped}")
+            };
             let count_size = ui
                 .painter()
                 .layout_no_wrap(
@@ -2056,15 +2930,34 @@ where
                 let query = std::mem::replace(&mut self.query, before.clone());
                 self.set_query(query);
             }
-            let cursor = edit.cursor_range.map_or(self.query.len(), |range| {
-                self.query
-                    .char_indices()
-                    .nth(range.primary.index.into())
-                    .map_or(self.query.len(), |(offset, _)| offset)
-            });
-            self.query_cursor = cursor;
+            // Typing `> ` or `: ` switched modes and replaced the text under the
+            // cursor; draw the frame again with the new prompt and text.
+            if self.command_mode != command_mode {
+                self.store_query_cursor(ctx);
+                ctx.request_discard("the query switched to or from command mode");
+            } else {
+                self.query_cursor = edit.cursor_range.map_or(self.query.len(), |range| {
+                    self.query
+                        .char_indices()
+                        .nth(range.primary.index.into())
+                        .map_or(self.query.len(), |(offset, _)| offset)
+                });
+            }
             self.query_rect = edit.response.rect;
             self.query_text_pos = edit.galley_pos;
+            if self.command_mode {
+                self.refresh_command_preview();
+            }
+            if let Some((ghost, color)) = self.ghost_text(appearance) {
+                let rect = edit.response.rect;
+                ui.painter().with_clip_rect(rect.intersect(ui.clip_rect())).text(
+                    egui::pos2(edit.galley_pos.x + edit.galley.size().x, rect.center().y),
+                    egui::Align2::LEFT_CENTER,
+                    ghost,
+                    appearance.typography.normal.clone(),
+                    color,
+                );
+            }
             if !self.preview_focused() {
                 self.refresh_completions();
             }
@@ -2171,6 +3064,17 @@ where
         let mut double_click = false;
         let mut copy = false;
         let mut complete = false;
+        let mut leave_command_line = false;
+        let mut dismiss_output = false;
+        let mut copy_output = false;
+        let query_selected = egui::text_edit::TextEditState::load(ctx, input_id)
+            .and_then(|state| state.cursor.char_range())
+            .is_some_and(|range| !range.is_empty());
+        let mut run_command_line = false;
+        // A listed command row Tab (false) or Enter (true) was pressed on.
+        let mut pick_command = None;
+        // Whether Ctrl+Enter rather than Enter runs the command line.
+        let mut alternate_command = false;
         let direction = if self.config.layout == Layout::QueryBottom {
             -1
         } else {
@@ -2251,12 +3155,35 @@ where
             });
             preview_handled = true;
         }
+        // Right arrow at the end of a command line completes its ghost text,
+        // as a shell's suggestion does; elsewhere it moves the cursor.
+        let ghost_completion = (self.query_cursor == self.query.len())
+            .then(|| self.ghost_completion())
+            .flatten();
+        let mut complete_ghost = None;
         if interactive && !self.closed && focused && !preview_handled {
             ctx.input_mut(|input| {
+                if let Some(line) = ghost_completion
+                    && input.consume_key(Modifiers::NONE, Key::ArrowRight)
+                {
+                    complete_ghost = Some(line);
+                }
                 // Unbound Ctrl+C chords, such as Ctrl+Shift+C outside copy
                 // mode, copy the selected result as they always have.
-                if input.consume_key(Modifiers::CTRL, Key::C) {
+                // In command mode they copy the command line's text instead.
+                if !self.command_mode && input.consume_key(Modifiers::CTRL, Key::C) {
                     copy = true;
+                }
+                // With nothing selected on the command line, Ctrl+C copies
+                // the command's output.
+                if self.command_output.is_some() && !query_selected {
+                    let mut chord = input.consume_key(Modifiers::CTRL, Key::C);
+                    input.events.retain(|event| {
+                        let copies = matches!(event, egui::Event::Copy);
+                        chord |= copies;
+                        !copies
+                    });
+                    copy_output |= chord;
                 }
                 let suggestions_open = !self.suggestions.is_empty();
                 if input.consume_key(Modifiers::NONE, Key::Escape) {
@@ -2265,6 +3192,11 @@ where
                         self.suggestions.clear();
                         self.suggestion_selected = 0;
                         self.focus_query = true;
+                    } else if self.command_output.is_some() {
+                        // Back to the command line, as it was typed.
+                        dismiss_output = true;
+                    } else if self.command_mode() {
+                        leave_command_line = true;
                     } else {
                         event = Some(PickerEvent::Cancelled);
                     }
@@ -2272,12 +3204,23 @@ where
                 if input.consume_key(Modifiers::NONE, Key::Enter) {
                     if suggestions_open {
                         complete = true;
+                    } else if self.command_mode() {
+                        pick_command = Some((self.command_selected, true));
                     } else {
                         accept = true;
                     }
                 }
+                // A command's second action, such as copying a result.
+                if self.command_mode() && input.consume_key(Modifiers::CTRL, Key::Enter) {
+                    pick_command = Some((self.command_selected, true));
+                    alternate_command = true;
+                }
                 if input.consume_key(Modifiers::NONE, Key::Tab) {
-                    complete = true;
+                    if self.command_mode() {
+                        pick_command = Some((self.command_selected, false));
+                    } else {
+                        complete = true;
+                    }
                 }
                 if suggestions_open {
                     if input.consume_key(Modifiers::NONE, Key::ArrowUp) {
@@ -2309,12 +3252,16 @@ where
                     ),
                 ] {
                     if input.consume_key(modifiers, key) {
-                        self.move_selection(delta);
+                        if self.command_mode {
+                            self.move_command_selection(delta);
+                        } else {
+                            self.move_selection(delta);
+                        }
                     }
                 }
 
                 input.events.retain(|e| {
-                    if matches!(e, egui::Event::Copy) {
+                    if !self.command_mode && matches!(e, egui::Event::Copy) {
                         copy = true;
                         false
                     } else {
@@ -2322,6 +3269,22 @@ where
                     }
                 });
             });
+        }
+        if leave_command_line {
+            self.set_command_mode(false);
+            self.store_query_cursor(ctx);
+        }
+        if dismiss_output {
+            self.dismiss_command_output();
+            ctx.request_repaint();
+        }
+        if copy_output {
+            self.copy_command_output(ctx);
+        }
+        if let Some(line) = complete_ghost {
+            self.set_query(line);
+            self.store_query_cursor(ctx);
+            ctx.request_repaint();
         }
         placement.position = self.effective_position(placement.position);
         let row_height = appearance.typography.preview_row_height(ctx);
@@ -2339,9 +3302,13 @@ where
             .and_then(|displayed| displayed.snapshot.header(&self.query));
         let header_height = if header.is_some() { row_height } else { 0.0 };
         let result_height = self.result_row_height(ctx, appearance);
+        let cards = self
+            .displayed
+            .as_ref()
+            .is_some_and(|displayed| displayed.snapshot.row_template().is_some());
         // Room for the preview's divider only when a preview can show.
         let overhead =
-            if (self.preview.is_some() || self.external_preview) && self.config.preview_visible {
+            if self.preview_available() && self.config.preview_visible {
                 PREVIEW_OVERHEAD
             } else {
                 RESULTS_OVERHEAD
@@ -2365,7 +3332,7 @@ where
         self.preview_rect = None;
         self.preview_rendered = false;
         self.visible_preview_rows =
-            if (self.preview.is_some() || self.external_preview) && self.config.preview_visible {
+            if self.preview_available() && self.config.preview_visible {
                 let capacity = (remaining / preview_row_height).floor() as usize;
                 if full_pane {
                     capacity.min(u16::MAX as usize)
@@ -2401,7 +3368,9 @@ where
             }
             + header_height;
         let rect = placement.rect(height);
-        if has_preview {
+        if has_preview && self.command_mode {
+            self.refresh_command_output((rect.width() - PANEL_FRAME_WIDTH).max(1.0), appearance);
+        } else if has_preview {
             self.refresh_preview((rect.width() - PANEL_FRAME_WIDTH).max(1.0), appearance);
         }
         if !self.closed && rect.is_positive() {
@@ -2464,15 +3433,28 @@ where
                                     - block_height;
                                 ui.add_space(gap.max(0.0));
                             }
-                            if let Some(header) = &header {
+                            if header.is_some() && self.command_mode {
+                                // The listed commands have no columns; the
+                                // space stays so the layout does not move.
+                                ui.allocate_exact_size(
+                                    egui::vec2(ui.available_width(), row_height),
+                                    egui::Sense::hover(),
+                                );
+                            } else if let Some(header) = &header {
                                 let (rect, _) = ui.allocate_exact_size(
                                     egui::vec2(ui.available_width(), row_height),
                                     egui::Sense::hover(),
                                 );
+                                // Over its columns, which row icons move right.
+                                let icon_inset = if self.row_icon.is_some() && !cards {
+                                    (result_height - 2.0).max(1.0) + CARD_ICON_GAP
+                                } else {
+                                    0.0
+                                };
                                 ui.painter()
                                     .with_clip_rect(rect.intersect(ui.clip_rect()))
                                     .text(
-                                        rect.left_center() + egui::vec2(12.0, 0.0),
+                                        rect.left_center() + egui::vec2(12.0 + icon_inset, 0.0),
                                         egui::Align2::LEFT_CENTER,
                                         header,
                                         appearance.typography.bold.clone(),
@@ -2521,6 +3503,31 @@ where
                 ctx.request_discard("resolve shared picker size before presentation");
             }
         }
+        // After the query box applied this frame's typing, so text typed
+        // just before Enter is part of the argument. A click picks like Enter.
+        if let Some((row, run)) = pick_command.or(self.command_clicked.take().map(|row| (row, true)))
+            && self.command_mode
+        {
+            let (picked, run) = self.pick_command(ctx, row, run, alternate_command);
+            event = event.or(picked);
+            run_command_line |= run;
+        }
+        if run_command_line && self.command_mode {
+            match query_command::resolve(&self.query_commands, &self.query) {
+                Ok((command, argument)) => {
+                    event = Some(PickerEvent::Command {
+                        name: command.name.clone(),
+                        argument: argument.to_owned(),
+                        alternate: alternate_command,
+                    });
+                }
+                Err(error) => {
+                    // Shown after the query box, which this frame already drew.
+                    self.command_error = Some(error);
+                    ctx.request_repaint();
+                }
+            }
+        }
         if interactive && !self.closed {
             self.palette_ui(ctx, rect, appearance);
         }
@@ -2548,7 +3555,7 @@ where
                     }
                 }
             } else if accept {
-                event = Some(PickerEvent::Accepted(selection));
+                event = self.accept(ctx, selection);
             } else if copy {
                 event = Some(PickerEvent::CopyRequested(selection));
             } else if let Some(action) = custom_action {
@@ -3152,6 +4159,26 @@ fn window_layout(
     job
 }
 
+/// The rest of `name` after `typed`, when `typed` starts it, ignoring case.
+fn name_rest<'a>(name: &'a str, typed: &str) -> Option<&'a str> {
+    let start = name.get(..typed.len())?;
+    (!typed.is_empty() && name.len() > typed.len() && start.eq_ignore_ascii_case(typed))
+        .then(|| &name[typed.len()..])
+}
+/// The query prompt while searching.
+const SEARCH_PROMPT: char = '>';
+/// The query prompt in command mode.
+const COMMAND_PROMPT: char = ':';
+/// Space between a completion and its detail.
+const DETAIL_GAP: &str = "    ";
+/// A completion as the popup shows it, for measuring.
+fn completion_label(completion: &nfm_search_core::store::SearchCompletion) -> String {
+    if completion.detail.is_empty() {
+        completion.text.clone()
+    } else {
+        format!("{}{DETAIL_GAP}{}", completion.text, completion.detail)
+    }
+}
 fn highlighted_layout(
     text: &str,
     positions: &[usize],
@@ -3376,13 +4403,29 @@ mod query_parity_tests {
         // Built-in commands come first, in order, with their current keys,
         // followed only by described custom commands.
         let actions: Vec<_> = rows.iter().map(|row| row.action).collect();
+        // Without query commands there is no command mode to toggle.
+        let built_in: Vec<_> = PickerAction::BUILT_IN
+            .into_iter()
+            .filter(|action| *action != PickerAction::ToggleCommandMode)
+            .collect();
+        assert_eq!(actions[..built_in.len()], built_in);
         assert_eq!(
-            actions[..PickerAction::BUILT_IN.len()],
-            PickerAction::BUILT_IN
-        );
-        assert_eq!(
-            actions[PickerAction::BUILT_IN.len()..],
+            actions[built_in.len()..],
             [PickerAction::Custom(5), PickerAction::Custom(6)]
+        );
+        picker.set_query_commands(vec![QueryCommand {
+            name: "Reload".into(),
+            description: String::new(),
+            argument: None,
+        }]);
+        let rows = picker.palette_rows();
+        let toggle = rows
+            .iter()
+            .find(|row| row.action == PickerAction::ToggleCommandMode)
+            .unwrap();
+        assert_eq!(
+            (toggle.title.as_str(), toggle.keys.as_str()),
+            ("Toggle command mode", "Ctrl+;")
         );
         assert_eq!(row("Toggle full-pane picker").keys, "Ctrl+G");
         assert_eq!(row("Toggle preview").keys, "Ctrl+P, Ctrl+Space");
@@ -5326,6 +6369,716 @@ mod query_parity_tests {
         frame.drop_without_applying_deltas();
         assert!(matches!(event, Some(PickerEvent::Cancelled)));
     }
+    fn commands() -> Vec<QueryCommand> {
+        vec![
+            QueryCommand {
+                name: "GrepClaudeSessions".into(),
+                description: "Search Claude transcripts".into(),
+                argument: Some(crate::CommandArgument {
+                    name: "search text".into(),
+                    description: "Literal text".into(),
+                    required: true,
+                }),
+            },
+            QueryCommand {
+                name: "Reload".into(),
+                description: "Reload the list".into(),
+                argument: None,
+            },
+        ]
+    }
+    fn shows_text(frame: &egui::FullOutput, needle: &str) -> bool {
+        frame.shapes.iter().any(|shape| {
+            matches!(&shape.shape, egui::Shape::Text(text) if text.galley.job.text.contains(needle))
+        })
+    }
+    fn shows_exact(frame: &egui::FullOutput, needle: &str) -> bool {
+        frame.shapes.iter().any(|shape| {
+            matches!(&shape.shape, egui::Shape::Text(text) if text.galley.job.text == needle)
+        })
+    }
+    /// The prompt's color, when the frame draws `prompt` on its own.
+    fn prompt_color(frame: &egui::FullOutput, prompt: char) -> Option<egui::Color32> {
+        frame.shapes.iter().find_map(|shape| match &shape.shape {
+            egui::Shape::Text(text) if text.galley.job.text == prompt.to_string() => {
+                Some(text.galley.job.sections[0].format.color)
+            }
+            _ => None,
+        })
+    }
+    /// Ctrl+; pressed and released; a toggle ignores a press egui reports
+    /// as a repeat because it never saw the last one released.
+    fn toggle() -> Vec<egui::Event> {
+        let press = modified_key(Key::Semicolon, Modifiers::CTRL);
+        let mut release = press.clone();
+        if let egui::Event::Key { pressed, .. } = &mut release {
+            *pressed = false;
+        }
+        vec![press, release]
+    }
+    #[test]
+    fn command_mode_completes_describes_and_runs_without_searching() {
+        let (ctx, mut picker) = make();
+        picker.set_query_commands(commands());
+        picker.set_query("beta");
+        wait(&mut picker);
+        let revision = picker.revision;
+        let palette = Appearance::default().palette;
+        let (frame, _) = draw(&ctx, &mut picker, vec![]);
+        assert_eq!(prompt_color(&frame, '>'), Some(palette.accent));
+        frame.drop_without_applying_deltas();
+
+        draw(&ctx, &mut picker, toggle()).0.drop_without_applying_deltas();
+        assert!(picker.command_mode());
+        assert_eq!(picker.query(), "");
+        let (frame, _) = draw(&ctx, &mut picker, vec![]);
+        assert_eq!(prompt_color(&frame, ':'), Some(palette.success));
+        assert_eq!(prompt_color(&frame, '>'), None);
+        assert!(picker.suggestions.is_empty(), "no popup");
+        assert_eq!(picker.listed_commands().len(), 2, "every command, before typing");
+        assert!(shows_text(&frame, "GrepClaudeSessions <search text>"));
+        assert!(shows_text(&frame, "Reload the list"));
+        assert!(!shows_text(&frame, "beta"), "the commands replace the results");
+        assert!(!picker.busy());
+        assert!(picker.current_results());
+        frame.drop_without_applying_deltas();
+
+        draw(&ctx, &mut picker, vec![egui::Event::Text("gr".into())])
+            .0
+            .drop_without_applying_deltas();
+        let (frame, _) = draw(&ctx, &mut picker, vec![]);
+        assert_eq!(picker.revision, revision, "command mode does not search");
+        assert_eq!(picker.displayed.as_ref().unwrap().output.matched, 1);
+        assert_eq!(picker.listed_commands().len(), 1);
+        assert!(shows_text(&frame, "Search Claude transcripts"));
+        assert!(!shows_text(&frame, "Reload the list"));
+        frame.drop_without_applying_deltas();
+
+        let (frame, event) = draw(&ctx, &mut picker, vec![key(Key::Enter)]);
+        frame.drop_without_applying_deltas();
+        assert!(event.is_none());
+        assert_eq!(picker.query(), "GrepClaudeSessions ");
+        draw(&ctx, &mut picker, vec![]).0.drop_without_applying_deltas();
+        let (frame, _) = draw(&ctx, &mut picker, vec![]);
+        assert!(shows_exact(&frame, "<search text>"), "placeholder");
+        assert!(
+            shows_text(&frame, "<search text> Literal text"),
+            "the named command's row describes its argument"
+        );
+        frame.drop_without_applying_deltas();
+
+        let (frame, event) = draw(&ctx, &mut picker, vec![key(Key::Enter)]);
+        frame.drop_without_applying_deltas();
+        assert!(event.is_none());
+        assert_eq!(picker.command_error.as_deref(), Some("search text is required"));
+        let (frame, _) = draw(&ctx, &mut picker, vec![]);
+        let error = frame.shapes.iter().find_map(|shape| match &shape.shape {
+            egui::Shape::Text(text) if text.galley.job.text == "search text is required" => {
+                Some(text.galley.job.sections[0].format.color)
+            }
+            _ => None,
+        });
+        assert_eq!(error, Some(palette.error), "the reason shows as ghost text");
+        assert!(!shows_exact(&frame, "<search text>"));
+        frame.drop_without_applying_deltas();
+
+        // Text typed in the same frame as Enter is part of the argument.
+        let (frame, event) = draw(
+            &ctx,
+            &mut picker,
+            vec![egui::Event::Text("fn \"main\"".into()), key(Key::Enter)],
+        );
+        frame.drop_without_applying_deltas();
+        assert!(matches!(
+            event,
+            Some(PickerEvent::Command { name, argument, alternate: false })
+                if name == "GrepClaudeSessions" && argument == "fn \"main\""
+        ));
+        assert!(!picker.is_closed());
+        assert_eq!(picker.revision, revision);
+
+        // Each mode keeps its text for the next switch.
+        draw(&ctx, &mut picker, toggle()).0.drop_without_applying_deltas();
+        assert!(!picker.command_mode());
+        assert_eq!(picker.query(), "beta");
+        assert_eq!(picker.revision, revision, "the search results are still current");
+        assert!(picker.selection().is_some());
+        draw(&ctx, &mut picker, toggle()).0.drop_without_applying_deltas();
+        assert_eq!(picker.query(), "GrepClaudeSessions fn \"main\"");
+
+        let (frame, event) = draw(&ctx, &mut picker, vec![key(Key::Escape)]);
+        frame.drop_without_applying_deltas();
+        assert!(event.is_none(), "Escape leaves command mode first");
+        assert!(!picker.command_mode());
+        assert_eq!(picker.query(), "beta");
+        let (frame, event) = draw(&ctx, &mut picker, vec![key(Key::Escape)]);
+        frame.drop_without_applying_deltas();
+        assert!(matches!(event, Some(PickerEvent::Cancelled)));
+    }
+    #[test]
+    fn typing_gt_space_into_an_empty_search_enters_command_mode() {
+        let (ctx, mut picker) = make();
+        picker.set_query_commands(commands());
+        wait(&mut picker);
+        let revision = picker.revision;
+        draw(&ctx, &mut picker, vec![]).0.drop_without_applying_deltas();
+        draw(&ctx, &mut picker, vec![egui::Event::Text(">".into())])
+            .0
+            .drop_without_applying_deltas();
+        assert_eq!(picker.query(), ">");
+        assert_eq!(picker.revision, revision, "a lone > may start the shortcut");
+        draw(&ctx, &mut picker, vec![egui::Event::Text(" ".into())])
+            .0
+            .drop_without_applying_deltas();
+        assert!(picker.command_mode());
+        assert_eq!(picker.query(), "");
+        draw(&ctx, &mut picker, vec![egui::Event::Text("Rel".into())])
+            .0
+            .drop_without_applying_deltas();
+        assert_eq!(picker.query(), "Rel", "the cursor moved to the new text");
+        draw(&ctx, &mut picker, vec![key(Key::Escape)])
+            .0
+            .drop_without_applying_deltas();
+        assert!(!picker.command_mode(), "no popup to close first");
+        assert_eq!(picker.query(), "");
+        assert_eq!(picker.revision, revision);
+
+        // Pasted into an empty search, the rest is the command line.
+        picker.set_query("> Reload");
+        assert!(picker.command_mode());
+        assert_eq!(picker.query(), "Reload");
+        picker.set_command_mode(false);
+
+        // `: ` does the same, typed or pasted.
+        picker.set_query(":");
+        assert_eq!(picker.revision, revision, "a lone : may start the shortcut");
+        picker.set_query(": ");
+        assert!(picker.command_mode());
+        assert_eq!(picker.query(), "");
+        picker.set_command_mode(false);
+        picker.set_query(": Reload");
+        assert!(picker.command_mode());
+        assert_eq!(picker.query(), "Reload");
+        picker.set_command_mode(false);
+
+        // Elsewhere, `>` and `:` are search text.
+        picker.set_query(">x");
+        assert_ne!(picker.revision, revision);
+        picker.set_query("beta");
+        picker.set_query("> beta");
+        assert!(!picker.command_mode());
+        picker.set_query("x");
+        picker.set_query("x: ");
+        assert!(!picker.command_mode());
+    }
+    #[test]
+    fn accepting_a_command_row_starts_its_command_as_completing_it_would() {
+        let (ctx, mut picker) = make();
+        picker.set_query_commands(commands());
+        picker.set_command_rows(Some(Arc::new(|selection| {
+            match selection.item.fields["Name"].as_str() {
+                "beta" => Some("GrepClaudeSessions".into()),
+                "猫 server" => Some("Reload".into()),
+                _ => None,
+            }
+        })));
+        let accept = |picker: &mut Picker<StructuredStreamingSnapshot>, query: &str| {
+            picker.set_query(query);
+            wait(picker);
+            draw(&ctx, picker, vec![]).0.drop_without_applying_deltas();
+            let (frame, event) = draw(&ctx, picker, vec![key(Key::Enter)]);
+            frame.drop_without_applying_deltas();
+            event
+        };
+
+        assert!(accept(&mut picker, "beta").is_none());
+        assert!(!picker.is_closed());
+        assert!(picker.command_mode());
+        assert_eq!(picker.query(), "GrepClaudeSessions ");
+        assert!(!picker.busy(), "the search before the command line is done");
+        assert_eq!(picker.query_cursor, picker.query().len());
+        draw(&ctx, &mut picker, vec![]).0.drop_without_applying_deltas();
+        let (frame, _) = draw(&ctx, &mut picker, vec![]);
+        assert!(shows_text(&frame, "<search text> Literal text"));
+        frame.drop_without_applying_deltas();
+        draw(&ctx, &mut picker, toggle()).0.drop_without_applying_deltas();
+        assert_eq!(picker.query(), "beta", "the search is kept");
+
+        let event = accept(&mut picker, "server");
+        assert!(matches!(
+            event,
+            Some(PickerEvent::Command { name, argument, alternate: false }) if name == "Reload" && argument.is_empty()
+        ));
+        assert!(!picker.command_mode());
+
+        assert!(matches!(
+            accept(&mut picker, "alpha"),
+            Some(PickerEvent::Accepted(selection)) if selection.item.fields["Name"] == "alpha one"
+        ));
+    }
+    #[test]
+    fn row_icons_move_the_column_header_with_its_columns() {
+        // Where the header and the first row's text start.
+        let starts = |icon: bool| {
+            let (ctx, mut picker) = make();
+            if icon {
+                picker.set_row_icon(Some(Arc::new(
+                    |item: &nfm_picker_sources::structured::StructuredPickerItem| {
+                        (item.fields["Name"] == "beta").then(|| "glyph::@#010203".to_string())
+                    },
+                )));
+            }
+            wait(&mut picker);
+            draw(&ctx, &mut picker, vec![]).0.drop_without_applying_deltas();
+            let (frame, _) = draw(&ctx, &mut picker, vec![]);
+            let start = |prefix: &str| {
+                frame
+                    .shapes
+                    .iter()
+                    .filter_map(|shape| match &shape.shape {
+                        egui::Shape::Text(text) if text.galley.job.text.starts_with(prefix) => {
+                            Some(text.pos.x)
+                        }
+                        _ => None,
+                    })
+                    .fold(f32::INFINITY, f32::min)
+            };
+            let starts = (start("Name"), start("alpha"));
+            frame.drop_without_applying_deltas();
+            starts
+        };
+        let (plain, iconed) = (starts(false), starts(true));
+        assert!(plain.0.is_finite() && plain.1.is_finite(), "{plain:?}");
+        let header_shift = iconed.0 - plain.0;
+        assert!(header_shift > 10.0, "{plain:?} {iconed:?}");
+        assert!((header_shift - (iconed.1 - plain.1)).abs() < 0.5, "{plain:?} {iconed:?}");
+    }
+    #[test]
+    fn enter_on_a_listed_command_without_an_argument_runs_it() {
+        let (ctx, mut picker) = make();
+        picker.set_query_commands(commands());
+        wait(&mut picker);
+        picker.set_command_mode(true);
+        picker.set_query("rel");
+        draw(&ctx, &mut picker, vec![]).0.drop_without_applying_deltas();
+        assert_eq!(picker.listed_commands()[0].name, "Reload");
+        let (frame, event) = draw(&ctx, &mut picker, vec![key(Key::Enter)]);
+        frame.drop_without_applying_deltas();
+        assert!(matches!(
+            event,
+            Some(PickerEvent::Command { name, argument, alternate: false }) if name == "Reload" && argument.is_empty()
+        ));
+        assert_eq!(picker.query(), "Reload");
+    }
+    #[test]
+    fn ctrl_enter_runs_a_command_line_as_its_alternate() {
+        let (ctx, mut picker) = make();
+        picker.set_query_commands(commands());
+        wait(&mut picker);
+        picker.set_command_mode(true);
+        picker.set_query("GrepClaudeSessions main");
+        draw(&ctx, &mut picker, vec![]).0.drop_without_applying_deltas();
+        let (frame, event) = draw(
+            &ctx,
+            &mut picker,
+            vec![modified_key(Key::Enter, Modifiers::CTRL)],
+        );
+        frame.drop_without_applying_deltas();
+        assert!(matches!(
+            event,
+            Some(PickerEvent::Command { name, argument, alternate: true })
+                if name == "GrepClaudeSessions" && argument == "main"
+        ));
+        // As Enter does, it types a listed command's name first.
+        picker.set_query("rel");
+        draw(&ctx, &mut picker, vec![]).0.drop_without_applying_deltas();
+        let (frame, event) = draw(
+            &ctx,
+            &mut picker,
+            vec![modified_key(Key::Enter, Modifiers::CTRL)],
+        );
+        frame.drop_without_applying_deltas();
+        assert!(matches!(
+            event,
+            Some(PickerEvent::Command { name, alternate: true, .. }) if name == "Reload"
+        ));
+
+        // A host's reason for not running the line shows until it changes.
+        picker.set_command_error(&ctx, "no result");
+        let (frame, _) = draw(&ctx, &mut picker, vec![]);
+        assert!(shows_text(&frame, "no result"));
+        frame.drop_without_applying_deltas();
+        picker.set_query("Reloa");
+        let (frame, _) = draw(&ctx, &mut picker, vec![]);
+        assert!(!shows_text(&frame, "no result"));
+        frame.drop_without_applying_deltas();
+    }
+    #[test]
+    fn arrows_tab_and_clicks_pick_listed_commands() {
+        let (ctx, mut picker) = make();
+        picker.set_query_commands(commands());
+        wait(&mut picker);
+        let selected = picker.selected;
+        picker.set_command_mode(true);
+        draw(&ctx, &mut picker, vec![]).0.drop_without_applying_deltas();
+        // Away from the query, as results go.
+        let away = if picker.config.layout == Layout::QueryBottom {
+            Key::ArrowUp
+        } else {
+            Key::ArrowDown
+        };
+        draw(&ctx, &mut picker, vec![key(away)]).0.drop_without_applying_deltas();
+        assert_eq!(picker.command_selected, 1);
+        assert_eq!(picker.selected, selected, "the search keeps its selection");
+        // Tab types a command's name without running it.
+        let (frame, event) = draw(&ctx, &mut picker, vec![key(Key::Tab)]);
+        frame.drop_without_applying_deltas();
+        assert!(event.is_none());
+        assert_eq!(picker.query(), "Reload");
+
+        // A click picks as Enter does.
+        picker.set_query("");
+        draw(&ctx, &mut picker, vec![]).0.drop_without_applying_deltas();
+        let (frame, _) = draw(&ctx, &mut picker, vec![]);
+        let row = frame
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::Shape::Text(text)
+                    if text.galley.job.text.starts_with("GrepClaudeSessions") =>
+                {
+                    Some(text.pos + egui::vec2(4.0, 4.0))
+                }
+                _ => None,
+            })
+            .unwrap();
+        frame.drop_without_applying_deltas();
+        let click = |pressed| egui::Event::PointerButton {
+            pos: row,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: Modifiers::NONE,
+        };
+        draw(&ctx, &mut picker, vec![egui::Event::PointerMoved(row), click(true)])
+            .0
+            .drop_without_applying_deltas();
+        let (frame, event) = draw(&ctx, &mut picker, vec![click(false)]);
+        frame.drop_without_applying_deltas();
+        assert!(event.is_none());
+        assert_eq!(picker.query(), "GrepClaudeSessions ");
+
+        // An unknown name lists nothing and says so.
+        picker.set_query("zz");
+        draw(&ctx, &mut picker, vec![]).0.drop_without_applying_deltas();
+        let (frame, _) = draw(&ctx, &mut picker, vec![]);
+        assert!(shows_text(&frame, "No command matches zz"));
+        frame.drop_without_applying_deltas();
+        draw(&ctx, &mut picker, vec![key(Key::Enter)]).0.drop_without_applying_deltas();
+        assert_eq!(picker.command_error.as_deref(), Some("Unknown command zz"));
+    }
+    #[test]
+    fn choices_list_under_the_command_and_enter_uses_or_ctrl_enter_copies_one() {
+        let (ctx, mut picker) = make();
+        picker.set_query_commands(commands());
+        wait(&mut picker);
+        picker.set_command_preview(Some(Arc::new(|_: &str, argument: &str| {
+            Some(crate::CommandHint {
+                text: String::new(),
+                completion: None,
+                choices: vec![
+                    crate::CommandChoice {
+                        text: format!("{argument} one"),
+                        value: format!("{argument}1"),
+                    },
+                    crate::CommandChoice {
+                        text: format!("{argument} two"),
+                        value: format!("{argument}2"),
+                    },
+                ],
+            })
+        })));
+        picker.set_command_mode(true);
+        picker.set_query("GrepClaudeSessions a");
+        draw(&ctx, &mut picker, vec![]).0.drop_without_applying_deltas();
+        let (frame, _) = draw(&ctx, &mut picker, vec![]);
+        assert!(shows_exact(&frame, "a one") && shows_exact(&frame, "a two"));
+        frame.drop_without_applying_deltas();
+        // Away from the query, as results go.
+        let away = if picker.config.layout == Layout::QueryBottom {
+            Key::ArrowUp
+        } else {
+            Key::ArrowDown
+        };
+        draw(&ctx, &mut picker, vec![key(away)]).0.drop_without_applying_deltas();
+        draw(&ctx, &mut picker, vec![key(away)]).0.drop_without_applying_deltas();
+        assert_eq!(picker.command_selected, 2);
+        draw(&ctx, &mut picker, vec![key(away)]).0.drop_without_applying_deltas();
+        assert_eq!(picker.command_selected, 2, "the last choice is the last row");
+
+        // Ctrl+Enter copies the selected choice's value and reports nothing.
+        let (frame, event) = draw(
+            &ctx,
+            &mut picker,
+            vec![modified_key(Key::Enter, Modifiers::CTRL)],
+        );
+        let copied: Vec<_> = frame
+            .platform_output
+            .commands
+            .iter()
+            .filter_map(|command| match command {
+                egui::OutputCommand::CopyText(text) => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        frame.drop_without_applying_deltas();
+        assert!(event.is_none());
+        assert_eq!(copied, ["a2"]);
+        assert_eq!(picker.query(), "GrepClaudeSessions a");
+
+        // Enter makes it the argument, which lists that argument's choices.
+        let (frame, event) = draw(&ctx, &mut picker, vec![key(Key::Enter)]);
+        frame.drop_without_applying_deltas();
+        assert!(event.is_none());
+        assert_eq!(picker.query(), "GrepClaudeSessions a2");
+        assert_eq!(picker.command_selected, 0, "the command row again");
+        draw(&ctx, &mut picker, vec![]).0.drop_without_applying_deltas();
+        let (frame, _) = draw(&ctx, &mut picker, vec![]);
+        assert!(shows_exact(&frame, "a2 one"));
+        frame.drop_without_applying_deltas();
+        // Enter on the command row runs the line as before.
+        let (frame, event) = draw(&ctx, &mut picker, vec![key(Key::Enter)]);
+        frame.drop_without_applying_deltas();
+        assert!(matches!(
+            event,
+            Some(PickerEvent::Command { argument, alternate: false, .. }) if argument == "a2"
+        ));
+    }
+    #[test]
+    fn right_arrow_at_the_end_completes_the_ghost_text() {
+        let (ctx, mut picker) = make();
+        picker.set_query_commands(commands());
+        wait(&mut picker);
+        picker.set_command_preview(Some(Arc::new(|_: &str, argument: &str| {
+            Some(crate::CommandHint {
+                text: format!("= {}", argument.len()),
+                completion: Some(argument.len().to_string()),
+                choices: Vec::new(),
+            })
+        })));
+        picker.set_command_mode(true);
+        let right = |picker: &mut Picker<StructuredStreamingSnapshot>| {
+            draw(&ctx, picker, vec![key(Key::ArrowRight)]).0.drop_without_applying_deltas();
+        };
+        // The rest of the selected command's name, in its own case.
+        picker.set_query("grep");
+        let (frame, _) = draw(&ctx, &mut picker, vec![]);
+        assert!(shows_exact(&frame, "ClaudeSessions"));
+        frame.drop_without_applying_deltas();
+        right(&mut picker);
+        assert_eq!(picker.query(), "GrepClaudeSessions ");
+        assert_eq!(picker.query_cursor, picker.query().len());
+
+        // The host's completion of the argument.
+        draw(&ctx, &mut picker, vec![egui::Event::Text("main".into())])
+            .0
+            .drop_without_applying_deltas();
+        let (frame, _) = draw(&ctx, &mut picker, vec![]);
+        assert!(shows_exact(&frame, "  = 4"));
+        frame.drop_without_applying_deltas();
+        right(&mut picker);
+        assert_eq!(picker.query(), "GrepClaudeSessions 4");
+        assert!(!picker.is_closed());
+
+        // Short of the end, Right moves the cursor.
+        picker.set_query("rel");
+        draw(&ctx, &mut picker, vec![]).0.drop_without_applying_deltas();
+        draw(&ctx, &mut picker, vec![key(Key::ArrowLeft)]).0.drop_without_applying_deltas();
+        right(&mut picker);
+        assert_eq!(picker.query(), "rel");
+        right(&mut picker);
+        assert_eq!(picker.query(), "Reload");
+    }
+    #[test]
+    fn the_host_previews_a_command_line_once_per_line() {
+        let (ctx, mut picker) = make();
+        picker.set_query_commands(commands());
+        wait(&mut picker);
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = calls.clone();
+        picker.set_command_preview(Some(Arc::new(move |name: &str, argument: &str| {
+            counted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            (name == "GrepClaudeSessions" && argument != "nothing").then(|| crate::CommandHint {
+                text: format!("= {}", argument.len()),
+                completion: None,
+                choices: Vec::new(),
+            })
+        })));
+        picker.set_command_mode(true);
+        let ghost = |picker: &mut Picker<StructuredStreamingSnapshot>, line: &str| {
+            picker.set_query(line);
+            draw(&ctx, picker, vec![]).0.drop_without_applying_deltas();
+            let (frame, _) = draw(&ctx, picker, vec![]);
+            let shown = shows_exact(&frame, "  = 4");
+            frame.drop_without_applying_deltas();
+            shown
+        };
+        assert!(ghost(&mut picker, "GrepClaudeSessions main"));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1, "not every frame");
+        assert!(!ghost(&mut picker, "GrepClaudeSessions nothing"));
+        let calls_before = calls.load(std::sync::atomic::Ordering::Relaxed);
+        // An empty argument shows its placeholder, without asking the host.
+        picker.set_query("GrepClaudeSessions ");
+        draw(&ctx, &mut picker, vec![]).0.drop_without_applying_deltas();
+        let (frame, _) = draw(&ctx, &mut picker, vec![]);
+        assert!(shows_exact(&frame, "<search text>"));
+        frame.drop_without_applying_deltas();
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), calls_before);
+        // The confirmation of a copy shows over the listed commands.
+        picker.notify_copied_value(&ctx, "255");
+        let (frame, _) = draw(&ctx, &mut picker, vec![]);
+        assert!(shows_text(&frame, "Copied: 255"));
+        frame.drop_without_applying_deltas();
+    }
+    /// `rows` numbered lines, as `row-007`.
+    fn numbered(rows: usize) -> Arc<crate::styled_document::StyledDocument> {
+        let text: Vec<String> = (0..rows).map(|row| format!("row-{row:03}")).collect();
+        crate::styled_document::StyledDocument::from_text(&text.join("\n"))
+    }
+    /// A command output and a flag its closing sets.
+    fn watched_output() -> (crate::CommandOutput, Arc<std::sync::atomic::AtomicBool>) {
+        let output = crate::CommandOutput::new();
+        let closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = closed.clone();
+        output.on_close(move || flag.store(true, std::sync::atomic::Ordering::SeqCst));
+        (output, closed)
+    }
+    fn shows_frame(
+        ctx: &Context,
+        picker: &mut Picker<StructuredStreamingSnapshot>,
+        events: Vec<egui::Event>,
+        needles: &[&str],
+    ) -> Vec<bool> {
+        let (frame, _) = draw(ctx, picker, events);
+        let shown = needles.iter().map(|needle| shows_text(&frame, needle)).collect();
+        frame.drop_without_applying_deltas();
+        shown
+    }
+    /// After a frame, the output's top row and rows in the preview pane.
+    fn output_view(
+        ctx: &Context,
+        picker: &mut Picker<StructuredStreamingSnapshot>,
+    ) -> Option<(usize, usize)> {
+        draw(ctx, picker, vec![]).0.drop_without_applying_deltas();
+        let viewport = picker.preview_viewport.as_ref()?;
+        Some((viewport.top as usize, viewport.total_rows() as usize))
+    }
+    #[test]
+    fn command_output_streams_into_the_preview_and_esc_returns_to_the_line() {
+        use std::sync::atomic::Ordering;
+        let (ctx, mut picker) = make();
+        picker.set_query_commands(commands());
+        wait(&mut picker);
+        assert!(!picker.preview_visible());
+        picker.start_command(&ctx, "GrepClaudeSessions x");
+        let (frame, event) = draw(&ctx, &mut picker, vec![key(Key::Enter)]);
+        frame.drop_without_applying_deltas();
+        assert!(matches!(event, Some(PickerEvent::Command { .. })));
+        let (output, closed) = watched_output();
+        picker.show_command_output(&ctx, output.clone());
+        assert!(picker.preview_visible(), "the hidden pane opens");
+        draw(&ctx, &mut picker, vec![]).0.drop_without_applying_deltas();
+        assert!(picker.busy(), "loading until finished");
+        assert_eq!(output_view(&ctx, &mut picker), None, "nothing yet");
+
+        // It follows the end as it grows.
+        output.publish(numbered(100));
+        let rows = picker.visible_preview_rows;
+        assert!(rows > 1);
+        assert_eq!(output_view(&ctx, &mut picker), Some((100 - rows, 100)));
+        output.publish(numbered(150));
+        assert_eq!(output_view(&ctx, &mut picker), Some((150 - rows, 150)));
+        assert!(shows_frame(&ctx, &mut picker, vec![], &["GrepClaudeSessions x"])[0]);
+
+        // Scrolled up, it stays put.
+        let up = modified_key(Key::ArrowUp, Modifiers::CTRL);
+        draw(&ctx, &mut picker, vec![up]).0.drop_without_applying_deltas();
+        output.publish(numbered(200));
+        assert_eq!(output_view(&ctx, &mut picker), Some((149 - rows, 200)));
+        output.finish();
+        assert!(!picker.busy());
+
+        // Ctrl+C copies all of it while nothing on the line is selected.
+        let (frame, _) = draw(&ctx, &mut picker, vec![modified_key(Key::C, Modifiers::CTRL)]);
+        let copied = frame.platform_output.commands.iter().find_map(|command| match command {
+            egui::OutputCommand::CopyText(text) => Some(text.clone()),
+            _ => None,
+        });
+        frame.drop_without_applying_deltas();
+        let copied = copied.expect("Ctrl+C copies the output");
+        assert!(copied.starts_with("row-000\nrow-001\n"), "{copied:?}");
+        assert!(copied.trim_end().ends_with("row-199"));
+
+        // Esc goes back to the line as it was typed and stops the command.
+        draw(&ctx, &mut picker, vec![key(Key::Escape)]).0.drop_without_applying_deltas();
+        assert!(!picker.command_output_shown());
+        assert!(closed.load(Ordering::SeqCst));
+        assert!(output.is_closed());
+        assert!(picker.command_mode());
+        assert_eq!(picker.query(), "GrepClaudeSessions x");
+        assert!(!picker.preview_visible(), "the pane closes again");
+        output.publish(numbered(10));
+        assert!(!picker.command_output_shown(), "a closed output stays closed");
+    }
+    #[test]
+    fn command_output_is_closed_when_replaced_left_or_dropped() {
+        use std::sync::atomic::Ordering;
+        let (ctx, mut picker) = make();
+        picker.set_query_commands(commands());
+        wait(&mut picker);
+        picker.config.preview_visible = true;
+        // Outside command mode there is nowhere to show it.
+        let (output, closed) = watched_output();
+        picker.show_command_output(&ctx, output);
+        assert!(closed.load(Ordering::SeqCst));
+
+        picker.start_command(&ctx, "Reload");
+        let (first, first_closed) = watched_output();
+        picker.show_command_output(&ctx, first);
+        let (second, second_closed) = watched_output();
+        picker.show_command_output(&ctx, second);
+        assert!(first_closed.load(Ordering::SeqCst));
+        assert!(!second_closed.load(Ordering::SeqCst));
+        draw(&ctx, &mut picker, toggle()).0.drop_without_applying_deltas();
+        assert!(!picker.command_mode());
+        assert!(second_closed.load(Ordering::SeqCst), "leaving command mode closes it");
+        assert!(picker.preview_visible(), "a pane that was open stays open");
+
+        picker.start_command(&ctx, "Reload");
+        let (third, third_closed) = watched_output();
+        picker.show_command_output(&ctx, third);
+        drop(picker);
+        assert!(third_closed.load(Ordering::SeqCst));
+    }
+    #[test]
+    fn without_commands_there_is_no_command_mode() {
+        let (ctx, mut picker) = make();
+        wait(&mut picker);
+        let revision = picker.revision;
+        draw(&ctx, &mut picker, toggle()).0.drop_without_applying_deltas();
+        assert!(!picker.command_mode());
+        picker.set_command_mode(true);
+        assert!(!picker.command_mode());
+        picker.set_query("> x");
+        assert!(!picker.command_mode());
+        assert_ne!(picker.revision, revision);
+        assert!(picker.completions(picker.query().len()).is_empty());
+        // Removing the commands leaves command mode.
+        picker.set_query("");
+        picker.set_query_commands(commands());
+        picker.set_command_mode(true);
+        picker.set_query_commands(Vec::new());
+        assert!(!picker.command_mode());
+    }
     #[test]
     fn mouse_completion_and_six_row_popup_match_skia() {
         let (ctx, mut picker) = make();
@@ -5627,6 +7380,134 @@ mod tests {
             Some(PickerEvent::Cancelled)
         ));
     }
+    /// A preview of `lines` numbered lines, as a streamed answer grows.
+    fn growing_document_provider() -> Arc<crate::styled_document::DocumentPreviewProvider<u64>> {
+        Arc::new(crate::styled_document::DocumentPreviewProvider::new(
+            |selection: &Selection<u64>| {
+                let text: Vec<String> = (1..=selection.item).map(|n| format!("line {n}")).collect();
+                Ok((
+                    crate::styled_document::StyledDocument::from_text(&text.join("\n")),
+                    None,
+                ))
+            },
+            egui::Color32::YELLOW,
+        ))
+    }
+    /// The preview's first shown row and its rows in all, once the preview
+    /// of `lines` lines has loaded.
+    fn shown_rows(ctx: &Context, picker: &mut Picker<Versioned>, lines: usize) -> (usize, usize) {
+        let mut shown = None;
+        wait(|| {
+            draw(ctx, picker, vec![]);
+            shown = match picker.preview.as_ref().and_then(|p| p.document.as_ref()) {
+                Some(Ok(Preview::Grid { total_rows, .. })) if *total_rows == lines => {
+                    Some((picker.scroll_offset, *total_rows))
+                }
+                _ => None,
+            };
+            shown.is_some() && !picker.preview.as_ref().unwrap().loading
+        });
+        shown.unwrap()
+    }
+    #[test]
+    fn a_growing_preview_follows_its_end_until_scrolled_away() {
+        let ctx = Context::default();
+        let store = Arc::new(SnapshotStore::new());
+        store.publish(snapshot(1, "answer", 3));
+        let mut picker = Picker::new(
+            "test",
+            &ctx,
+            store.clone(),
+            PickerConfig {
+                preview_rows: 10,
+                ..PickerConfig::default()
+            },
+        );
+        picker.set_preview_provider(&ctx, growing_document_provider());
+        picker.set_preview_follows_end(true);
+        wait(|| {
+            picker.poll();
+            picker.selection().is_some()
+        });
+        assert_eq!(shown_rows(&ctx, &mut picker, 3), (0, 3));
+        // As the answer grows past the pane, the end stays in view.
+        store.publish(snapshot(2, "answer", 50));
+        assert_eq!(shown_rows(&ctx, &mut picker, 50), (40, 50));
+        store.publish(snapshot(3, "answer", 80));
+        assert_eq!(shown_rows(&ctx, &mut picker, 80), (70, 80));
+
+        // Scrolled up to read, the place is kept as more arrives.
+        let up = egui::Event::Key {
+            key: Key::ArrowUp,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers::CTRL,
+        };
+        draw(&ctx, &mut picker, vec![up]);
+        let (first, _) = shown_rows(&ctx, &mut picker, 80);
+        assert_eq!(first, 69);
+        store.publish(snapshot(4, "answer", 120));
+        assert_eq!(shown_rows(&ctx, &mut picker, 120), (69, 120));
+
+        // Back at the end, it follows again.
+        let end = egui::Event::Key {
+            key: Key::PageDown,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers::CTRL,
+        };
+        for _ in 0..8 {
+            draw(&ctx, &mut picker, vec![end.clone()]);
+        }
+        // Copy-mode scrolling stops a row short of the last page.
+        assert_eq!(shown_rows(&ctx, &mut picker, 120).0, 109);
+        store.publish(snapshot(5, "answer", 150));
+        assert_eq!(shown_rows(&ctx, &mut picker, 150), (140, 150));
+
+        // Copy mode keeps its document while more arrives, and the preview
+        // catches up once it is left.
+        picker.execute(&ctx, PickerAction::TogglePreviewFocus);
+        draw(&ctx, &mut picker, vec![]);
+        draw(&ctx, &mut picker, vec![]);
+        assert!(picker.preview_focused());
+        store.publish(snapshot(6, "answer", 170));
+        wait(|| {
+            draw(&ctx, &mut picker, vec![]);
+            picker.selection().is_some_and(|s| s.source_version == 6)
+        });
+        assert!(picker.preview_focused(), "a new version does not leave copy mode");
+        picker.execute(&ctx, PickerAction::TogglePreviewFocus);
+        draw(&ctx, &mut picker, vec![]);
+        assert!(!picker.preview_focused());
+        assert_eq!(shown_rows(&ctx, &mut picker, 170).1, 170);
+        store.complete();
+    }
+    #[test]
+    fn without_following_a_new_version_starts_at_the_top() {
+        let ctx = Context::default();
+        let store = Arc::new(SnapshotStore::new());
+        store.publish(snapshot(1, "answer", 50));
+        let mut picker = Picker::new(
+            "test",
+            &ctx,
+            store.clone(),
+            PickerConfig {
+                preview_rows: 10,
+                ..PickerConfig::default()
+            },
+        );
+        picker.set_preview_provider(&ctx, growing_document_provider());
+        wait(|| {
+            picker.poll();
+            picker.selection().is_some()
+        });
+        assert_eq!(shown_rows(&ctx, &mut picker, 50), (0, 50));
+        store.publish(snapshot(2, "answer", 80));
+        assert_eq!(shown_rows(&ctx, &mut picker, 80), (0, 80));
+        store.complete();
+    }
 }
 
 #[cfg(test)]
@@ -5674,6 +7555,7 @@ mod extension_tests {
         let invalid = nfm_search_core::store::SearchCompletion {
             text: String::new(),
             positions: vec![],
+            detail: String::new(),
             replacement: "bad".into(),
             replace: 1..usize::MAX,
         };
