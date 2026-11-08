@@ -176,15 +176,41 @@ fn native_options(options: &Options) -> eframe::NativeOptions {
     let font_size = options.font_size.unwrap_or(14.0);
     let row = (font_size * 1.2 + 6.0).ceil();
     let rows = options.rows.unwrap_or(app::DEFAULT_ROWS) as f32;
+    // Cards (--row-template) are a line per template line, a larger title
+    // line, 6 points of padding above and below, and 1 point between lines.
+    let result = options.row_template.as_deref().map_or(row, |spec| {
+        let lines = spec.split(';').filter(|line| !line.trim().is_empty());
+        let line = font_size * 1.2;
+        let height: f32 = lines
+            .map(|l| {
+                if l.contains(":title") {
+                    (line * 1.15).ceil() + 1.0
+                } else {
+                    line + 1.0
+                }
+            })
+            .sum();
+        (height - 1.0 + 12.0).ceil()
+    });
     let (preview, overhead) = if app::preview_initially_visible(options) {
         let rows = options.preview_rows.unwrap_or(app::DEFAULT_PREVIEW_ROWS) as f32;
         (rows * row, 58.0)
     } else {
         (0.0, 43.0)
     };
+    // Tables (processes, windows, csv rows without cards) add a header row.
+    let header = match options.command {
+        options::Command::Processes | options::Command::Windows => row,
+        _ if options.input_format == options::InputFormat::Csv
+            && options.row_template.is_none() =>
+        {
+            row
+        }
+        _ => 0.0,
+    };
     let height = options
         .height
-        .unwrap_or((rows + 1.0) * row + preview + overhead);
+        .unwrap_or(row + header + rows * result + preview + overhead);
     let width = options.width.unwrap_or(app::DEFAULT_WIDTH);
     eframe::NativeOptions {
         renderer: eframe::Renderer::Glow,

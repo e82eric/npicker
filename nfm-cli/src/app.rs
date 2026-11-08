@@ -739,21 +739,10 @@ fn build_view(
         }
         #[cfg(windows)]
         (Command::Windows, _) if preview.has_command() && !options.window_preview => {
-            use nfm_search_core::{snapshot_store::SnapshotStore, store::FlatSnapshot};
+            use nfm_search_core::snapshot_store::SnapshotStore;
             let windows = nfm_win32::list_windows::list_windows().map_err(|e| e.to_string())?;
             let store = Arc::new(SnapshotStore::new());
-            store.publish(Arc::new(FlatSnapshot::from_items(
-                windows
-                    .into_iter()
-                    .filter(|window| window.hwnd != hwnd)
-                    .map(|window| {
-                        let item = nfm_win32::WindowPickerItem {
-                            title: window.text.clone(),
-                            native_window: window.hwnd,
-                        };
-                        (window.text, item)
-                    }),
-            )));
+            store.publish(Arc::new(nfm_window_egui::window_snapshot(windows, hwnd)));
             store.complete();
             let mut picker = Picker::new("nfm-window-list", ctx, store, config);
             picker.set_preview_provider(

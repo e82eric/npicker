@@ -8,6 +8,10 @@ use crate::{
 };
 use egui::{Context, Id, Key, Modifiers};
 use nfm_picker_sources::structured::{StructuredStreamingSnapshot, structured_source};
+use crate::icons::{IconCache, IconResolver, paint_icon};
+use nfm_search_core::row::{
+    RowAlign, RowFields, RowSlot, RowStyle, RowTemplate, SlotKind,
+};
 use nfm_search_core::search::resolve_match_positions;
 use std::{
     sync::Arc,
@@ -408,6 +412,10 @@ impl<T> PickerOutput<T> {
     }
 }
 
+/// The icon reference for a one-line result, from its item (see
+/// [`Picker::set_row_icon`]).
+pub type RowIcon<T> = Arc<dyn Fn(&T) -> Option<String> + Send + Sync>;
+
 pub struct Picker<S: ItemsSource + Send + Sync + 'static> {
     id: Id,
     session: Session<S>,
@@ -426,6 +434,10 @@ pub struct Picker<S: ItemsSource + Send + Sync + 'static> {
     scroll_offset: usize,
     error: Option<String>,
     visible_result_rows: usize,
+    /// Host-resolved icons in card slots.
+    icons: IconCache,
+    /// Icons beside one-line results.
+    row_icon: Option<RowIcon<S::Item>>,
     visible_preview_rows: usize,
     external_preview: bool,
     preview_rect: Option<egui::Rect>,
@@ -484,6 +496,8 @@ where
             scroll_offset: 0,
             error: None,
             visible_result_rows: 7,
+            icons: IconCache::default(),
+            row_icon: None,
             visible_preview_rows: 12,
             external_preview: false,
             preview_rect: None,
@@ -827,6 +841,28 @@ where
         if let Some(viewport) = &mut self.preview_viewport {
             viewport.set_scroll_padding(rows);
         }
+    }
+
+    /// Add a resolver for icon references other than `glyph:` in card icon
+    /// slots (see [`crate::icons`]). Resolvers are asked in the order they
+    /// were added. Without any, only glyphs are drawn.
+    pub fn add_icon_resolver(&mut self, resolver: Arc<dyn IconResolver>) {
+        self.icons.add_resolver(resolver);
+    }
+
+    /// Draw an icon at the left of each one-line result. `icon` maps the
+    /// result's item to an icon reference (see [`crate::icons`]); items that
+    /// return `None` keep the column empty so text stays aligned. Card rows
+    /// use their template's icon slots instead. Build references in host
+    /// code: a reference taken from item text lets data pick what a host
+    /// resolver reads. The function stays until replaced, also across
+    /// [`Self::replace_source`].
+    pub fn set_row_icon(&mut self, icon: Option<RowIcon<S::Item>>) {
+        self.row_icon = icon;
+    }
+
+    pub fn has_row_icon(&self) -> bool {
+        self.row_icon.is_some()
     }
 
     /// Show line numbers in a gutter left of preview text. Wrapping providers
@@ -1658,6 +1694,17 @@ where
         self.preview_line_count = total;
         gutter
     }
+    /// Height of one result: a line, or a card when the source has a row template.
+    fn result_row_height(&self, ctx: &egui::Context, appearance: &Appearance) -> f32 {
+        match self
+            .displayed
+            .as_ref()
+            .and_then(|displayed| displayed.snapshot.row_template())
+        {
+            Some(template) => card_metrics(ctx, appearance, template).height,
+            None => appearance.typography.preview_row_height(ctx),
+        }
+    }
     fn results_ui(
         &mut self,
         ui: &mut egui::Ui,
@@ -1667,7 +1714,8 @@ where
     ) {
         let row_height = appearance.typography.preview_row_height(ui.ctx());
         if let Some(error) = &self.error {
-            let height = self.visible_result_rows as f32 * row_height;
+            let height =
+                self.visible_result_rows as f32 * self.result_row_height(ui.ctx(), appearance);
             let (rect, _) = ui.allocate_exact_size(
                 egui::vec2(ui.available_width(), height),
                 egui::Sense::hover(),
@@ -1697,6 +1745,15 @@ where
             .displayed
             .as_ref()
             .map(|displayed| displayed.snapshot.effective_query(&displayed.query));
+        let template = self
+            .displayed
+            .as_ref()
+            .and_then(|displayed| displayed.snapshot.row_template().cloned());
+        let card = template
+            .as_ref()
+            .map(|template| card_metrics(ui.ctx(), appearance, template));
+        let result_height = card.as_ref().map_or(row_height, |card| card.height);
+        self.icons.poll();
         let mut first_rect = None;
         for slot in 0..self.visible_result_rows {
             let index = if self.config.layout == Layout::QueryBottom {
@@ -1705,7 +1762,7 @@ where
                 self.visible_start + slot
             };
             let (rect, _) = ui.allocate_exact_size(
-                egui::vec2(ui.available_width(), row_height),
+                egui::vec2(ui.available_width(), result_height),
                 egui::Sense::hover(),
             );
             first_rect.get_or_insert(rect);
@@ -1720,46 +1777,104 @@ where
                     painter.rect_filled(
                         egui::Rect::from_center_size(
                             egui::pos2(rect.left() + 1.5, rect.center().y),
-                            egui::vec2(3.0, 16.0),
+                            egui::vec2(
+                                3.0,
+                                if card.is_some() {
+                                    (rect.height() - 20.0).max(16.0)
+                                } else {
+                                    16.0
+                                },
+                            ),
                         ),
                         1.5,
                         appearance.palette.accent,
                     );
                 }
-                let display = displayed
-                    .snapshot
-                    .display_text(result.node_index, &displayed.query)
-                    .unwrap_or_else(|| result.path.clone());
-                let mut positions =
-                    resolve_match_positions(effective_query.as_deref().unwrap_or(""), &display);
-                positions.sort_unstable();
-                positions.dedup();
-                let text_left = rect.left() + 12.0;
-                let available = (rect.right() - text_left - RESULT_RIGHT_PADDING).max(0.0);
-                let typography = &appearance.typography;
-                let window = ui.fonts_mut(|fonts| {
-                    result_window(&display, &positions, available, |c, matched| {
-                        let font = if matched {
-                            &typography.bold
-                        } else {
-                            &typography.normal
-                        };
-                        fonts.glyph_width(font, c)
-                    })
-                });
-                let job = result_window_layout(
-                    &display,
-                    window,
-                    &positions,
-                    index == self.selected,
-                    appearance,
-                );
-                let galley = painter.layout_job(job);
-                painter.galley(
-                    egui::pos2(text_left, rect.center().y - galley.size().y / 2.0),
-                    galley,
-                    appearance.palette.text,
-                );
+                let display = if let (Some(template), Some(card)) = (&template, &card) {
+                    let below = if self.config.layout == Layout::QueryBottom {
+                        index.checked_sub(1)
+                    } else {
+                        Some(index + 1)
+                    };
+                    if slot + 1 < self.visible_result_rows
+                        && below.is_some_and(|below| {
+                            below < displayed.output.results.len()
+                                && below != self.selected
+                                && index != self.selected
+                        })
+                    {
+                        let y = rect.bottom() - 0.5;
+                        painter.line_segment(
+                            [
+                                egui::pos2(rect.left() + 12.0, y),
+                                egui::pos2(rect.right() - 12.0, y),
+                            ],
+                            egui::Stroke::new(
+                                1.0,
+                                crate::appearance::blend(
+                                    appearance.palette.background,
+                                    appearance.palette.divider,
+                                    0.3,
+                                ),
+                            ),
+                        );
+                    }
+                    let fields = displayed
+                        .snapshot
+                        .row_fields(result.node_index)
+                        .unwrap_or_default();
+                    paint_card(
+                        ui.ctx(),
+                        &painter,
+                        rect,
+                        template,
+                        card,
+                        &fields,
+                        effective_query.as_deref().unwrap_or(""),
+                        index == self.selected,
+                        &mut self.icons,
+                        appearance,
+                    )
+                } else {
+                    let display = displayed
+                        .snapshot
+                        .display_text(result.node_index, &displayed.query)
+                        .unwrap_or_else(|| result.path.clone());
+                    let mut inset = 0.0;
+                    if let Some(row_icon) = &self.row_icon {
+                        let size = (rect.height() - 2.0).max(1.0);
+                        let square = egui::Rect::from_min_size(
+                            egui::pos2(rect.left() + 12.0, rect.center().y - size / 2.0),
+                            egui::vec2(size, size),
+                        );
+                        if let Some(reference) = displayed
+                            .snapshot
+                            .item(result.node_index)
+                            .and_then(|item| row_icon(&item))
+                        {
+                            paint_icon(
+                                ui.ctx(),
+                                &painter,
+                                square,
+                                &reference,
+                                &mut self.icons,
+                                appearance,
+                            );
+                        }
+                        inset = size + CARD_ICON_GAP;
+                    }
+                    paint_result_line(
+                        ui,
+                        &painter,
+                        rect,
+                        inset,
+                        &display,
+                        effective_query.as_deref().unwrap_or(""),
+                        index == self.selected,
+                        appearance,
+                    );
+                    display
+                };
                 response.widget_info(|| {
                     egui::WidgetInfo::selected(
                         egui::WidgetType::Button,
@@ -1816,7 +1931,7 @@ where
         {
             let results_rect = egui::Rect::from_min_size(
                 top.min,
-                egui::vec2(top.width(), self.visible_result_rows as f32 * row_height),
+                egui::vec2(top.width(), self.visible_result_rows as f32 * result_height),
             );
             let galley = ui.painter().layout(
                 self.copy_notice.clone(),
@@ -1841,7 +1956,10 @@ where
         let hovered = first_rect.is_some_and(|first| {
             ui.rect_contains_pointer(egui::Rect::from_min_size(
                 first.min,
-                egui::vec2(first.width(), self.visible_result_rows as f32 * row_height),
+                egui::vec2(
+                    first.width(),
+                    self.visible_result_rows as f32 * result_height,
+                ),
             ))
         });
         let wheel = ui.input(|input| {
@@ -2209,14 +2327,27 @@ where
             .as_ref()
             .and_then(|displayed| displayed.snapshot.header(&self.query));
         let header_height = if header.is_some() { row_height } else { 0.0 };
+        let result_height = self.result_row_height(ctx, appearance);
+        // Room for the preview's divider only when a preview can show.
+        let overhead =
+            if (self.preview.is_some() || self.external_preview) && self.config.preview_visible {
+                PREVIEW_OVERHEAD
+            } else {
+                RESULTS_OVERHEAD
+            };
         self.visible_result_rows = self.config.result_rows.clamp(1, 256).min(
-            ((available - PREVIEW_OVERHEAD - header_height) / row_height - 1.0)
-                .floor()
-                .max(1.0) as usize,
+            rows_below_query(
+                available - overhead - header_height,
+                row_height,
+                result_height,
+            )
+            .floor()
+            .max(1.0) as usize,
         );
         let preview_row_height = appearance.typography.preview_row_height(ctx);
         let remaining = (available
-            - (self.visible_result_rows + 1) as f32 * row_height
+            - row_height
+            - self.visible_result_rows as f32 * result_height
             - PREVIEW_OVERHEAD
             - header_height)
             .max(0.0);
@@ -2236,18 +2367,21 @@ where
         if full_pane && self.visible_preview_rows == 0 {
             // The pane belongs to results when there is no visible preview.
             // Reserve the query, divider, frame margins, and optional header.
-            self.visible_result_rows =
-                ((available - PANEL_FRAME_HEIGHT - DIVIDER_HEIGHT - header_height) / row_height
-                    - 1.0)
-                    .floor()
-                    .clamp(1.0, u16::MAX as f32) as usize;
+            self.visible_result_rows = rows_below_query(
+                available - PANEL_FRAME_HEIGHT - DIVIDER_HEIGHT - header_height,
+                row_height,
+                result_height,
+            )
+            .floor()
+            .clamp(1.0, u16::MAX as f32) as usize;
         }
         self.keep_selected_visible();
         let has_preview = self.visible_preview_rows > 0;
         if !has_preview {
             self.leave_preview_focus();
         }
-        let height = (self.visible_result_rows + 1) as f32 * row_height
+        let height = row_height
+            + self.visible_result_rows as f32 * result_height
             + self.visible_preview_rows as f32 * preview_row_height
             + if has_preview {
                 PREVIEW_OVERHEAD
@@ -2310,7 +2444,8 @@ where
                                 // Keep results next to the bottom query. Any
                                 // unused pane height belongs above this block.
                                 let block_height = header_height
-                                    + (self.visible_result_rows + 1) as f32 * row_height
+                                    + row_height
+                                    + self.visible_result_rows as f32 * result_height
                                     + DIVIDER_HEIGHT;
                                 let gap = rect.bottom()
                                     - PANEL_INSET_BOTTOM
@@ -2625,6 +2760,330 @@ fn result_format(matched: bool, selected: bool, appearance: &Appearance) -> egui
     }
 }
 
+/// Vertical padding above the first and below the last line of a card.
+const CARD_PADDING_Y: f32 = 6.0;
+/// Space between card lines.
+const CARD_LINE_GAP: f32 = 1.0;
+/// Space between an icon and what follows it.
+const CARD_ICON_GAP: f32 = 6.0;
+/// Space between slots on a card line.
+const CARD_SLOT_GAP: f32 = 16.0;
+/// The share of a line that right-aligned slots may take.
+const CARD_RIGHT_SHARE: f32 = 0.6;
+
+/// Line heights, the leading icon's column and the total height of every
+/// card in a template.
+#[derive(Clone, Debug, PartialEq)]
+struct CardMetrics {
+    line_heights: Vec<f32>,
+    /// Width of the leading icon's column, its gap included; 0 without one.
+    leading: f32,
+    height: f32,
+}
+
+fn card_font(style: RowStyle, matched: bool, appearance: &Appearance) -> egui::FontId {
+    let base = if matched {
+        &appearance.typography.bold
+    } else {
+        &appearance.typography.normal
+    };
+    if style == RowStyle::Title {
+        egui::FontId::new((base.size * 1.15).round(), base.family.clone())
+    } else {
+        base.clone()
+    }
+}
+
+fn card_color(style: RowStyle, selected: bool, appearance: &Appearance) -> egui::Color32 {
+    let palette = &appearance.palette;
+    match style {
+        RowStyle::Muted => palette.muted,
+        RowStyle::Accent => palette.accent,
+        RowStyle::Normal | RowStyle::Title if selected => palette.selection_text,
+        RowStyle::Normal | RowStyle::Title => palette.text,
+    }
+}
+
+/// The height, in points, of a picker showing `rows` results without a preview
+/// or column header: as cards when `template` is set, else as lines. Hosts that
+/// size a window to its results can call it before any results arrive, and add
+/// the placement's margins.
+pub fn results_height(
+    ctx: &egui::Context,
+    appearance: &Appearance,
+    template: Option<&RowTemplate>,
+    rows: usize,
+) -> f32 {
+    let row_height = appearance.typography.preview_row_height(ctx);
+    let result_height = template.map_or(row_height, |template| {
+        card_metrics(ctx, appearance, template).height
+    });
+    row_height + rows.clamp(1, 256) as f32 * result_height + RESULTS_OVERHEAD
+}
+
+/// Each line is as tall as its tallest font; the card height is rounded to a
+/// whole physical pixel so stacked cards stay aligned. The leading icon is a
+/// square as tall as the title line.
+fn card_metrics(
+    ctx: &egui::Context,
+    appearance: &Appearance,
+    template: &RowTemplate,
+) -> CardMetrics {
+    let line_heights: Vec<f32> = ctx.fonts_mut(|fonts| {
+        template
+            .lines
+            .iter()
+            .map(|line| {
+                let styles = line.slots.iter().map(|slot| slot.style);
+                styles
+                    .chain(std::iter::once(RowStyle::Normal))
+                    .map(|style| {
+                        fonts
+                            .row_height(&card_font(style, false, appearance))
+                            .max(fonts.row_height(&card_font(style, true, appearance)))
+                    })
+                    .fold(0.0, f32::max)
+            })
+            .collect()
+    });
+    let content: f32 = line_heights.iter().sum::<f32>()
+        + CARD_LINE_GAP * line_heights.len().saturating_sub(1) as f32;
+    let scale = ctx.pixels_per_point().max(0.01);
+    let height = ((content + 2.0 * CARD_PADDING_Y) * scale).round() / scale;
+    let leading = match template.leading {
+        Some(_) => {
+            line_heights.get(template.title_line()).copied().unwrap_or(0.0) + CARD_ICON_GAP
+        }
+        None => 0.0,
+    };
+    CardMetrics {
+        line_heights,
+        leading,
+        height,
+    }
+}
+
+/// Match positions per field. The highlighted fields are joined in template
+/// order and matched once, so a query whose terms fall in different fields
+/// still highlights each of them; positions are mapped back to each field.
+fn card_match_positions(
+    template: &RowTemplate,
+    fields: &RowFields,
+    query: &str,
+) -> std::collections::HashMap<usize, Vec<usize>> {
+    let mut positions = std::collections::HashMap::new();
+    if query.is_empty() {
+        return positions;
+    }
+    let mut joined = String::new();
+    let mut ranges: Vec<(usize, usize, usize)> = Vec::new();
+    for slot in template.lines.iter().flat_map(|line| &line.slots) {
+        if !slot.highlight || ranges.iter().any(|&(field, ..)| field == slot.field) {
+            continue;
+        }
+        if !joined.is_empty() {
+            joined.push_str("  ");
+        }
+        let start = joined.len();
+        joined.push_str(fields.get(slot.field));
+        ranges.push((slot.field, start, joined.len()));
+    }
+    let mut matched = resolve_match_positions(query, &joined);
+    matched.sort_unstable();
+    matched.dedup();
+    for (field, start, end) in ranges {
+        let local: Vec<usize> = matched
+            .iter()
+            .filter(|&&p| p >= start && p < end)
+            .map(|&p| p - start)
+            .collect();
+        if !local.is_empty() {
+            positions.insert(field, local);
+        }
+    }
+    positions
+}
+
+/// Paint one card in `rect` and return its accessible label: the text slots'
+/// values (icon references are not words, so icons are left out).
+#[allow(clippy::too_many_arguments)]
+fn paint_card(
+    ctx: &egui::Context,
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    template: &RowTemplate,
+    metrics: &CardMetrics,
+    fields: &RowFields,
+    query: &str,
+    selected: bool,
+    icons: &mut IconCache,
+    appearance: &Appearance,
+) -> String {
+    let positions = card_match_positions(template, fields, query);
+    let no_positions = Vec::new();
+    let text_left = rect.left() + 12.0 + metrics.leading;
+    let text_right = rect.right() - RESULT_RIGHT_PADDING - 8.0;
+    let mut label = Vec::new();
+    let mut y = rect.top() + CARD_PADDING_Y;
+    let title_line = template.title_line();
+    for (line_index, (line, &height)) in
+        template.lines.iter().zip(&metrics.line_heights).enumerate()
+    {
+        let center_y = y + height / 2.0;
+        if line_index == title_line
+            && let Some(leading) = &template.leading
+        {
+            let size = metrics.leading - CARD_ICON_GAP;
+            let square = egui::Rect::from_min_size(
+                egui::pos2(rect.left() + 12.0, center_y - size / 2.0),
+                egui::vec2(size, size),
+            );
+            paint_icon(ctx, painter, square, fields.get(leading.field), icons, appearance);
+        }
+        let mut left = text_left;
+        let mut right = text_right;
+        let mut paint_slot = |slot: &RowSlot, available: f32, anchor: f32, align: RowAlign| -> f32 {
+            let text = fields.get(slot.field);
+            if text.is_empty() || available <= 0.0 {
+                return 0.0;
+            }
+            if slot.kind == SlotKind::Icon {
+                if available < height {
+                    return 0.0;
+                }
+                let x = match align {
+                    RowAlign::Left => anchor,
+                    RowAlign::Right => anchor - height,
+                };
+                let square = egui::Rect::from_min_size(
+                    egui::pos2(x, center_y - height / 2.0),
+                    egui::vec2(height, height),
+                );
+                let painted = paint_icon(ctx, painter, square, text, icons, appearance);
+                return if painted { height } else { 0.0 };
+            }
+            let slot_positions = if slot.highlight {
+                positions.get(&slot.field).unwrap_or(&no_positions)
+            } else {
+                &no_positions
+            };
+            let window = ctx.fonts_mut(|fonts| {
+                result_window(text, slot_positions, available, |c, matched| {
+                    fonts.glyph_width(&card_font(slot.style, matched, appearance), c)
+                })
+            });
+            let ellipsis = egui::TextFormat {
+                font_id: card_font(slot.style, false, appearance),
+                color: appearance.palette.muted,
+                ..Default::default()
+            };
+            let job = window_layout(text, window, slot_positions, ellipsis, |matched| {
+                egui::TextFormat {
+                    font_id: card_font(slot.style, matched, appearance),
+                    color: if matched {
+                        appearance.palette.match_highlight
+                    } else {
+                        card_color(slot.style, selected, appearance)
+                    },
+                    ..Default::default()
+                }
+            });
+            let galley = painter.layout_job(job);
+            let width = galley.size().x;
+            let x = match align {
+                RowAlign::Left => anchor,
+                RowAlign::Right => anchor - width,
+            };
+            painter.galley(
+                egui::pos2(x, center_y - galley.size().y / 2.0),
+                galley,
+                appearance.palette.text,
+            );
+            width
+        };
+        let gap = |slot: &RowSlot| match slot.kind {
+            SlotKind::Icon => CARD_ICON_GAP,
+            SlotKind::Text => CARD_SLOT_GAP,
+        };
+        // Right slots first, from the right edge inward, so they keep their
+        // width; left slots then share what is left, in order.
+        let line_width = (right - left).max(0.0);
+        for slot in line
+            .slots
+            .iter()
+            .rev()
+            .filter(|s| s.align == RowAlign::Right)
+        {
+            let budget = (line_width * CARD_RIGHT_SHARE - (text_right - right)).min(right - left);
+            let width = paint_slot(slot, budget, right, RowAlign::Right);
+            if width > 0.0 {
+                right -= width + gap(slot);
+            }
+        }
+        for slot in line.slots.iter().filter(|s| s.align == RowAlign::Left) {
+            let width = paint_slot(slot, right - left, left, RowAlign::Left);
+            if width > 0.0 {
+                left += width + gap(slot);
+            }
+        }
+        for slot in line.slots.iter().filter(|s| s.kind == SlotKind::Text) {
+            let text = fields.get(slot.field);
+            if !text.is_empty() {
+                label.push(text);
+            }
+        }
+        y += height + CARD_LINE_GAP;
+    }
+    label.join(" — ")
+}
+
+/// Paint a one-line result: `display` with query matches highlighted, shifted
+/// so the last match stays visible.
+fn paint_result_line(
+    ui: &egui::Ui,
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    inset: f32,
+    display: &str,
+    query: &str,
+    selected: bool,
+    appearance: &Appearance,
+) {
+    let mut positions = resolve_match_positions(query, display);
+    positions.sort_unstable();
+    positions.dedup();
+    let text_left = rect.left() + 12.0 + inset;
+    let available = (rect.right() - text_left - RESULT_RIGHT_PADDING).max(0.0);
+    let typography = &appearance.typography;
+    let window = ui.fonts_mut(|fonts| {
+        result_window(display, &positions, available, |c, matched| {
+            let font = if matched {
+                &typography.bold
+            } else {
+                &typography.normal
+            };
+            fonts.glyph_width(font, c)
+        })
+    });
+    let job = result_window_layout(display, window, &positions, selected, appearance);
+    let galley = painter.layout_job(job);
+    painter.galley(
+        egui::pos2(text_left, rect.center().y - galley.size().y / 2.0),
+        galley,
+        appearance.palette.text,
+    );
+}
+
+/// Rows that fit in `space` below a query row of `row_height`, each
+/// `result_height` tall. One-line results keep the original arithmetic.
+fn rows_below_query(space: f32, row_height: f32, result_height: f32) -> f32 {
+    if result_height == row_height {
+        space / row_height - 1.0
+    } else {
+        (space - row_height) / result_height
+    }
+}
+
 /// Lay out `window` of `text`, one section per run of matched or unmatched
 /// characters. `positions` must be sorted.
 fn result_window_layout(
@@ -2634,12 +3093,26 @@ fn result_window_layout(
     selected: bool,
     appearance: &Appearance,
 ) -> egui::text::LayoutJob {
-    let mut job = egui::text::LayoutJob::default();
     let ellipsis = egui::TextFormat {
         font_id: appearance.typography.normal.clone(),
         color: appearance.palette.muted,
         ..Default::default()
     };
+    window_layout(text, window, positions, ellipsis, |matched| {
+        result_format(matched, selected, appearance)
+    })
+}
+
+/// Lay out `window` of `text` with `format(matched)` for each run and
+/// `ellipsis` for the markers of hidden text. `positions` must be sorted.
+fn window_layout(
+    text: &str,
+    window: ResultWindow,
+    positions: &[usize],
+    ellipsis: egui::TextFormat,
+    format: impl Fn(bool) -> egui::TextFormat,
+) -> egui::text::LayoutJob {
+    let mut job = egui::text::LayoutJob::default();
     if window.leading {
         job.append(&RESULT_ELLIPSIS.to_string(), 0.0, ellipsis.clone());
     }
@@ -2653,14 +3126,14 @@ fn result_window_layout(
         }
         let matched = positions.get(next) == Some(&offset);
         if matched != run_matched && !run.is_empty() {
-            job.append(&run, 0.0, result_format(run_matched, selected, appearance));
+            job.append(&run, 0.0, format(run_matched));
             run.clear();
         }
         run_matched = matched;
         run.push(result_display_char(c));
     }
     if !run.is_empty() {
-        job.append(&run, 0.0, result_format(run_matched, selected, appearance));
+        job.append(&run, 0.0, format(run_matched));
     }
     if window.trailing {
         job.append(&RESULT_ELLIPSIS.to_string(), 0.0, ellipsis);
@@ -5763,5 +6236,482 @@ mod long_result_tests {
         assert!(rect.right() <= width, "row overflows: {rect:?}");
         // Later frames rebuild the row and paint the same text.
         assert_eq!(paint().0, text);
+    }
+}
+
+#[cfg(test)]
+mod card_tests {
+    use super::*;
+    use nfm_picker_sources::structured::{
+        StructuredSchema, StructuredStreamingSnapshot, StructuredStreamingStore,
+    };
+    use nfm_search_core::{snapshot_store::SnapshotStore, store::FlatSnapshot};
+
+    fn make(rows: &[[&str; 4]]) -> (Context, Picker<StructuredStreamingSnapshot>) {
+        let ctx = Context::default();
+        // `updated` holds seconds ago; the host words them.
+        let schema = StructuredSchema::new(
+            ["project", "updated", "title", "status"]
+                .map(String::from)
+                .to_vec(),
+        )
+        .unwrap()
+        .with_formatter("updated", |raw| match raw.parse::<u64>() {
+            Ok(seconds) if seconds < 3600 => format!("{} minutes ago", seconds / 60),
+            Ok(seconds) => format!("{} hours ago", seconds / 3600),
+            Err(_) => raw.into(),
+        })
+        .unwrap();
+        let template = schema
+            .row_template("project:muted|updated:right;title:title", None)
+            .unwrap();
+        let mut store = StructuredStreamingStore::new(schema)
+            .with_row_template(template)
+            .unwrap();
+        for row in rows {
+            store
+                .add_record(&csv::StringRecord::from(row.to_vec()))
+                .unwrap();
+        }
+        let source = Arc::new(SnapshotStore::new());
+        source.publish(store.snapshot());
+        source.complete();
+        let picker = Picker::new(
+            "cards",
+            &ctx,
+            source,
+            PickerConfig {
+                preview_visible: false,
+                result_rows: 3,
+                ..Default::default()
+            },
+        );
+        (ctx, picker)
+    }
+
+    fn texts(ctx: &Context, picker: &mut Picker<StructuredStreamingSnapshot>) -> Vec<String> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !picker.current_results() {
+            picker.poll();
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let mut frame = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1000.0, 800.0),
+                )),
+                ..Default::default()
+            },
+            |ui| {
+                picker.show(
+                    ui.ctx(),
+                    Placement::new(ui.ctx().content_rect()),
+                    &Appearance::default(),
+                    false,
+                );
+            },
+        );
+        frame.textures_delta.clear();
+        frame
+            .shapes
+            .iter()
+            .filter_map(|clipped| match &clipped.shape {
+                egui::Shape::Text(text) => Some(text.galley.text().to_owned()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_window_sized_by_results_height_shows_that_many_cards() {
+        let rows: Vec<[&str; 4]> = (0..10).map(|_| ["p", "60", "title", "s"]).collect();
+        let (ctx, mut picker) = make(&rows);
+        // The window, not result_rows, limits the cards.
+        picker.config.result_rows = 6;
+        texts(&ctx, &mut picker);
+        let appearance = Appearance::default();
+        let template = picker
+            .displayed
+            .as_ref()
+            .and_then(|displayed| displayed.snapshot.row_template().cloned())
+            .unwrap();
+        for rows in [1, 4, 6] {
+            let placement = Placement::new(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(
+                    600.0,
+                    results_height(&ctx, &appearance, Some(&template), rows) + 20.0,
+                ),
+            ));
+            let frame = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(placement.bounds),
+                    ..Default::default()
+                },
+                |ui| {
+                    picker.show(ui.ctx(), placement, &appearance, false);
+                },
+            );
+            frame.drop_without_applying_deltas();
+            assert_eq!(picker.visible_result_rows, rows);
+        }
+    }
+
+    #[test]
+    fn cards_paint_fields_host_formatted_times_and_size_the_panel_by_card() {
+        let nine = (9 * 60).to_string();
+        let three = (3 * 3600 + 60).to_string();
+        let (ctx, mut picker) = make(&[
+            ["src/t3code", nine.as_str(), "/resume", "running"],
+            [
+                "src/nterm",
+                three.as_str(),
+                "what worktrees do we have",
+                "done",
+            ],
+        ]);
+        let painted = texts(&ctx, &mut picker);
+        for expected in [
+            "src/t3code",
+            "9 minutes ago",
+            "/resume",
+            "src/nterm",
+            "3 hours ago",
+        ] {
+            assert!(
+                painted.iter().any(|text| text == expected),
+                "{expected:?} not painted in {painted:?}"
+            );
+        }
+        // Cards have no column header and do not paint the CSV display text.
+        assert!(!painted.iter().any(|text| text.contains("project")));
+        assert!(!painted.iter().any(|text| text.contains(',')));
+        let line = Appearance::default().typography.preview_row_height(&ctx);
+        let card = picker.result_row_height(&ctx, &Appearance::default());
+        assert!(card > 2.0 * line, "card {card} vs line {line}");
+        assert_eq!(picker.visible_result_rows, 3);
+    }
+
+    #[test]
+    fn matches_across_fields_are_highlighted_in_each_field() {
+        let template = RowTemplate::parse("project|updated:right:nohl;title", None, |name| {
+            ["project", "updated", "title"]
+                .iter()
+                .position(|n| *n == name)
+        })
+        .unwrap();
+        let fields = RowFields {
+            values: vec![
+                "src/t3code".into(),
+                "9 minutes ago".into(),
+                "/resume".into(),
+            ],
+        };
+        let positions = card_match_positions(&template, &fields, "t3 resume");
+        assert_eq!(positions.get(&0), Some(&vec![4, 5]));
+        assert_eq!(positions.get(&2), Some(&vec![1, 2, 3, 4, 5, 6]));
+        // `nohl` slots are not highlighted.
+        assert!(!positions.contains_key(&1));
+        assert!(card_match_positions(&template, &fields, "").is_empty());
+    }
+
+    #[test]
+    fn values_a_formatter_leaves_alone_are_shown_as_they_are() {
+        let (ctx, mut picker) = make(&[["p", "sometime", "t", ""]]);
+        let painted = texts(&ctx, &mut picker);
+        assert!(painted.iter().any(|text| text == "sometime"));
+    }
+
+    /// A picker over `columns` with a card `template` and optional leading
+    /// icon slot.
+    fn make_cards(
+        columns: &[&str],
+        template: &str,
+        leading: Option<&str>,
+        rows: &[&[&str]],
+    ) -> (Context, Picker<StructuredStreamingSnapshot>) {
+        let ctx = Context::default();
+        let schema = StructuredSchema::new(columns.iter().map(|c| c.to_string()).collect()).unwrap();
+        let template = schema.row_template(template, leading).unwrap();
+        let mut store = StructuredStreamingStore::new(schema)
+            .with_row_template(template)
+            .unwrap();
+        for row in rows {
+            store
+                .add_record(&csv::StringRecord::from(row.to_vec()))
+                .unwrap();
+        }
+        let source = Arc::new(SnapshotStore::new());
+        source.publish(store.snapshot());
+        source.complete();
+        let picker = Picker::new(
+            "icon-cards",
+            &ctx,
+            source,
+            PickerConfig {
+                preview_visible: false,
+                result_rows: 3,
+                ..Default::default()
+            },
+        );
+        (ctx, picker)
+    }
+
+    /// Run `frames` frames and return the last frame's shapes.
+    fn shapes(
+        ctx: &Context,
+        picker: &mut Picker<StructuredStreamingSnapshot>,
+        frames: usize,
+    ) -> Vec<egui::Shape> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !picker.current_results() {
+            picker.poll();
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let mut shapes = Vec::new();
+        for _ in 0..frames {
+            let mut frame = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1000.0, 800.0),
+                    )),
+                    ..Default::default()
+                },
+                |ui| {
+                    picker.show(
+                        ui.ctx(),
+                        Placement::new(ui.ctx().content_rect()),
+                        &Appearance::default(),
+                        false,
+                    );
+                },
+            );
+            frame.textures_delta.clear();
+            shapes = frame.shapes.into_iter().map(|clipped| clipped.shape).collect();
+        }
+        shapes
+    }
+
+    /// The color of each `glyph` painted in `shapes`.
+    fn glyph_colors(shapes: &[egui::Shape], glyph: &str) -> Vec<egui::Color32> {
+        shapes
+            .iter()
+            .filter_map(|shape| match shape {
+                egui::Shape::Text(text) if text.galley.text() == glyph => text
+                    .galley
+                    .job
+                    .sections
+                    .first()
+                    .map(|section| section.format.color),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn glyph_fonts(shapes: &[egui::Shape], glyph: char) -> Vec<egui::FontFamily> {
+        shapes
+            .iter()
+            .filter_map(|shape| match shape {
+                egui::Shape::Text(text) if text.galley.text() == glyph.to_string() => text
+                    .galley
+                    .job
+                    .sections
+                    .first()
+                    .map(|section| section.format.font_id.family.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn leading_glyphs_use_their_color_or_the_text_color_and_empty_values_paint_none() {
+        let (ctx, mut picker) = make_cards(
+            &["name", "icon"],
+            "name:title",
+            Some("icon"),
+            &[&["a", "glyph:●@#ff0000"], &["b", "glyph:●"], &["c", ""]],
+        );
+        let mut colors = glyph_colors(&shapes(&ctx, &mut picker, 1), "●");
+        colors.sort_by_key(|color| color.to_array());
+        let mut expected = vec![
+            egui::Color32::from_rgb(255, 0, 0),
+            Appearance::default().palette.text,
+        ];
+        expected.sort_by_key(|color| color.to_array());
+        assert_eq!(colors, expected);
+    }
+
+    #[test]
+    fn devicon_glyphs_draw_with_the_bundled_symbols_font() {
+        let (ctx, mut picker) = make_cards(
+            &["path"],
+            "path:icon:devicon|path",
+            None,
+            &[&["src/main.rs"]],
+        );
+        let glyph = nfm_picker_sources::devicon::lookup("main.rs").glyph;
+        // The font registers on the first frame and is used from the next.
+        let families = glyph_fonts(&shapes(&ctx, &mut picker, 3), glyph);
+        assert_eq!(
+            families,
+            vec![egui::FontFamily::Name(crate::icons::SYMBOLS_FONT_FAMILY.into())]
+        );
+    }
+
+    #[test]
+    fn host_references_need_a_resolver_and_resolve_off_the_ui_thread() {
+        use crate::icons::IconSource;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let rows: &[&[&str]] = &[&["a", "host:dot"], &["b", "hwnd:0x10"]];
+        // Without resolvers, data cannot reach anything but glyphs.
+        let (ctx, mut picker) = make_cards(&["name", "icon"], "icon:icon|name", None, rows);
+        assert!(glyph_colors(&shapes(&ctx, &mut picker, 2), "H").is_empty());
+
+        let (ctx, mut picker) = make_cards(&["name", "icon"], "icon:icon|name", None, rows);
+        let asked = Arc::new(AtomicUsize::new(0));
+        let seen = asked.clone();
+        let ui_thread = std::thread::current().id();
+        picker.add_icon_resolver(Arc::new(move |reference: &str, size: u32| {
+            seen.fetch_add(1, Ordering::SeqCst);
+            assert_ne!(std::thread::current().id(), ui_thread);
+            assert!(size > 0);
+            (reference == "host:dot").then(|| IconSource::Glyph {
+                text: "H".into(),
+                color: Some(egui::Color32::from_rgb(1, 2, 3)),
+            })
+        }));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let fills = loop {
+            let fills = glyph_colors(&shapes(&ctx, &mut picker, 1), "H");
+            if !fills.is_empty() || Instant::now() > deadline {
+                break fills;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        assert_eq!(fills, vec![egui::Color32::from_rgb(1, 2, 3)]);
+        // Each reference is resolved once, then cached.
+        let _ = shapes(&ctx, &mut picker, 3);
+        assert_eq!(asked.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn painted_host_icons_are_drawn_each_frame() {
+        use crate::icons::IconSource;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let (ctx, mut picker) =
+            make_cards(&["name", "state"], "name:title", Some("state"), &[&["a", "swm:running"]]);
+        let painted = Arc::new(AtomicUsize::new(0));
+        let count = painted.clone();
+        picker.add_icon_resolver(Arc::new(move |reference: &str, _: u32| {
+            let count = count.clone();
+            (reference == "swm:running").then(|| IconSource::Painted {
+                paint: Arc::new(move |_: &egui::Painter, rect: egui::Rect, _: f64| {
+                    assert!(rect.width() > 0.0 && (rect.width() - rect.height()).abs() < 0.01);
+                    count.fetch_add(1, Ordering::SeqCst);
+                }),
+                animated: false,
+            })
+        }));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while painted.load(Ordering::SeqCst) == 0 && Instant::now() < deadline {
+            let _ = shapes(&ctx, &mut picker, 1);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let before = painted.load(Ordering::SeqCst);
+        assert!(before > 0);
+        let _ = shapes(&ctx, &mut picker, 2);
+        assert_eq!(painted.load(Ordering::SeqCst), before + 2);
+    }
+
+    /// The last frame's shapes and the x of each result's text, for a picker
+    /// over plain `rows`.
+    fn plain_rows(
+        rows: &[(&str, u32)],
+        setup: impl FnOnce(&mut Picker<FlatSnapshot<u32>>),
+    ) -> (Vec<egui::Shape>, Vec<(String, f32)>) {
+        let ctx = Context::default();
+        let store = Arc::new(SnapshotStore::new());
+        store.publish(Arc::new(FlatSnapshot::from_items(rows.iter().copied())));
+        store.complete();
+        let mut picker = Picker::new(
+            "row-icons",
+            &ctx,
+            store,
+            PickerConfig {
+                preview_visible: false,
+                result_rows: rows.len(),
+                ..Default::default()
+            },
+        );
+        setup(&mut picker);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !picker.current_results() {
+            picker.poll();
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let mut shapes = Vec::new();
+        for _ in 0..2 {
+            let mut frame = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1000.0, 800.0),
+                    )),
+                    ..Default::default()
+                },
+                |ui| {
+                    picker.show(
+                        ui.ctx(),
+                        Placement::new(ui.ctx().content_rect()),
+                        &Appearance::default(),
+                        false,
+                    );
+                },
+            );
+            frame.textures_delta.clear();
+            shapes = frame.shapes.into_iter().map(|clipped| clipped.shape).collect();
+        }
+        let texts = shapes
+            .iter()
+            .filter_map(|shape| match shape {
+                egui::Shape::Text(text)
+                    if rows.iter().any(|(row, _)| *row == text.galley.text()) =>
+                {
+                    Some((text.galley.text().to_string(), text.pos.x))
+                }
+                _ => None,
+            })
+            .collect();
+        (shapes, texts)
+    }
+
+    #[test]
+    fn row_icons_draw_beside_one_line_results_and_keep_text_aligned() {
+        let rows = [("alpha", 1u32), ("beta", 2)];
+        let (_, plain) = plain_rows(&rows, |_| {});
+        let (shapes, iconed) = plain_rows(&rows, |picker| {
+            picker.set_row_icon(Some(Arc::new(|item: &u32| {
+                (*item == 1).then(|| "glyph:★@#010203".to_string())
+            })));
+        });
+        assert_eq!(
+            glyph_colors(&shapes, "★"),
+            vec![egui::Color32::from_rgb(1, 2, 3)]
+        );
+        assert_eq!(plain.len(), 2);
+        assert_eq!(iconed.len(), 2);
+        // Both rows move right by the same column, with or without an icon.
+        let shift: Vec<f32> = plain
+            .iter()
+            .zip(&iconed)
+            .map(|((_, before), (_, after))| after - before)
+            .collect();
+        assert!(shift[0] > 10.0, "{shift:?}");
+        assert_eq!(shift[0], shift[1]);
     }
 }

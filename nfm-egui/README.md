@@ -140,6 +140,30 @@ previews. Parsing is pure Rust (`vte` plus the line model in `src/ansi.rs`);
 by `Preview::Text`. Native window thumbnails and application-specific preview
 content are supplied by host adapters, not a second NFM-owned popup window.
 
+## Card rows and icons
+
+A source that returns a `RowTemplate` from `ItemsSource::row_template` (and
+`RowFields` per item) is drawn as multi-line cards; the structured CSV store
+builds one with `StructuredSchema::row_template`. Icon slots hold references
+(`nfm_search_core::icon::IconRef`): `glyph:TEXT[@COLOR]` or a bare 1–2
+character glyph. Glyphs are drawn with the bundled Symbols Nerd Font
+(MIT, about 2.5 MB; turn off the default `symbols-font` feature to leave it
+out, and glyphs then use the normal font).
+
+Any other `SCHEME:REST` reference paints nothing unless the host installs an
+`icons::IconResolver` with `Picker::add_icon_resolver`. Resolvers run on a
+worker thread and return a glyph, a `ColorImage`, or a `Painted`
+closure drawn each frame (set `animated` to keep repainting). Results are
+cached per reference and size. Install resolvers only for references the host
+builds itself; data that reaches a resolver chooses what it reads.
+Images are drawn at their own pixel size when they fit, on whole pixels, so
+resolvers should return them at the requested `size_px`.
+
+One-line results can show an icon too: `Picker::set_row_icon` takes a function
+from an item to a reference, and items that return `None` keep an empty column
+so text stays aligned. Build the reference in host code from the item, not
+from its text.
+
 ## Appearance and placement
 
 Pass `Appearance` each frame. It contains an instance palette and normal/bold
@@ -297,6 +321,17 @@ Structured queries share one parser and source completions:
 `/#Display==Column,OtherColumn` selects/reorders displayed columns. Quoted values,
 comma-separated alternatives, repeated expressions and fuzzy text can be combined.
 These expressions are available on structured sources, such as processes.
+Sorting and comparisons follow each column's type
+(`StructuredSchema::with_types`, such as `size:bytes=KB,took:duration`): values
+are parsed once per cell, filter values are read the same way
+(`/:WorkingSet>500MB`), and cells a type cannot parse sort last. Number, size
+and duration columns are right-aligned, and `StructuredSchema::with_formats`
+(such as `size:bytes`) or `with_formatter` (a host function, such as one that
+words a timestamp as "9 minutes ago") shows a column formatted in the table and
+on cards; fuzzy search reads the formatted text, everything else the raw value.
+Typed `datetime`, `duration` and `bytes` columns default to their type's format. `with_default_sort`
+(`/!Descending==CPU /!Descending==PrivateBytes`) orders rows until the query has
+fuzzy text or `/!` sorts of its own; sorts without fuzzy text order every row.
 
 Typing `/` opens a six-row completion popup at the active token.
 Up/Down selects a suggestion, Enter or Tab applies it, and Escape dismisses the

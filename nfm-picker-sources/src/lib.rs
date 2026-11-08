@@ -1,5 +1,9 @@
+pub mod cell_format;
+pub mod column_type;
 pub mod delimited;
+pub mod devicon;
 pub mod structured;
+pub mod value;
 
 pub mod command;
 pub mod file;

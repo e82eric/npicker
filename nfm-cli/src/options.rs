@@ -94,7 +94,15 @@ pub struct Options {
     pub value_field: Field,
     pub input_format: InputFormat,
     pub csv_columns: Option<Vec<String>>,
+    /// Column types, `NAME:TYPE,...`; see `StructuredSchema::with_types`.
+    pub csv_types: Option<String>,
+    /// Table formats, `NAME:FORMAT,...`; see `StructuredSchema::with_formats`.
+    pub csv_formats: Option<String>,
     pub csv_delimiter: u8,
+    /// Card layout for csv rows; see `RowTemplate::parse`.
+    pub row_template: Option<String>,
+    /// Slot painted as an icon beside each card title, such as `path:devicon`.
+    pub row_icon: Option<String>,
     pub preview_file_field: Option<usize>,
     pub preview_center_line_field: Option<usize>,
     pub unique: bool,
@@ -151,7 +159,11 @@ impl Default for Options {
             value_field: Field::All,
             input_format: InputFormat::Lines,
             csv_columns: None,
+            csv_types: None,
+            csv_formats: None,
             csv_delimiter: b',',
+            row_template: None,
+            row_icon: None,
             preview_file_field: None,
             preview_center_line_field: None,
             unique: false,
@@ -404,6 +416,10 @@ fn apply_value(
             }
             o.csv_columns = Some(columns);
         }
+        "csv-types" => o.csv_types = Some(value("NAME:TYPE pairs")?),
+        "csv-formats" => o.csv_formats = Some(value("NAME:FORMAT pairs")?),
+        "row-template" => o.row_template = Some(value("a row template")?),
+        "row-icon" => o.row_icon = Some(value("an icon slot")?),
         "csv-delimiter" => {
             let delimiter = parse_delimiter(&flag, &value("a character")?)?;
             o.csv_delimiter = u8::try_from(delimiter)
@@ -649,7 +665,11 @@ fn finish(draft: Draft) -> Result<Options, String> {
         "--preview-file-field",
     )?;
     only(!csv && o.csv_columns.is_some(), "--csv-columns", "--input-format csv")?;
+    only(!csv && o.csv_types.is_some(), "--csv-types", "--input-format csv")?;
+    only(!csv && o.csv_formats.is_some(), "--csv-formats", "--input-format csv")?;
     only(!csv && o.csv_delimiter != b',', "--csv-delimiter", "--input-format csv")?;
+    only(!csv && o.row_template.is_some(), "--row-template", "--input-format csv")?;
+    only(o.row_icon.is_some() && o.row_template.is_none(), "--row-icon", "--row-template")?;
     if (delimited || csv) && (o.unique || o.reverse || o.line_continuation.is_some()) {
         return Err("--unique, --reverse and --line-continuation apply to plain lines, not --delimiter or csv input".into());
     }
@@ -880,6 +900,17 @@ Line input (stdin, file, command):
       --input-format <lines|csv>      Read CSV records as a table; filter with /:size==2, sort with /!Descending==size
       --csv-columns <A,B,...>         Column names when the input has no header record
       --csv-delimiter <CHAR>          CSV field separator (default ,)
+      --csv-types <NAME:TYPE,...>     Column types for sorting, filters and default formats: auto,
+                                      text, number, bytes[=UNIT], duration or datetime
+      --csv-formats <NAME:FORMAT,...> Show and search columns formatted, e.g. size:bytes,took:duration:
+                                      date[=STRFTIME], duration, number[=N], bytes or percent[=N];
+                                      typed columns default to their type's format. Sorting,
+                                      filters and output keep the raw values
+      --row-template <SPEC>           Show csv rows as cards: lines split by ;, slots by |,
+                                      slots are COLUMN[:title|muted|accent|right|nohl], shown as
+                                      the table shows them; COLUMN:icon[:devicon] paints an icon
+      --row-icon <SLOT>               Icon beside each card title, e.g. path:devicon or a column
+                                      of glyph:TEXT[@COLOR] references
 
 Filesystem:
       --max-depth <N>                 Limit how deep the walk goes
@@ -1020,6 +1051,16 @@ mod tests {
         assert!(run(&["--input-format", "csv", "--delimiter", ","]).is_err());
         assert!(run(&["--csv-columns", "a,b"]).is_err());
         assert!(run(&["--input-format", "csv", "--csv-columns", "a,b"]).is_ok());
+        assert!(run(&["--csv-types", "a:number"]).is_err());
+        assert!(run(&["--input-format", "csv", "--csv-types", "a:number"]).is_ok());
+        assert!(run(&["--csv-formats", "a:bytes"]).is_err());
+        assert!(run(&["--input-format", "csv", "--csv-formats", "a:bytes"]).is_ok());
+        assert!(run(&["--row-template", "a"]).is_err());
+        assert!(run(&["--input-format", "csv", "--row-icon", "a:devicon"]).is_err());
+        assert!(
+            run(&["--input-format", "csv", "--row-template", "a;b:muted", "--row-icon", "a:devicon"])
+                .is_ok()
+        );
     }
 
     #[test]

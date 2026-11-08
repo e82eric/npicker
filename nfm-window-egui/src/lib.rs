@@ -4,15 +4,16 @@ use nfm_egui::{
     Appearance, ItemsSource, Picker, PickerConfig, PickerEvent, Placement, SearchSnapshotProvider,
     egui,
 };
-use nfm_search_core::{snapshot_store::SnapshotStore, store::FlatSnapshot};
+use nfm_search_core::snapshot_store::SnapshotStore;
 use nfm_win32::{
-    WindowPickerItem,
+    WindowPickerItem, WindowPickerSnapshot,
     list_windows::{WindowListItem, list_windows},
 };
 use std::sync::Arc;
 use windows_sys::Win32::UI::WindowsAndMessaging::IsWindow;
-/// Immutable window candidates, excluding the host popup.
-pub type WindowSnapshot = FlatSnapshot<WindowPickerItem>;
+/// Immutable window candidates, excluding the host popup: a table of handle,
+/// PID, process and title columns.
+pub type WindowSnapshot = WindowPickerSnapshot;
 /// Map native window snapshots to the host's shared picker type.
 pub trait WindowSourceAdapter<S: ItemsSource>: Send + Sync + 'static {
     fn source(
@@ -161,19 +162,16 @@ where
         }
     }
 }
-fn window_snapshot(items: Vec<WindowListItem>, destination: isize) -> WindowSnapshot {
-    FlatSnapshot::from_items(
-        items
-            .into_iter()
-            .filter(|item| item.hwnd != destination)
-            .map(|item| {
-                let payload = WindowPickerItem {
-                    title: item.text.clone(),
-                    native_window: item.hwnd,
-                };
-                (item.text, payload)
-            }),
-    )
+/// The windows other than `destination` (pass 0 to keep every window) as a
+/// table under a `HWND  PID  Process  Title` header. Column filters such as
+/// `/:Process==Code.exe` and sorting such as `/!Descending==PID` work as in
+/// the process picker.
+pub fn window_snapshot(items: Vec<WindowListItem>, destination: isize) -> WindowSnapshot {
+    let items: Vec<_> = items
+        .into_iter()
+        .filter(|item| item.hwnd != destination)
+        .collect();
+    WindowPickerSnapshot::from_items(&items)
 }
 /// DWM composites only the selected window into the popup; no screen capture.
 #[derive(Default)]
@@ -289,10 +287,14 @@ mod picker_tests {
             WindowListItem {
                 text: "host popup".into(),
                 hwnd: 1,
+                ..Default::default()
             },
             WindowListItem {
-                text: "selected window".into(),
+                text: "00000002     42 Code.exe selected window".into(),
                 hwnd: 2,
+                title: "selected window".into(),
+                process_name: "Code.exe".into(),
+                process_id: 42,
             },
         ]
     }
@@ -354,7 +356,35 @@ mod picker_tests {
         assert_eq!(snapshot.len(), 1);
         let item = snapshot.item(0).unwrap();
         assert_eq!(item.native_window, 2);
-        assert_eq!(item.title, "selected window");
+        assert_eq!(item.title, "00000002     42 Code.exe selected window");
+    }
+    #[test]
+    fn windows_are_a_table_with_a_header_and_column_filters() {
+        let mut items = items();
+        items.push(WindowListItem {
+            text: "00000003      7 notepad.exe notes".into(),
+            hwnd: 3,
+            title: "notes".into(),
+            process_name: "notepad.exe".into(),
+            process_id: 7,
+        });
+        let snapshot = window_snapshot(items, 1);
+        let header = snapshot.header("").unwrap();
+        let columns: Vec<&str> = header.split_whitespace().collect();
+        assert_eq!(columns, ["HWND", "PID", "Process", "Title"]);
+        let row = snapshot.display_text(0, "").unwrap();
+        let cells: Vec<&str> = row.split_whitespace().collect();
+        assert_eq!(cells, ["00000002", "42", "Code.exe", "selected", "window"]);
+        // Columns line up under the header.
+        assert_eq!(row.find("Code.exe"), header.find("Process"));
+        let matches = |query: &str| {
+            let plan = snapshot.create_search_plan(query);
+            (0..snapshot.len())
+                .filter(|&index| plan.includes(index))
+                .map(|index| snapshot.item(index).unwrap().native_window)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(matches("/:Process==notepad.exe"), [3]);
     }
     #[test]
     fn selection_cancel_and_reuse_preserve_window_behavior() {
