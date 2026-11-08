@@ -1772,6 +1772,10 @@ where
             {
                 let response =
                     ui.interact(rect, self.id.with(("row", index)), egui::Sense::click());
+                let hovered = response.hovered() && index != self.selected;
+                if hovered {
+                    painter.rect_filled(rect, 4, appearance.palette.hover_background());
+                }
                 if index == self.selected {
                     painter.rect_filled(rect, 4, appearance.palette.selection_background);
                     painter.rect_filled(
@@ -1796,7 +1800,14 @@ where
                     } else {
                         Some(index + 1)
                     };
+                    // The row below this one on screen is the next slot, in
+                    // either layout. Its response isn't built yet, so test the
+                    // pointer against its rect.
+                    let below_rect = rect.translate(egui::vec2(0.0, result_height));
+                    let below_hovered = ui.is_enabled() && ui.rect_contains_pointer(below_rect);
                     if slot + 1 < self.visible_result_rows
+                        && !hovered
+                        && !below_hovered
                         && below.is_some_and(|below| {
                             below < displayed.output.results.len()
                                 && below != self.selected
@@ -6713,5 +6724,97 @@ mod card_tests {
             .collect();
         assert!(shift[0] > 10.0, "{shift:?}");
         assert_eq!(shift[0], shift[1]);
+    }
+
+    #[test]
+    fn hovering_an_unselected_result_fills_it_without_moving_the_selection() {
+        let ctx = Context::default();
+        let store = Arc::new(SnapshotStore::new());
+        store.publish(Arc::new(FlatSnapshot::from_items(
+            [("alpha", 1u32), ("beta", 2), ("gamma", 3)],
+        )));
+        store.complete();
+        let mut picker = Picker::new(
+            "hover",
+            &ctx,
+            store,
+            PickerConfig {
+                preview_visible: false,
+                result_rows: 3,
+                ..Default::default()
+            },
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !picker.current_results() {
+            picker.poll();
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let hover = Appearance::default().palette.hover_background();
+        let mut frame = |events: Vec<egui::Event>| {
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1000.0, 800.0),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    picker.show(
+                        ui.ctx(),
+                        Placement::new(ui.ctx().content_rect()),
+                        &Appearance::default(),
+                        false,
+                    );
+                },
+            );
+            output.textures_delta.clear();
+            output
+                .shapes
+                .into_iter()
+                .map(|clipped| clipped.shape)
+                .collect::<Vec<_>>()
+        };
+        let text_pos = |shapes: &[egui::Shape], wanted: &str| {
+            shapes
+                .iter()
+                .find_map(|shape| match shape {
+                    egui::Shape::Text(text) if text.galley.text() == wanted => {
+                        Some(text.pos + egui::vec2(2.0, 4.0))
+                    }
+                    _ => None,
+                })
+                .unwrap()
+        };
+        let hover_fills = |shapes: &[egui::Shape]| {
+            shapes
+                .iter()
+                .filter_map(|shape| match shape {
+                    egui::Shape::Rect(rect) if rect.fill == hover => Some(rect.rect),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        frame(vec![]);
+        let shapes = frame(vec![]);
+        assert!(hover_fills(&shapes).is_empty());
+        let beta = text_pos(&shapes, "beta");
+        let alpha = text_pos(&shapes, "alpha");
+
+        frame(vec![egui::Event::PointerMoved(beta)]);
+        let shapes = frame(vec![]);
+        let fills = hover_fills(&shapes);
+        assert_eq!(fills.len(), 1, "{fills:?}");
+        assert!(fills[0].contains(beta));
+
+        // The selected row keeps its own fill.
+        frame(vec![egui::Event::PointerMoved(alpha)]);
+        assert!(hover_fills(&frame(vec![])).is_empty());
+
+        frame(vec![egui::Event::PointerGone]);
+        assert!(hover_fills(&frame(vec![])).is_empty());
+        assert_eq!(picker.selected, 0);
     }
 }

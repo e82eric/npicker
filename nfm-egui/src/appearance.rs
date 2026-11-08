@@ -46,6 +46,11 @@ impl Palette {
             .unwrap_or_else(|| blend(self.preview_selection_background, self.text, 0.30));
         blend(self.background, peak, strength)
     }
+    /// Fill under a result row the pointer is over: halfway between the
+    /// background and the selection, so the selected row still stands out.
+    pub fn hover_background(&self) -> Color32 {
+        blend(self.background, self.selection_background, 0.5)
+    }
 }
 pub(crate) fn blend(a: Color32, b: Color32, amount: f32) -> Color32 {
     let mix = |a: u8, b: u8| (f32::from(a) * (1.0 - amount) + f32::from(b) * amount).round() as u8;
