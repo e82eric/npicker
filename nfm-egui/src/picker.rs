@@ -511,6 +511,9 @@ pub struct Picker<S: ItemsSource + Send + Sync + 'static> {
     /// Results that stand for query commands.
     command_rows: Option<CommandRows<S::Item>>,
     visible_preview_rows: usize,
+    /// The preview pane's height this frame when a command's output fills the
+    /// command list's space too, down to the query; else rows of the preview.
+    output_pane_height: Option<f32>,
     external_preview: bool,
     preview_rect: Option<egui::Rect>,
     preview_rendered: bool,
@@ -599,6 +602,7 @@ where
             row_icon: None,
             command_rows: None,
             visible_preview_rows: 12,
+            output_pane_height: None,
             external_preview: false,
             preview_rect: None,
             preview_rendered: false,
@@ -2262,8 +2266,9 @@ where
     fn preview_ui(&mut self, ui: &mut egui::Ui, appearance: &Appearance) {
         // Allocate every row, including loading/empty/short documents, so the
         // query and selected row never move when asynchronous content arrives.
-        let height =
-            self.visible_preview_rows as f32 * appearance.typography.preview_row_height(ui.ctx());
+        let height = self.output_pane_height.unwrap_or(
+            self.visible_preview_rows as f32 * appearance.typography.preview_row_height(ui.ctx()),
+        );
         if self.command_mode && self.command_output.is_none() {
             // Nothing previews a command; the pane keeps its space.
             ui.allocate_exact_size(egui::vec2(ui.available_width(), height), egui::Sense::hover());
@@ -3236,6 +3241,23 @@ where
                             (self.suggestion_selected + 1) % self.suggestions.len();
                     }
                 }
+                // A command's output covers the command list, so these keys
+                // scroll it, Up toward its start, rather than move the hidden
+                // selection.
+                if self.command_mode && self.command_output.is_some() {
+                    let page = self.visible_preview_rows.max(1) as isize;
+                    for (key, modifiers, rows) in [
+                        (Key::N, Modifiers::CTRL, 1),
+                        (Key::ArrowDown, Modifiers::NONE, 1),
+                        (Key::ArrowUp, Modifiers::NONE, -1),
+                        (Key::PageDown, Modifiers::NONE, page),
+                        (Key::PageUp, Modifiers::NONE, -page),
+                    ] {
+                        if input.consume_key(modifiers, key) {
+                            self.scroll_preview_rows(rows);
+                        }
+                    }
+                }
                 for (key, modifiers, delta) in [
                     (Key::N, Modifiers::CTRL, 1),
                     (Key::ArrowDown, Modifiers::NONE, direction),
@@ -3331,6 +3353,7 @@ where
             .max(0.0);
         self.preview_rect = None;
         self.preview_rendered = false;
+        self.output_pane_height = None;
         self.visible_preview_rows =
             if self.preview_available() && self.config.preview_visible {
                 let capacity = (remaining / preview_row_height).floor() as usize;
@@ -3368,6 +3391,24 @@ where
             }
             + header_height;
         let rect = placement.rect(height);
+        // A command's output takes the command list's space too, down to the
+        // query (or the panel's end with the query on top). The panel keeps
+        // its size; the output shows the whole rows that fit.
+        let output_covers_results =
+            has_preview && self.command_mode && self.command_output.is_some();
+        if output_covers_results {
+            let pane = if full_pane {
+                rect.height() - PANEL_FRAME_HEIGHT - row_height - DIVIDER_HEIGHT
+            } else {
+                self.visible_preview_rows as f32 * preview_row_height
+                    + DIVIDER_HEIGHT
+                    + header_height
+                    + self.visible_result_rows as f32 * result_height
+            }
+            .max(preview_row_height);
+            self.output_pane_height = Some(pane);
+            self.visible_preview_rows = (pane / preview_row_height).floor().max(1.0) as usize;
+        }
         if has_preview && self.command_mode {
             self.refresh_command_output((rect.width() - PANEL_FRAME_WIDTH).max(1.0), appearance);
         } else if has_preview {
@@ -3418,9 +3459,14 @@ where
                             }
                             if has_preview {
                                 self.preview_ui(ui, appearance);
-                                divider(ui, appearance);
+                                if !output_covers_results {
+                                    divider(ui, appearance);
+                                }
                             }
-                            if full_pane && self.config.layout == Layout::QueryBottom {
+                            if !output_covers_results
+                                && full_pane
+                                && self.config.layout == Layout::QueryBottom
+                            {
                                 // Keep results next to the bottom query. Any
                                 // unused pane height belongs above this block.
                                 let block_height = header_height
@@ -3433,7 +3479,9 @@ where
                                     - block_height;
                                 ui.add_space(gap.max(0.0));
                             }
-                            if header.is_some() && self.command_mode {
+                            if output_covers_results {
+                                // The output stands in for the command list.
+                            } else if header.is_some() && self.command_mode {
                                 // The listed commands have no columns; the
                                 // space stays so the layout does not move.
                                 ui.allocate_exact_size(
@@ -3473,7 +3521,8 @@ where
                                         ),
                                     );
                             }
-                            if interactive {
+                            if output_covers_results {
+                            } else if interactive {
                                 self.results_ui(ui, appearance, &mut accept, &mut double_click);
                             } else {
                                 ui.scope_builder(egui::UiBuilder::new().disabled(), |ui| {
@@ -7028,6 +7077,86 @@ mod query_parity_tests {
         assert!(!picker.preview_visible(), "the pane closes again");
         output.publish(numbered(10));
         assert!(!picker.command_output_shown(), "a closed output stays closed");
+    }
+    #[test]
+    fn command_output_covers_the_command_list_down_to_the_query() {
+        let (ctx, mut picker) = make();
+        picker.set_query_commands(commands());
+        wait(&mut picker);
+        picker.config.preview_visible = true;
+        picker.start_command(&ctx, "GrepClaudeSessions x");
+        draw(&ctx, &mut picker, vec![]).0.drop_without_applying_deltas();
+        let id = picker.id;
+        let panel = || ctx.memory(|memory| memory.area_rect(id)).unwrap();
+        let before = panel();
+        let listed = shows_frame(&ctx, &mut picker, vec![], &["Search Claude transcripts"])[0];
+        assert!(listed, "the command list shows before any output");
+
+        let output = crate::CommandOutput::new();
+        picker.show_command_output(&ctx, output.clone());
+        output.publish(numbered(200));
+        let listed = shows_frame(&ctx, &mut picker, vec![], &["Search Claude transcripts"])[0];
+        assert!(!listed, "the output stands in for the command list");
+        // The pane runs from the panel's top to the divider above the query.
+        let (pane, query, shown) = (picker.preview_rect.unwrap(), picker.query_rect, panel());
+        let top = shown.top() + PANEL_MARGIN.top as f32 + PANEL_BORDER;
+        assert!((pane.top() - top).abs() < 1.0, "{pane:?} in {shown:?}");
+        assert!(
+            (query.top() - DIVIDER_HEIGHT - pane.bottom()).abs() < 1.0,
+            "the pane reaches the divider above the query: {pane:?} {query:?}"
+        );
+        let covering = picker.visible_preview_rows;
+        let configured = picker.config.preview_rows;
+        assert!(covering > configured, "{covering} rows, from {configured}");
+        assert_eq!(output_view(&ctx, &mut picker), Some((200 - covering, 200)));
+
+        // Up and Down scroll the output rather than pick a hidden command.
+        let selected = picker.command_selected;
+        for _ in 0..2 {
+            draw(&ctx, &mut picker, vec![key(Key::ArrowUp)])
+                .0
+                .drop_without_applying_deltas();
+        }
+        assert_eq!(output_view(&ctx, &mut picker), Some((198 - covering, 200)));
+        draw(&ctx, &mut picker, vec![key(Key::ArrowDown)])
+            .0
+            .drop_without_applying_deltas();
+        assert_eq!(output_view(&ctx, &mut picker), Some((199 - covering, 200)));
+        draw(&ctx, &mut picker, vec![key(Key::PageUp)])
+            .0
+            .drop_without_applying_deltas();
+        assert_eq!(output_view(&ctx, &mut picker), Some((199 - 2 * covering, 200)));
+        assert_eq!(picker.command_selected, selected);
+
+        // Esc brings the command list back.
+        draw(&ctx, &mut picker, vec![key(Key::Escape)])
+            .0
+            .drop_without_applying_deltas();
+        assert!(shows_frame(&ctx, &mut picker, vec![], &["Search Claude transcripts"])[0]);
+        assert_eq!(picker.visible_preview_rows, 0, "the pane closes again");
+        assert_eq!(panel(), before);
+    }
+    #[test]
+    fn with_the_query_on_top_command_output_runs_to_the_panels_end() {
+        let (ctx, mut picker) = make();
+        picker.config.layout = Layout::QueryTop;
+        picker.set_query_commands(commands());
+        wait(&mut picker);
+        picker.start_command(&ctx, "GrepClaudeSessions x");
+        let output = crate::CommandOutput::new();
+        picker.show_command_output(&ctx, output.clone());
+        output.publish(numbered(200));
+        draw(&ctx, &mut picker, vec![]).0.drop_without_applying_deltas();
+        draw(&ctx, &mut picker, vec![]).0.drop_without_applying_deltas();
+        let shown = ctx.memory(|memory| memory.area_rect(picker.id)).unwrap();
+        let (pane, query) = (picker.preview_rect.unwrap(), picker.query_rect);
+        assert!((pane.top() - (query.bottom() + DIVIDER_HEIGHT)).abs() < 1.0);
+        // Within the query's sizing allowance of the panel's inner edge.
+        let end = shown.bottom() - PANEL_INSET_BOTTOM;
+        assert!(
+            pane.bottom() <= end + 0.5 && pane.bottom() >= end - QUERY_HEIGHT_ALLOWANCE - 0.5,
+            "{pane:?} in {shown:?}"
+        );
     }
     #[test]
     fn command_output_is_closed_when_replaced_left_or_dropped() {
