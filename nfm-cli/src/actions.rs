@@ -30,6 +30,8 @@ pub enum PickerState {
     StructuredStdin,
     Processes,
     Windows,
+    /// The `argument` input: the selection is the text typed.
+    Argument,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -38,6 +40,8 @@ pub enum Resolution {
     Complete,
     /// Switch to the filesystem picker at these roots.
     Filewalker(Vec<String>),
+    /// Show another page on top of this one: an nfm command line.
+    Push(Vec<String>),
 }
 
 #[derive(Deserialize)]
@@ -46,6 +50,7 @@ enum Response {
     None,
     Complete,
     Picker { picker: PickerResponse },
+    Push { args: Vec<String> },
 }
 
 #[derive(Deserialize)]
@@ -103,6 +108,7 @@ fn parse_response(stdout: &[u8], selected_value: Option<&str>) -> Result<Resolut
     match response {
         Response::None => Ok(Resolution::None),
         Response::Complete => Ok(Resolution::Complete),
+        Response::Push { args } => Ok(Resolution::Push(args)),
         Response::Picker {
             picker: PickerResponse::Filewalker { roots },
         } => {
@@ -143,6 +149,11 @@ mod tests {
         );
         assert!(parse_response(br#"{"action":"picker","picker":{"kind":"filewalker","roots":[]}}"#, None).is_err());
         assert!(parse_response(br#"{"action":"picker","picker":{"kind":"filewalker","roots":["{item}"]}}"#, None).is_err());
+        assert_eq!(
+            parse_response(br#"{"action":"push","args":["command","--","rg","a b"]}"#, None),
+            Ok(Resolution::Push(vec!["command".into(), "--".into(), "rg".into(), "a b".into()]))
+        );
+        assert!(parse_response(br#"{"action":"push"}"#, None).is_err());
         assert!(parse_response(b"nope", None).is_err());
     }
 

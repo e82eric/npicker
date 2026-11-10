@@ -49,6 +49,44 @@ pub fn place(hwnd: isize, position: WindowPosition) {
     }
 }
 
+/// Put the window, which has changed size, back where windows of its size
+/// open on the monitor it is on. One opened at the mouse stays where it is,
+/// moved only as far as keeps it on the monitor.
+pub fn place_again(hwnd: isize, position: WindowPosition) {
+    use windows_sys::Win32::Graphics::Gdi::MonitorFromWindow;
+    if hwnd == 0 {
+        return;
+    }
+    unsafe {
+        let monitor = MonitorFromWindow(hwnd as _, MONITOR_DEFAULTTONEAREST);
+        let mut info: MONITORINFO = std::mem::zeroed();
+        info.cbSize = size_of::<MONITORINFO>() as u32;
+        let mut window: RECT = std::mem::zeroed();
+        if GetMonitorInfoW(monitor, &mut info) == 0 || GetWindowRect(hwnd as _, &mut window) == 0 {
+            return;
+        }
+        let work = info.rcWork;
+        let (width, height) = (window.right - window.left, window.bottom - window.top);
+        // The point the mouse would be at to open the window where it is.
+        let anchor = (window.left + width / 2, window.top + height / 3);
+        let (x, y) = origin(
+            position,
+            (work.left, work.top, work.right, work.bottom),
+            (width, height),
+            anchor,
+        );
+        SetWindowPos(
+            hwnd as _,
+            std::ptr::null_mut(),
+            x,
+            y,
+            0,
+            0,
+            SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+        );
+    }
+}
+
 fn origin(
     position: WindowPosition,
     (left, top, right, bottom): (i32, i32, i32, i32),

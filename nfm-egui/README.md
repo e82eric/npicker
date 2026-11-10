@@ -50,7 +50,10 @@ let frame = ctx.run_ui(egui::RawInput::default(), |ui| {
             assert!(selection.item == 101 || selection.item == 202);
         }
         Some(PickerEvent::CopyRequested(selection)) => ctx.copy_text(selection.text),
-        Some(PickerEvent::Cancelled) | Some(PickerEvent::CustomAction { .. }) | None => {}
+        Some(PickerEvent::Cancelled)
+        | Some(PickerEvent::CustomAction { .. })
+        | Some(PickerEvent::Submitted(_))
+        | None => {}
     }
 });
 // A real host paints this output with its existing egui renderer.

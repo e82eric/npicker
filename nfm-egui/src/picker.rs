@@ -231,6 +231,14 @@ pub fn default_bindings() -> Vec<PickerBinding> {
     .map(|(key, modifiers, action)| PickerBinding::key(key, modifiers, action))
     .collect()
 }
+/// The text a query with `role` searches for: itself, or nothing for an
+/// argument.
+fn searched_text(role: QueryRole, query: &str) -> &str {
+    match role {
+        QueryRole::Filter => query,
+        QueryRole::Argument => "",
+    }
+}
 fn resolved_bindings(bindings: Vec<PickerBinding>) -> Vec<PickerBinding> {
     let mut resolved = default_bindings();
     for binding in bindings {
@@ -332,6 +340,28 @@ pub struct PickerConfig {
     /// terminal output, are unaffected.
     pub preview_wrap: bool,
     pub sort: SearchSortMode,
+    /// What typing in the query box does.
+    pub query_role: QueryRole,
+    /// Drawn before the query; a page asking for an argument shows what the
+    /// argument is for, such as a command's name.
+    pub prompt: String,
+    /// Muted text in the query box while it is empty.
+    pub placeholder: String,
+    /// Whether accepting a result closes the picker. A host that shows another
+    /// page on top and comes back to this one turns it off, and calls
+    /// [`Picker::close`] itself when an accepted result does end the picker.
+    pub close_on_accept: bool,
+}
+/// What typing in the query box does.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum QueryRole {
+    /// The text filters the results, and Enter accepts the selected one.
+    #[default]
+    Filter,
+    /// The text is an argument the host asked for. It is not searched, and
+    /// Enter reports it as typed with [`PickerEvent::Submitted`], leaving the
+    /// picker open for the host to say what comes next.
+    Argument,
 }
 impl Default for PickerConfig {
     fn default() -> Self {
@@ -347,6 +377,10 @@ impl Default for PickerConfig {
             preview_line_numbers: PreviewLineNumbers::Off,
             preview_wrap: true,
             sort: SearchSortMode::Score,
+            query_role: QueryRole::Filter,
+            prompt: ">".into(),
+            placeholder: String::new(),
+            close_on_accept: true,
         }
     }
 }
@@ -382,6 +416,8 @@ pub enum PickerEvent<T> {
     },
     Cancelled,
     CopyRequested(Selection<T>),
+    /// Enter on a query with [`QueryRole::Argument`]: the text as typed.
+    Submitted(String),
 }
 pub struct PickerOutput<T> {
     /// Content paint commands were built this frame; this is not GPU presentation.
@@ -416,8 +452,48 @@ impl<T> PickerOutput<T> {
 /// [`Picker::set_row_icon`]).
 pub type RowIcon<T> = Arc<dyn Fn(&T) -> Option<String> + Send + Sync>;
 
+/// The egui id of one live picker. egui keeps state by id: the query box's
+/// cursor and undo history, popups, the picker's area. Pickers made with the
+/// same name may be alive together, as pages are, so each takes the lowest
+/// slot of that name no live picker holds and gives it back when dropped.
+/// The ids in use are as many as were ever alive at once, and a new picker
+/// finds the state of the last one in its slot, as it would under one id.
+struct IdSlot {
+    name: Id,
+    slot: usize,
+}
+static ID_SLOTS: std::sync::Mutex<Vec<(Id, usize)>> = std::sync::Mutex::new(Vec::new());
+impl IdSlot {
+    fn take(name: Id) -> Self {
+        let mut taken = ID_SLOTS.lock().unwrap_or_else(|e| e.into_inner());
+        let slot = (0..)
+            .find(|slot| !taken.contains(&(name, *slot)))
+            .expect("a free slot");
+        taken.push((name, slot));
+        Self { name, slot }
+    }
+    /// The first picker of a name has the name as its id.
+    fn id(&self) -> Id {
+        if self.slot == 0 {
+            self.name
+        } else {
+            self.name.with(("picker", self.slot))
+        }
+    }
+}
+impl Drop for IdSlot {
+    fn drop(&mut self) {
+        ID_SLOTS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|taken| *taken != (self.name, self.slot));
+    }
+}
+
 pub struct Picker<S: ItemsSource + Send + Sync + 'static> {
     id: Id,
+    /// Holds `id` for as long as the picker lives.
+    _id_slot: IdSlot,
     session: Session<S>,
     config: PickerConfig,
     query: String,
@@ -475,12 +551,15 @@ where
         provider: Arc<P>,
         mut config: PickerConfig,
     ) -> Self {
+        let id_slot = IdSlot::take(Id::new(id));
         let query = config.initial_query.clone();
         let query_cursor = query.len();
         config.bindings = resolved_bindings(config.bindings);
+        let searched = searched_text(config.query_role, &query).to_owned();
         Self {
-            id: Id::new(id),
-            session: Session::new(provider, query.clone(), config.sort, ctx.clone()),
+            id: id_slot.id(),
+            _id_slot: id_slot,
+            session: Session::new(provider, searched, config.sort, ctx.clone()),
             config,
             query,
             revision: 0,
@@ -533,7 +612,12 @@ where
         self.session.stop();
         self.query = query.into();
         self.query_cursor = self.query.len();
-        self.session = Session::new(provider, self.query.clone(), self.config.sort, ctx.clone());
+        self.session = Session::new(
+            provider,
+            self.searched_query().to_owned(),
+            self.config.sort,
+            ctx.clone(),
+        );
         self.revision = 0;
         self.transition_pending = true;
         if let Some(displayed) = &mut self.displayed {
@@ -637,6 +721,10 @@ where
             self.query_cursor = self.query.len();
             self.suggestion_selected = 0;
             self.dismissed_completion = None;
+            if self.config.query_role == QueryRole::Argument {
+                // An argument is not searched; the results stay as they are.
+                return;
+            }
             self.revision = self.session.set_query(self.query.clone());
             self.selected = 0;
             self.visible_start = 0;
@@ -1192,10 +1280,15 @@ where
             preview.stop();
         }
     }
+    /// The text the results are searched for: the query, or nothing while
+    /// the query is an argument.
+    fn searched_query(&self) -> &str {
+        searched_text(self.config.query_role, &self.query)
+    }
     fn current_results(&self) -> bool {
         self.displayed
             .as_ref()
-            .is_some_and(|d| d.revision == self.revision && d.query == self.query)
+            .is_some_and(|d| d.revision == self.revision && d.query == self.searched_query())
     }
     fn displayed_selection(&self) -> Option<Selection<S::Item>> {
         let displayed = self.displayed.as_ref()?;
@@ -1920,8 +2013,11 @@ where
                     .as_ref()
                     .is_none_or(|d| d.output.results.is_empty())
             {
-                let text =
-                    if self.current_results() && self.displayed.as_ref().is_some_and(|d| d.done) {
+                // An argument is not searched, so nothing failed to match it.
+                let text = if self.config.query_role != QueryRole::Argument
+                    && self.current_results()
+                    && self.displayed.as_ref().is_some_and(|d| d.done)
+                {
                         "No matches"
                     } else {
                         " "
@@ -1995,16 +2091,23 @@ where
     ) {
         let before = self.query.clone();
         let row_height = appearance.typography.preview_row_height(ctx);
+        let argument = self.config.query_role == QueryRole::Argument;
         ui.horizontal(|ui| {
-            let prompt_width =
-                ui.fonts_mut(|fonts| fonts.glyph_width(&appearance.typography.normal, '>'));
-            let (prompt_rect, _) =
-                ui.allocate_exact_size(egui::vec2(prompt_width, row_height), egui::Sense::hover());
-            ui.painter().text(
-                prompt_rect.left_center(),
-                egui::Align2::LEFT_CENTER,
-                ">",
+            let prompt = ui.painter().layout_no_wrap(
+                self.config.prompt.clone(),
                 appearance.typography.normal.clone(),
+                appearance.palette.accent,
+            );
+            let (prompt_rect, _) = ui.allocate_exact_size(
+                egui::vec2(prompt.size().x, row_height),
+                egui::Sense::hover(),
+            );
+            ui.painter().galley(
+                egui::pos2(
+                    prompt_rect.left(),
+                    prompt_rect.center().y - prompt.size().y / 2.0,
+                ),
+                prompt,
                 appearance.palette.accent,
             );
             let total = self.displayed.as_ref().map_or(0, |d| d.output.total);
@@ -2065,6 +2168,18 @@ where
             self.query_cursor = cursor;
             self.query_rect = edit.response.rect;
             self.query_text_pos = edit.galley_pos;
+            if self.query.is_empty() && !self.config.placeholder.is_empty() {
+                let rect = edit.response.rect;
+                ui.painter()
+                    .with_clip_rect(rect.intersect(ui.clip_rect()))
+                    .text(
+                        egui::pos2(edit.galley_pos.x, rect.center().y),
+                        egui::Align2::LEFT_CENTER,
+                        &self.config.placeholder,
+                        appearance.typography.normal.clone(),
+                        appearance.palette.muted,
+                    );
+            }
             if !self.preview_focused() {
                 self.refresh_completions();
             }
@@ -2103,13 +2218,16 @@ where
                     appearance.palette.muted,
                 );
             }
-            ui.painter().text(
-                status_rect.right_center(),
-                egui::Align2::RIGHT_CENTER,
-                count,
-                appearance.typography.normal.clone(),
-                appearance.palette.muted,
-            );
+            // An argument is not a search, so it has no match count.
+            if !argument {
+                ui.painter().text(
+                    status_rect.right_center(),
+                    egui::Align2::RIGHT_CENTER,
+                    count,
+                    appearance.typography.normal.clone(),
+                    appearance.palette.muted,
+                );
+            }
         });
     }
     /// Draw within an existing host egui pass; no window, GL or platform ownership.
@@ -2171,6 +2289,9 @@ where
         let mut double_click = false;
         let mut copy = false;
         let mut complete = false;
+        // Enter on an argument, reported once the query box has this frame's
+        // typing.
+        let mut submit = false;
         let direction = if self.config.layout == Layout::QueryBottom {
             -1
         } else {
@@ -2272,6 +2393,8 @@ where
                 if input.consume_key(Modifiers::NONE, Key::Enter) {
                     if suggestions_open {
                         complete = true;
+                    } else if self.config.query_role == QueryRole::Argument {
+                        submit = true;
                     } else {
                         accept = true;
                     }
@@ -2532,7 +2655,9 @@ where
         {
             self.completion_ui(ctx, placement.bounds, appearance);
         }
-        if event.is_none()
+        if submit && event.is_none() {
+            event = Some(PickerEvent::Submitted(self.query.clone()));
+        } else if event.is_none()
             && self.result_actions_enabled
             && let Some(selection) = self.selection()
         {
@@ -2555,10 +2680,12 @@ where
                 event = Some(PickerEvent::CustomAction { action, selection });
             }
         }
-        if matches!(
-            event,
-            Some(PickerEvent::Accepted(_)) | Some(PickerEvent::Cancelled)
-        ) {
+        let closes = match &event {
+            Some(PickerEvent::Accepted(_)) => self.config.close_on_accept,
+            Some(PickerEvent::Cancelled) => true,
+            _ => false,
+        };
+        if closes {
             self.close();
         }
         let busy = self.busy();
@@ -3963,6 +4090,129 @@ mod query_parity_tests {
             repeat: false,
             modifiers,
         }
+    }
+    fn shows_text(frame: &egui::FullOutput, needle: &str) -> bool {
+        frame.shapes.iter().any(|shape| {
+            matches!(&shape.shape, egui::Shape::Text(text) if text.galley.job.text.contains(needle))
+        })
+    }
+    #[test]
+    fn an_argument_is_not_searched_and_enter_submits_it_as_typed() {
+        let (ctx, mut picker) = make();
+        picker.config.query_role = QueryRole::Argument;
+        picker.config.prompt = "Grep".into();
+        picker.config.placeholder = "<search text>".into();
+        wait(&mut picker);
+        let revision = picker.revision;
+        draw(&ctx, &mut picker, vec![]);
+        let (frame, event) = draw(&ctx, &mut picker, vec![]);
+        assert!(event.is_none());
+        assert!(shows_text(&frame, "Grep"), "the prompt");
+        assert!(shows_text(&frame, "<search text>"), "the placeholder");
+        assert!(!shows_text(&frame, "3/3"), "an argument has no match count");
+
+        // Text typed in the same frame as Enter is part of the argument.
+        let (_, event) = draw(
+            &ctx,
+            &mut picker,
+            vec![egui::Event::Text("fn \"main\" ".into()), key(Key::Enter)],
+        );
+        assert!(matches!(event, Some(PickerEvent::Submitted(text)) if text == "fn \"main\" "));
+        assert_eq!(picker.revision, revision, "an argument is not searched");
+        assert!(picker.current_results());
+        assert!(!picker.is_closed(), "the host says what comes next");
+        let (frame, _) = draw(&ctx, &mut picker, vec![]);
+        assert!(!shows_text(&frame, "<search text>"));
+        assert!(shows_text(&frame, "alpha one"), "the results are not filtered");
+
+        let (_, event) = draw(&ctx, &mut picker, vec![key(Key::Escape)]);
+        assert!(matches!(event, Some(PickerEvent::Cancelled)));
+        assert!(picker.is_closed());
+    }
+    #[test]
+    fn an_argument_with_nothing_to_pick_from_does_not_say_no_matches() {
+        let ctx = egui::Context::default();
+        let empty = || {
+            let store = Arc::new(SnapshotStore::new());
+            store.publish(StructuredStreamingSnapshot::from_rows(vec!["Name".into()], vec![]).unwrap());
+            store.complete();
+            store
+        };
+        let mut filter = Picker::new("query-parity", &ctx, empty(), PickerConfig::default());
+        wait(&mut filter);
+        draw(&ctx, &mut filter, vec![]);
+        assert!(shows_text(&draw(&ctx, &mut filter, vec![]).0, "No matches"));
+
+        let config = PickerConfig {
+            query_role: QueryRole::Argument,
+            ..PickerConfig::default()
+        };
+        let mut argument = Picker::new("query-parity", &ctx, empty(), config);
+        wait(&mut argument);
+        draw(&ctx, &mut argument, vec![]);
+        assert!(!shows_text(&draw(&ctx, &mut argument, vec![]).0, "No matches"));
+    }
+    #[test]
+    fn a_page_shown_again_types_at_its_own_cursor() {
+        let (ctx, mut under) = make();
+        wait(&mut under);
+        draw(&ctx, &mut under, vec![]);
+        draw(&ctx, &mut under, vec![egui::Event::Text("abc".into())]);
+        // A page on top, made with the same name, keeps its own cursor.
+        let store = Arc::new(SnapshotStore::new());
+        store.publish(StructuredStreamingSnapshot::from_rows(vec!["Name".into()], vec![]).unwrap());
+        store.complete();
+        let mut top = Picker::new("query-parity", &ctx, store, PickerConfig::default());
+        draw(&ctx, &mut top, vec![]);
+        draw(&ctx, &mut top, vec![egui::Event::Text("x".into())]);
+        draw(&ctx, &mut top, vec![]);
+        assert_eq!(top.query(), "x");
+        assert_ne!(top.id, under.id);
+        drop(top);
+        // Typed as the page comes back, and once it has the focus again.
+        draw(&ctx, &mut under, vec![egui::Event::Text("d".into())]);
+        assert_eq!(under.query(), "abcd");
+        draw(&ctx, &mut under, vec![]);
+        draw(&ctx, &mut under, vec![egui::Event::Text("e".into())]);
+        assert_eq!(under.query(), "abcde");
+    }
+    #[test]
+    fn live_pickers_of_one_name_have_their_own_ids_and_a_dropped_one_gives_its_back() {
+        let ctx = egui::Context::default();
+        let new = || {
+            let store = Arc::new(SnapshotStore::new());
+            store.publish(StructuredStreamingSnapshot::from_rows(vec!["Name".into()], vec![]).unwrap());
+            store.complete();
+            Picker::new("id-slots", &ctx, store, PickerConfig::default())
+        };
+        let first = new();
+        assert_eq!(first.id, Id::new("id-slots"), "one picker has the name as its id");
+        let second = new();
+        let third = new();
+        let ids = [first.id, second.id, third.id];
+        assert!(ids[0] != ids[1] && ids[1] != ids[2] && ids[0] != ids[2]);
+        // The ids in use are as many as the pickers alive at once.
+        drop(second);
+        assert_eq!(new().id, ids[1]);
+        drop(first);
+        assert_eq!(new().id, ids[0]);
+        drop(third);
+        assert_eq!(new().id, ids[0], "the lowest free one");
+    }
+    #[test]
+    fn a_picker_pages_go_on_top_of_stays_open_when_it_accepts() {
+        let (ctx, mut picker) = make();
+        picker.config.close_on_accept = false;
+        wait(&mut picker);
+        draw(&ctx, &mut picker, vec![]);
+        for _ in 0..2 {
+            let (_, event) = draw(&ctx, &mut picker, vec![key(Key::Enter)]);
+            assert!(matches!(event, Some(PickerEvent::Accepted(_))));
+            assert!(!picker.is_closed());
+        }
+        let (_, event) = draw(&ctx, &mut picker, vec![key(Key::Escape)]);
+        assert!(matches!(event, Some(PickerEvent::Cancelled)));
+        assert!(picker.is_closed());
     }
     #[test]
     fn alt_space_quick_select_restores_focus_and_selects_without_accepting() {

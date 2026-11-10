@@ -8,6 +8,7 @@ pub mod copy_controller;
 pub mod copy_document;
 pub mod copy_mode;
 pub mod document_search;
+mod pages;
 mod picker;
 mod placement;
 pub mod preview;
@@ -25,8 +26,10 @@ pub use nfm_search_core::search::SearchSortMode;
 pub use nfm_search_core::{fuzzy_search_session::SearchSnapshotProvider, store::ItemsSource};
 pub use picker::{
     Layout, Picker, PickerAction, PickerBinding, PickerConfig, PickerEvent, PickerOutput,
-    PickerTrigger, PreviewLineNumbers, RowIcon, Selection, default_bindings, results_height,
+    PickerTrigger, PreviewLineNumbers, QueryRole, RowIcon, Selection, default_bindings,
+    results_height,
 };
+pub use pages::PageStack;
 pub use placement::{Placement, Position};
 pub use preview::{Cancellation, GridLines, Preview, PreviewCell, PreviewProvider, PreviewRequest};
 pub use session::SearchTimings;

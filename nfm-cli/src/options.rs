@@ -13,6 +13,8 @@ pub enum Command {
     FileSystem(Vec<String>),
     Processes,
     Windows,
+    /// Nothing to pick from: the query box takes text as typed.
+    Argument,
 }
 impl Command {
     pub fn is_line_input(&self) -> bool {
@@ -26,6 +28,7 @@ impl Command {
             Self::FileSystem(_) => "filesystem",
             Self::Processes => "processes",
             Self::Windows => "windows",
+            Self::Argument => "argument",
         }
     }
 }
@@ -80,6 +83,16 @@ pub struct PreviewCommand {
     pub kind: PreviewKind,
 }
 
+/// What a key bound to an `--action` does.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Action {
+    /// Ask a program, which answers with what the picker does next.
+    Resolver(Program),
+    /// Show another page on top of this one: an nfm command line, with
+    /// `{query}` and `{item}` replaced in its arguments.
+    Push(Vec<String>),
+}
+
 /// Bind targets every picker understands; anything else names an `--action`.
 pub const BUILTIN_ACTIONS: &[&str] = &["accept", "cancel", "parent"];
 
@@ -88,6 +101,10 @@ pub struct Options {
     pub command: Command,
     pub query: String,
     pub title: Option<String>,
+    /// Shown before the query in place of `>`.
+    pub prompt: Option<String>,
+    /// Shown muted in the query box while it is empty.
+    pub placeholder: Option<String>,
     // Input
     pub delimiter: Option<char>,
     pub text_field: Field,
@@ -124,7 +141,7 @@ pub struct Options {
     pub window_preview: bool,
     // Actions
     pub accept_resolver: Option<Program>,
-    pub actions: BTreeMap<String, Program>,
+    pub actions: BTreeMap<String, Action>,
     pub bindings: Vec<(keys::Chord, String)>,
     pub expect: Vec<keys::Chord>,
     // Presentation
@@ -154,6 +171,8 @@ impl Default for Options {
             command: Command::Stdin,
             query: String::new(),
             title: None,
+            prompt: None,
+            placeholder: None,
             delimiter: None,
             text_field: Field::All,
             value_field: Field::All,
@@ -214,6 +233,7 @@ pub enum Parsed {
 }
 
 /// One list of flags and where it came from, for error messages.
+#[derive(Clone)]
 pub struct Layer {
     pub origin: String,
     pub args: Vec<String>,
@@ -271,7 +291,8 @@ struct ProfileDraft {
 }
 #[derive(Default)]
 struct ActionDraft {
-    declared: bool,
+    /// False for `action-resolver`, true for `push`; None until declared.
+    push: Option<bool>,
     program: Option<String>,
     args: Vec<String>,
 }
@@ -294,6 +315,33 @@ pub fn parse(layers: &[Layer]) -> Result<Parsed, String> {
         return Ok(Parsed::Version);
     }
     finish(draft).map(|options| Parsed::Run(Box::new(options)))
+}
+
+/// The options of a page pushed on top of a running picker: `args` is an nfm
+/// command line, read after the same defaults (`base`) as the first page's.
+pub fn parse_page(base: &[Layer], args: Vec<String>) -> Result<Options, String> {
+    const ORIGIN: &str = "pushed page";
+    let mut layers = base.to_vec();
+    layers.push(Layer {
+        origin: ORIGIN.into(),
+        args,
+        positionals: true,
+    });
+    let options = match parse(&layers)? {
+        Parsed::Run(options) => *options,
+        Parsed::Help | Parsed::Version => {
+            return Err(format!("{ORIGIN}: --help and --version do not show a page"));
+        }
+    };
+    if options.command == Command::Stdin {
+        return Err(format!(
+            "{ORIGIN}: standard input belongs to the first page; use file, command, filesystem, processes, windows or argument"
+        ));
+    }
+    if options.filter.is_some() || options.select_1 || options.exit_0 {
+        return Err(format!("{ORIGIN}: --filter, --select-1 and --exit-0 do not show a page"));
+    }
+    Ok(options)
 }
 
 fn parse_layer(draft: &mut Draft, layer: &Layer) -> Result<(), String> {
@@ -391,6 +439,8 @@ fn apply_value(
     match name {
         "query" => o.query = value("a value")?,
         "title" => o.title = Some(value("a value")?),
+        "prompt" => o.prompt = Some(value("a value")?),
+        "placeholder" => o.placeholder = Some(value("a value")?),
         "config" => {
             // Read before the config file is loaded.
             value("a path")?;
@@ -481,10 +531,16 @@ fn apply_value(
         "action" => {
             let name = action_name(&flag, value("an action name")?)?;
             let kind = value("an action name and a type")?;
-            if kind != "action-resolver" {
-                return Err(format!("{flag} {name}: the only action type is action-resolver, not '{kind}'"));
-            }
-            draft.actions.entry(name).or_default().declared = true;
+            let push = match kind.as_str() {
+                "action-resolver" => false,
+                "push" => true,
+                _ => {
+                    return Err(format!(
+                        "{flag} {name}: the action types are action-resolver and push, not '{kind}'"
+                    ));
+                }
+            };
+            draft.actions.entry(name).or_default().push = Some(push);
         }
         "action-program" => {
             let name = action_name(&flag, value("an action name")?)?;
@@ -602,14 +658,17 @@ fn finish(draft: Draft) -> Result<Options, String> {
         Some("filesystem") => Command::FileSystem(operands.clone()),
         Some("processes") => Command::Processes,
         Some("windows") => Command::Windows,
+        Some("argument") => Command::Argument,
         Some(other) => {
             return Err(format!(
-                "unknown command '{other}'; expected file, command, filesystem, processes or windows"
+                "unknown command '{other}'; expected file, command, filesystem, processes, windows or argument"
             ));
         }
     };
-    if matches!(options.command, Command::Processes | Command::Windows | Command::Stdin)
-        && !operands.is_empty()
+    if matches!(
+        options.command,
+        Command::Processes | Command::Windows | Command::Stdin | Command::Argument
+    ) && !operands.is_empty()
     {
         return Err(format!(
             "{} does not take arguments: '{}'",
@@ -753,22 +812,34 @@ fn finish(draft: Draft) -> Result<Options, String> {
         cwd: None,
     });
     for (name, action) in actions {
-        if !action.declared {
+        let Some(push) = action.push else {
             return Err(format!(
                 "action '{name}' is not declared; add --action {name} action-resolver"
             ));
-        }
-        let program = action
-            .program
-            .ok_or_else(|| format!("action '{name}' has no program; add --action-program {name} PROGRAM"))?;
-        o.actions.insert(
-            name,
-            Program {
+        };
+        let action = if push {
+            if action.program.is_some() {
+                return Err(format!(
+                    "action '{name}' pushes a page and takes no program; give the page with --action-arg {name} ARG"
+                ));
+            }
+            if action.args.is_empty() {
+                return Err(format!(
+                    "action '{name}' has no page; add --action-arg {name} ARG for each argument of its nfm command line"
+                ));
+            }
+            Action::Push(action.args)
+        } else {
+            let program = action.program.ok_or_else(|| {
+                format!("action '{name}' has no program; add --action-program {name} PROGRAM")
+            })?;
+            Action::Resolver(Program {
                 program,
                 args: action.args,
                 cwd: None,
-            },
-        );
+            })
+        };
+        o.actions.insert(name, action);
     }
     for (chord, action) in bindings {
         let parsed = keys::parse(&chord).map_err(|e| format!("--bind {chord}: {e}"))?;
@@ -877,12 +948,15 @@ Usage:
   nfm filesystem [ROOT...] [OPTIONS]         Pick a file; Enter opens directories, Ctrl+U goes up
   nfm processes [OPTIONS]                    Pick a process; Ctrl+K kills, Ctrl+R refreshes
   nfm windows [OPTIONS]                      Pick a desktop window with a live preview
+  nfm argument [OPTIONS]                     Type text: nothing is searched, Enter prints it
 
 The selected value is printed to standard output.
 Exit status: 0 selected, 1 no match, 2 error, 130 cancelled.
 
 Search:
   -q, --query <TEXT>                  Initial query
+      --prompt <TEXT>                 Shown before the query (default >)
+      --placeholder <TEXT>            Shown in the query box while it is empty
       --sort <score|input>            Rank by match score (default) or keep input order
       --filter <QUERY>                Print the matches for QUERY without opening a window
       --select-1                      Print the only match without opening a window
@@ -942,12 +1016,16 @@ Keys and actions:
       --action <NAME> action-resolver Declare an action run by a program
       --action-program <NAME> <PROGRAM>
       --action-arg <NAME> <ARG>
+      --action <NAME> push            Declare an action that shows another page on top of this
+                                      one; Esc there comes back. Its --action-arg values are the
+                                      page's nfm command line, with {query} and {item} replaced
       --accept-resolver <PROGRAM>     Resolve Enter through a program
       --accept-resolver-arg <ARG>
       --expect <KEY,KEY...>           Accept with these keys too and print the key first
   Action programs receive NFM_ACTION_STATE (JSON with selection, picker and query) and
-  print {\"action\":\"none\"}, {\"action\":\"complete\"} or
-  {\"action\":\"picker\",\"picker\":{\"kind\":\"filewalker\",\"roots\":[\"{item}\"]}}.
+  print {\"action\":\"none\"}, {\"action\":\"complete\"},
+  {\"action\":\"picker\",\"picker\":{\"kind\":\"filewalker\",\"roots\":[\"{item}\"]}} or, to show
+  another page, {\"action\":\"push\",\"args\":[...]} with an nfm command line.
   Keys look like ctrl-o, alt-enter, ctrl-shift-k or f5.
 
 Window:
@@ -1097,7 +1175,14 @@ mod tests {
             "--bind", "ctrl-o", "accept",
         ])
         .unwrap();
-        assert_eq!(o.actions["open"].args, ["--flag"]);
+        assert_eq!(
+            o.actions["open"],
+            Action::Resolver(Program {
+                program: "open.exe".into(),
+                args: vec!["--flag".into()],
+                cwd: None,
+            })
+        );
         assert_eq!(o.bindings.len(), 1);
         assert_eq!(o.bindings[0].1, "accept");
         assert!(run(&["--bind", "ctrl-o", "open"]).is_err());
@@ -1107,6 +1192,52 @@ mod tests {
         assert!(run(&["--bind", "ctrl-u", "parent"]).is_err());
         assert!(run(&["filesystem", "--bind", "ctrl-u", "parent"]).is_ok());
         assert!(run(&["--bind", "hyper-x", "accept"]).is_err());
+    }
+
+    #[test]
+    fn a_push_action_is_an_nfm_command_line() {
+        let o = run(&[
+            "argument", "--prompt", "Grep:", "--placeholder", "<text>",
+            "--action", "grep", "push",
+            "--action-arg", "grep", "command",
+            "--action-arg", "grep", "--",
+            "--action-arg", "grep", "rg",
+            "--action-arg", "grep", "{query}",
+            "--bind", "enter", "grep",
+        ])
+        .unwrap();
+        assert_eq!(o.command, Command::Argument);
+        assert_eq!(o.prompt.as_deref(), Some("Grep:"));
+        assert_eq!(o.placeholder.as_deref(), Some("<text>"));
+        assert_eq!(
+            o.actions["grep"],
+            Action::Push(vec!["command".into(), "--".into(), "rg".into(), "{query}".into()])
+        );
+        assert!(run(&["argument", "x"]).is_err());
+        assert!(run(&["--action", "grep", "push"]).is_err());
+        assert!(
+            run(&["--action", "grep", "push", "--action-arg", "grep", "windows", "--action-program", "grep", "x"])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn a_pushed_page_reads_the_same_defaults_and_its_own_command_line() {
+        let base = [Layer {
+            origin: "config".into(),
+            args: vec!["--rows".into(), "4".into()],
+            positionals: false,
+        }];
+        let args = |args: &[&str]| args.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let o = parse_page(&base, args(&["command", "--delimiter", ":", "--", "rg", "-n", "a b"])).unwrap();
+        assert_eq!(o.rows, Some(4));
+        assert_eq!(o.command, Command::Run(vec!["rg".into(), "-n".into(), "a b".into()]));
+        assert_eq!(parse_page(&base, args(&["argument"])).unwrap().command, Command::Argument);
+        // Standard input was the first page's to read.
+        assert!(parse_page(&base, args(&[])).unwrap_err().contains("standard input"));
+        assert!(parse_page(&base, args(&["windows", "--bogus"])).unwrap_err().contains("pushed page"));
+        assert!(parse_page(&base, args(&["--help"])).is_err());
+        assert!(parse_page(&base, args(&["file", "a.txt", "--filter", "x"])).is_err());
     }
 
     #[test]

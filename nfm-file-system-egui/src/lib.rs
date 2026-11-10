@@ -242,7 +242,7 @@ where
                 }
                 Ok(None)
             }
-            Some(PickerEvent::CustomAction { .. }) | None => Ok(None),
+            Some(PickerEvent::CustomAction { .. } | PickerEvent::Submitted(_)) | None => Ok(None),
         }
     }
     pub fn navigate(&mut self, ctx: &egui::Context, roots: Vec<String>) -> Result<(), String> {

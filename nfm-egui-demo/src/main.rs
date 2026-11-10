@@ -221,7 +221,7 @@ impl eframe::App for Demo {
                     ctx.copy_text(selection.text);
                     picker.notify_copied(ctx);
                 }
-                Some(PickerEvent::CustomAction { .. }) | None => {}
+                Some(PickerEvent::CustomAction { .. } | PickerEvent::Submitted(_)) | None => {}
             }
             if !output.busy
                 && self.source.is_done()

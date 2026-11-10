@@ -158,7 +158,7 @@ where
                 ctx.copy_text(selection.text);
                 None
             }
-            Some(PickerEvent::CustomAction { .. }) | None => None,
+            Some(PickerEvent::CustomAction { .. } | PickerEvent::Submitted(_)) | None => None,
         }
     }
 }
