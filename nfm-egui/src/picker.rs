@@ -347,10 +347,6 @@ pub struct PickerConfig {
     pub prompt: String,
     /// Muted text in the query box while it is empty.
     pub placeholder: String,
-    /// Whether accepting a result closes the picker. A host that shows another
-    /// page on top and comes back to this one turns it off, and calls
-    /// [`Picker::close`] itself when an accepted result does end the picker.
-    pub close_on_accept: bool,
 }
 /// What typing in the query box does.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -380,7 +376,6 @@ impl Default for PickerConfig {
             query_role: QueryRole::Filter,
             prompt: ">".into(),
             placeholder: String::new(),
-            close_on_accept: true,
         }
     }
 }
@@ -1272,6 +1267,10 @@ where
     pub fn is_closed(&self) -> bool {
         self.closed
     }
+    /// Stop searching and previewing, and draw nothing from here on. The
+    /// picker never does this itself: it reports what the user did, and its
+    /// host decides whether that ends it. A host that drops the picker has
+    /// no need to close it first.
     pub fn close(&mut self) {
         self.leave_preview_focus();
         self.closed = true;
@@ -2679,14 +2678,6 @@ where
             } else if let Some(action) = custom_action {
                 event = Some(PickerEvent::CustomAction { action, selection });
             }
-        }
-        let closes = match &event {
-            Some(PickerEvent::Accepted(_)) => self.config.close_on_accept,
-            Some(PickerEvent::Cancelled) => true,
-            _ => false,
-        };
-        if closes {
-            self.close();
         }
         let busy = self.busy();
         if busy {
@@ -4127,7 +4118,7 @@ mod query_parity_tests {
 
         let (_, event) = draw(&ctx, &mut picker, vec![key(Key::Escape)]);
         assert!(matches!(event, Some(PickerEvent::Cancelled)));
-        assert!(picker.is_closed());
+        assert!(!picker.is_closed(), "going back or closing is the host's");
     }
     #[test]
     fn an_argument_with_nothing_to_pick_from_does_not_say_no_matches() {
@@ -4200,11 +4191,12 @@ mod query_parity_tests {
         assert_eq!(new().id, ids[0], "the lowest free one");
     }
     #[test]
-    fn a_picker_pages_go_on_top_of_stays_open_when_it_accepts() {
+    fn a_picker_reports_what_the_user_did_and_leaves_closing_to_its_host() {
         let (ctx, mut picker) = make();
-        picker.config.close_on_accept = false;
         wait(&mut picker);
         draw(&ctx, &mut picker, vec![]);
+        // Accepted, with a page shown on top and then left: the picker is as
+        // it was, and accepts again.
         for _ in 0..2 {
             let (_, event) = draw(&ctx, &mut picker, vec![key(Key::Enter)]);
             assert!(matches!(event, Some(PickerEvent::Accepted(_))));
@@ -4212,7 +4204,12 @@ mod query_parity_tests {
         }
         let (_, event) = draw(&ctx, &mut picker, vec![key(Key::Escape)]);
         assert!(matches!(event, Some(PickerEvent::Cancelled)));
+        assert!(!picker.is_closed());
+        // Its host closes it, and it takes no more input.
+        picker.close();
         assert!(picker.is_closed());
+        let (_, event) = draw(&ctx, &mut picker, vec![key(Key::Enter)]);
+        assert!(event.is_none());
     }
     #[test]
     fn alt_space_quick_select_restores_focus_and_selects_without_accepting() {
@@ -5837,7 +5834,7 @@ mod tests {
         }
     }
     #[test]
-    fn keyboard_accept_returns_payload_and_closes_once() {
+    fn keyboard_accept_returns_payload_and_a_closed_picker_accepts_nothing() {
         let (ctx, _, mut picker) = make();
         wait(|| {
             picker.poll();
@@ -5849,7 +5846,8 @@ mod tests {
             output.event,
             Some(PickerEvent::Accepted(Selection { item: 42, .. }))
         ));
-        assert!(picker.is_closed());
+        assert!(!picker.is_closed(), "the host says whether that ends it");
+        picker.close();
         assert!(
             draw(&ctx, &mut picker, vec![key(Key::Enter)])
                 .event

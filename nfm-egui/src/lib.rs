@@ -3,11 +3,11 @@
 //! See the crate README for the embedding and lifetime contracts.
 mod ansi;
 mod appearance;
-pub mod icons;
 pub mod copy_controller;
 pub mod copy_document;
 pub mod copy_mode;
 pub mod document_search;
+pub mod icons;
 mod pages;
 mod picker;
 mod placement;
@@ -24,12 +24,12 @@ pub use appearance::{Appearance, FontFace, Palette, Typography};
 pub use egui;
 pub use nfm_search_core::search::SearchSortMode;
 pub use nfm_search_core::{fuzzy_search_session::SearchSnapshotProvider, store::ItemsSource};
+pub use pages::{Outcome, PageStack};
 pub use picker::{
     Layout, Picker, PickerAction, PickerBinding, PickerConfig, PickerEvent, PickerOutput,
     PickerTrigger, PreviewLineNumbers, QueryRole, RowIcon, Selection, default_bindings,
     results_height,
 };
-pub use pages::PageStack;
 pub use placement::{Placement, Position};
 pub use preview::{Cancellation, GridLines, Preview, PreviewCell, PreviewProvider, PreviewRequest};
 pub use session::SearchTimings;

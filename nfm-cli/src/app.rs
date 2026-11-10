@@ -665,15 +665,17 @@ impl App {
             None
         };
         let page = Page::new(ctx, Arc::new(options), source, self.hwnd)?;
-        self.pages.push(page);
+        self.pages.apply(nfm_egui::Outcome::Push(page));
         self.page_changed(ctx);
         Ok(())
     }
 
-    /// Go back a page; false from the first one.
+    /// Go back a page; false from the first one, which stays for the window
+    /// to draw until it closes.
     fn back(&mut self, ctx: &egui::Context) -> bool {
-        let went = self.pages.back();
+        let went = self.pages.len() > 1;
         if went {
+            self.pages.apply(nfm_egui::Outcome::Back);
             self.page_changed(ctx);
         }
         went
