@@ -269,6 +269,34 @@ impl PublishedSnapshot {
         node_index < self.node_count && self.nodes[node_index].is_dir()
     }
 
+    /// An entry's own name and the directory it is in: the two parts of the
+    /// text `item` returns, without the separator between them. A root has
+    /// no directory and is all name.
+    pub fn name_and_directory(&self, node_index: usize) -> Option<(String, String)> {
+        if node_index >= self.node_count {
+            return None;
+        }
+        let mut path = Vec::new();
+        self.path_utf8(node_index, &mut path);
+        let text = |bytes: &[u8]| String::from_utf8_lossy(bytes).into_owned();
+        let node = self.node(node_index);
+        let name_len = self.name(node.name_index()).len as usize;
+        let split = match path.len().checked_sub(name_len) {
+            Some(split) if node.parent >= 0 => split,
+            _ => return Some((text(&path), String::new())),
+        };
+        let (parents, parent_count) = self.parents();
+        assert!((node.parent as usize) < parent_count);
+        let parent = self.name(parents[node.parent as usize].name_index());
+        // The path has a separator after the parent's name unless that name
+        // is empty (a relative root) or ends with its own, such as `C:\`,
+        // which is part of the directory.
+        let joined = parent.len > 0
+            && self.byte_at(parent.offset as usize + parent.len as usize - 1) != PATH_SEPARATOR;
+        let directory = &path[..split - usize::from(joined)];
+        Some((text(&path[split..]), text(directory)))
+    }
+
     /// The full path of an entry, including its root in relative scans.
     pub fn absolute_path(&self, node_index: usize) -> Option<PathBuf> {
         if node_index >= self.node_count {
@@ -640,6 +668,65 @@ mod interning_tests {
     }
 
     #[test]
+    fn entries_split_into_their_name_and_directory() {
+        let sep = PATH_SEPARATOR as char;
+        let parts = |snapshot: &PublishedSnapshot, index: u32| {
+            let (name, directory) = snapshot.name_and_directory(index as usize).unwrap();
+            // The parts always rebuild the text a search matches.
+            let item = snapshot.item(index as usize).unwrap();
+            let joined = match directory.as_str() {
+                "" => name.clone(),
+                directory if directory.ends_with(sep) => format!("{directory}{name}"),
+                directory => format!("{directory}{sep}{name}"),
+            };
+            assert_eq!(joined, item);
+            (name, directory)
+        };
+        let pair = |name: &str, directory: &str| (name.to_owned(), directory.to_owned());
+
+        // A root is all name. A root that ends with a separator keeps it as
+        // the directory of its entries.
+        let mut store = CompactUtf8FileStore::new();
+        let root = store.add_directory(-1, "root");
+        let sub = store.add_directory(root as i32, "sub");
+        let file = store.add_node(sub as i32, "a.txt");
+        let drive = store.add_directory(-1, &format!("C:{sep}"));
+        let top = store.add_node(drive as i32, "b.txt");
+        store.complete_adding();
+        let snapshot = store.snapshot();
+        assert_eq!(parts(&snapshot, root), pair("root", ""));
+        assert_eq!(parts(&snapshot, sub), pair("sub", "root"));
+        assert_eq!(
+            parts(&snapshot, file),
+            pair("a.txt", &format!("root{sep}sub"))
+        );
+        assert_eq!(parts(&snapshot, top), pair("b.txt", &format!("C:{sep}")));
+
+        // Relative roots have empty names, so their entries have no directory.
+        let mut store = CompactUtf8FileStore::with_relative_roots(Arc::new([PathBuf::from("r")]));
+        let root = store.add_directory(-1, "");
+        let sub = store.add_directory(root as i32, "sub");
+        let file = store.add_node(sub as i32, "a.txt");
+        store.complete_adding();
+        let snapshot = store.snapshot();
+        assert_eq!(parts(&snapshot, root), pair(".", ""));
+        assert_eq!(parts(&snapshot, sub), pair("sub", ""));
+        assert_eq!(parts(&snapshot, file), pair("a.txt", "sub"));
+
+        // Separate parents: the directory comes from the parents' names.
+        let mut store = CompactUtf8FileStore::new().with_separate_parents();
+        let root = store.add_parent(-1, "root");
+        let sub = store.add_parent(root as i32, "sub");
+        let file = store.add_node(sub as i32, "a.txt");
+        store.complete_adding();
+        let snapshot = store.snapshot();
+        assert_eq!(
+            parts(&snapshot, file),
+            pair("a.txt", &format!("root{sep}sub"))
+        );
+    }
+
+    #[test]
     fn directories_are_flagged_without_changing_names_or_paths() {
         let sep = PATH_SEPARATOR as char;
         let mut store = CompactUtf8FileStore::new();
@@ -659,6 +746,7 @@ mod interning_tests {
             [true, false, true]
         );
         assert!(!snapshot.is_dir(snapshot.len()));
+        assert_eq!(snapshot.name_and_directory(snapshot.len()), None);
         assert_eq!(snapshot.item(0).unwrap(), "same");
         assert_eq!(snapshot.item(1).unwrap(), format!("same{sep}same"));
         assert_eq!(snapshot.item(2).unwrap(), format!("same{sep}sub"));
