@@ -22,13 +22,13 @@ const PANEL_RADIUS: u8 = 8;
 const PANEL_MARGIN: egui::Margin = egui::Margin::symmetric(18, 10);
 const PANEL_BORDER: f32 = 1.0;
 const PANEL_INSET_BOTTOM: f32 = PANEL_MARGIN.bottom as f32 + PANEL_BORDER;
-const PANEL_FRAME_HEIGHT: f32 =
+pub(crate) const PANEL_FRAME_HEIGHT: f32 =
     (PANEL_MARGIN.top as f32 + PANEL_MARGIN.bottom as f32) + 2.0 * PANEL_BORDER;
-const PANEL_FRAME_WIDTH: f32 =
+pub(crate) const PANEL_FRAME_WIDTH: f32 =
     (PANEL_MARGIN.left as f32 + PANEL_MARGIN.right as f32) + 2.0 * PANEL_BORDER;
-const DIVIDER_HEIGHT: f32 = 15.0;
+pub(crate) const DIVIDER_HEIGHT: f32 = 15.0;
 // Existing query sizing allowance, independent of the panel's margins.
-const QUERY_HEIGHT_ALLOWANCE: f32 = 4.0;
+pub(crate) const QUERY_HEIGHT_ALLOWANCE: f32 = 4.0;
 const RESULTS_OVERHEAD: f32 = PANEL_FRAME_HEIGHT + DIVIDER_HEIGHT + QUERY_HEIGHT_ALLOWANCE;
 const PREVIEW_OVERHEAD: f32 = RESULTS_OVERHEAD + DIVIDER_HEIGHT;
 
@@ -231,14 +231,6 @@ pub fn default_bindings() -> Vec<PickerBinding> {
     .map(|(key, modifiers, action)| PickerBinding::key(key, modifiers, action))
     .collect()
 }
-/// The text a query with `role` searches for: itself, or nothing for an
-/// argument.
-fn searched_text(role: QueryRole, query: &str) -> &str {
-    match role {
-        QueryRole::Filter => query,
-        QueryRole::Argument => "",
-    }
-}
 fn resolved_bindings(bindings: Vec<PickerBinding>) -> Vec<PickerBinding> {
     let mut resolved = default_bindings();
     for binding in bindings {
@@ -340,24 +332,10 @@ pub struct PickerConfig {
     /// terminal output, are unaffected.
     pub preview_wrap: bool,
     pub sort: SearchSortMode,
-    /// What typing in the query box does.
-    pub query_role: QueryRole,
-    /// Drawn before the query; a page asking for an argument shows what the
-    /// argument is for, such as a command's name.
+    /// Drawn before the query.
     pub prompt: String,
     /// Muted text in the query box while it is empty.
     pub placeholder: String,
-}
-/// What typing in the query box does.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum QueryRole {
-    /// The text filters the results, and Enter accepts the selected one.
-    #[default]
-    Filter,
-    /// The text is an argument the host asked for. It is not searched, and
-    /// Enter reports it as typed with [`PickerEvent::Submitted`], leaving the
-    /// picker open for the host to say what comes next.
-    Argument,
 }
 impl Default for PickerConfig {
     fn default() -> Self {
@@ -373,7 +351,6 @@ impl Default for PickerConfig {
             preview_line_numbers: PreviewLineNumbers::Off,
             preview_wrap: true,
             sort: SearchSortMode::Score,
-            query_role: QueryRole::Filter,
             prompt: ">".into(),
             placeholder: String::new(),
         }
@@ -411,8 +388,6 @@ pub enum PickerEvent<T> {
     },
     Cancelled,
     CopyRequested(Selection<T>),
-    /// Enter on a query with [`QueryRole::Argument`]: the text as typed.
-    Submitted(String),
 }
 pub struct PickerOutput<T> {
     /// Content paint commands were built this frame; this is not GPU presentation.
@@ -447,19 +422,19 @@ impl<T> PickerOutput<T> {
 /// [`Picker::set_row_icon`]).
 pub type RowIcon<T> = Arc<dyn Fn(&T) -> Option<String> + Send + Sync>;
 
-/// The egui id of one live picker. egui keeps state by id: the query box's
+/// The egui id of one live picker or prompt. egui keeps state by id: the query box's
 /// cursor and undo history, popups, the picker's area. Pickers made with the
 /// same name may be alive together, as pages are, so each takes the lowest
 /// slot of that name no live picker holds and gives it back when dropped.
 /// The ids in use are as many as were ever alive at once, and a new picker
 /// finds the state of the last one in its slot, as it would under one id.
-struct IdSlot {
+pub(crate) struct IdSlot {
     name: Id,
     slot: usize,
 }
 static ID_SLOTS: std::sync::Mutex<Vec<(Id, usize)>> = std::sync::Mutex::new(Vec::new());
 impl IdSlot {
-    fn take(name: Id) -> Self {
+    pub(crate) fn take(name: Id) -> Self {
         let mut taken = ID_SLOTS.lock().unwrap_or_else(|e| e.into_inner());
         let slot = (0..)
             .find(|slot| !taken.contains(&(name, *slot)))
@@ -468,7 +443,7 @@ impl IdSlot {
         Self { name, slot }
     }
     /// The first picker of a name has the name as its id.
-    fn id(&self) -> Id {
+    pub(crate) fn id(&self) -> Id {
         if self.slot == 0 {
             self.name
         } else {
@@ -550,11 +525,10 @@ where
         let query = config.initial_query.clone();
         let query_cursor = query.len();
         config.bindings = resolved_bindings(config.bindings);
-        let searched = searched_text(config.query_role, &query).to_owned();
         Self {
             id: id_slot.id(),
             _id_slot: id_slot,
-            session: Session::new(provider, searched, config.sort, ctx.clone()),
+            session: Session::new(provider, query.clone(), config.sort, ctx.clone()),
             config,
             query,
             revision: 0,
@@ -609,7 +583,7 @@ where
         self.query_cursor = self.query.len();
         self.session = Session::new(
             provider,
-            self.searched_query().to_owned(),
+            self.query.clone(),
             self.config.sort,
             ctx.clone(),
         );
@@ -716,10 +690,6 @@ where
             self.query_cursor = self.query.len();
             self.suggestion_selected = 0;
             self.dismissed_completion = None;
-            if self.config.query_role == QueryRole::Argument {
-                // An argument is not searched; the results stay as they are.
-                return;
-            }
             self.revision = self.session.set_query(self.query.clone());
             self.selected = 0;
             self.visible_start = 0;
@@ -1279,15 +1249,10 @@ where
             preview.stop();
         }
     }
-    /// The text the results are searched for: the query, or nothing while
-    /// the query is an argument.
-    fn searched_query(&self) -> &str {
-        searched_text(self.config.query_role, &self.query)
-    }
     fn current_results(&self) -> bool {
         self.displayed
             .as_ref()
-            .is_some_and(|d| d.revision == self.revision && d.query == self.searched_query())
+            .is_some_and(|d| d.revision == self.revision && d.query == self.query)
     }
     fn displayed_selection(&self) -> Option<Selection<S::Item>> {
         let displayed = self.displayed.as_ref()?;
@@ -2012,9 +1977,7 @@ where
                     .as_ref()
                     .is_none_or(|d| d.output.results.is_empty())
             {
-                // An argument is not searched, so nothing failed to match it.
-                let text = if self.config.query_role != QueryRole::Argument
-                    && self.current_results()
+                let text = if self.current_results()
                     && self.displayed.as_ref().is_some_and(|d| d.done)
                 {
                         "No matches"
@@ -2090,25 +2053,7 @@ where
     ) {
         let before = self.query.clone();
         let row_height = appearance.typography.preview_row_height(ctx);
-        let argument = self.config.query_role == QueryRole::Argument;
         ui.horizontal(|ui| {
-            let prompt = ui.painter().layout_no_wrap(
-                self.config.prompt.clone(),
-                appearance.typography.normal.clone(),
-                appearance.palette.accent,
-            );
-            let (prompt_rect, _) = ui.allocate_exact_size(
-                egui::vec2(prompt.size().x, row_height),
-                egui::Sense::hover(),
-            );
-            ui.painter().galley(
-                egui::pos2(
-                    prompt_rect.left(),
-                    prompt_rect.center().y - prompt.size().y / 2.0,
-                ),
-                prompt,
-                appearance.palette.accent,
-            );
             let total = self.displayed.as_ref().map_or(0, |d| d.output.total);
             let matched = if self.current_results() {
                 self.displayed.as_ref().map_or(0, |d| d.output.matched)
@@ -2131,25 +2076,14 @@ where
                 )
                 .size();
             let status_width = count_size.x + 24.0;
-            let query_width =
-                (ui.available_width() - status_width - ui.spacing().item_spacing.x).max(1.0);
-            let query_interactive = interactive && !self.preview_focused();
-            let edit = egui::TextEdit::singleline(&mut self.query)
-                .id(input_id)
-                .interactive(query_interactive)
-                .font(appearance.typography.normal.clone())
-                .vertical_align(egui::Align::Center)
-                .margin(0)
-                .min_size(egui::vec2(query_width, row_height))
-                .desired_width(query_width)
-                .frame(egui::Frame::NONE)
-                .event_filter(egui::EventFilter {
-                    tab: true,
-                    escape: true,
-                    horizontal_arrows: true,
-                    vertical_arrows: true,
-                })
-                .show(ui);
+            let edit = crate::query_box::QueryBox {
+                id: input_id,
+                prompt: &self.config.prompt,
+                placeholder: &self.config.placeholder,
+                interactive: interactive && !self.preview_focused(),
+                reserve: status_width + ui.spacing().item_spacing.x,
+            }
+            .show(ui, appearance, row_height, &mut self.query);
             if interactive && self.focus_query && !self.preview_focused() {
                 edit.response.request_focus();
                 self.focus_query = false;
@@ -2158,27 +2092,9 @@ where
                 let query = std::mem::replace(&mut self.query, before.clone());
                 self.set_query(query);
             }
-            let cursor = edit.cursor_range.map_or(self.query.len(), |range| {
-                self.query
-                    .char_indices()
-                    .nth(range.primary.index.into())
-                    .map_or(self.query.len(), |(offset, _)| offset)
-            });
-            self.query_cursor = cursor;
+            self.query_cursor = edit.cursor;
             self.query_rect = edit.response.rect;
-            self.query_text_pos = edit.galley_pos;
-            if self.query.is_empty() && !self.config.placeholder.is_empty() {
-                let rect = edit.response.rect;
-                ui.painter()
-                    .with_clip_rect(rect.intersect(ui.clip_rect()))
-                    .text(
-                        egui::pos2(edit.galley_pos.x, rect.center().y),
-                        egui::Align2::LEFT_CENTER,
-                        &self.config.placeholder,
-                        appearance.typography.normal.clone(),
-                        appearance.palette.muted,
-                    );
-            }
+            self.query_text_pos = edit.text_pos;
             if !self.preview_focused() {
                 self.refresh_completions();
             }
@@ -2217,16 +2133,13 @@ where
                     appearance.palette.muted,
                 );
             }
-            // An argument is not a search, so it has no match count.
-            if !argument {
-                ui.painter().text(
-                    status_rect.right_center(),
-                    egui::Align2::RIGHT_CENTER,
-                    count,
-                    appearance.typography.normal.clone(),
-                    appearance.palette.muted,
-                );
-            }
+            ui.painter().text(
+                status_rect.right_center(),
+                egui::Align2::RIGHT_CENTER,
+                count,
+                appearance.typography.normal.clone(),
+                appearance.palette.muted,
+            );
         });
     }
     /// Draw within an existing host egui pass; no window, GL or platform ownership.
@@ -2288,9 +2201,6 @@ where
         let mut double_click = false;
         let mut copy = false;
         let mut complete = false;
-        // Enter on an argument, reported once the query box has this frame's
-        // typing.
-        let mut submit = false;
         let direction = if self.config.layout == Layout::QueryBottom {
             -1
         } else {
@@ -2392,8 +2302,6 @@ where
                 if input.consume_key(Modifiers::NONE, Key::Enter) {
                     if suggestions_open {
                         complete = true;
-                    } else if self.config.query_role == QueryRole::Argument {
-                        submit = true;
                     } else {
                         accept = true;
                     }
@@ -2540,24 +2448,13 @@ where
                 .fixed_pos(rect.min)
                 .show(ctx, |ui| {
                     ui.set_clip_rect(rect.intersect(placement.bounds).intersect(ui.clip_rect()));
-                    egui::Frame::new()
-                        .fill(appearance.palette.background)
-                        .stroke(egui::Stroke::new(PANEL_BORDER, appearance.palette.divider))
-                        .corner_radius(PANEL_RADIUS)
-                        .inner_margin(PANEL_MARGIN)
+                    panel_frame(appearance)
                         .show(ui, |ui| {
                             ui.set_width((rect.width() - PANEL_FRAME_WIDTH).max(1.0));
                             if full_pane {
                                 ui.set_min_height((rect.height() - PANEL_FRAME_HEIGHT).max(0.0));
                             }
-                            ui.spacing_mut().item_spacing.y = 0.0;
-                            ui.visuals_mut().override_text_color = Some(appearance.palette.text);
-                            ui.visuals_mut().text_cursor.stroke =
-                                egui::Stroke::new(2.0, appearance.palette.text);
-                            ui.visuals_mut().selection.bg_fill =
-                                appearance.palette.selection_background;
-                            ui.visuals_mut().selection.stroke.color =
-                                appearance.palette.selection_text;
+                            panel_style(ui, appearance);
                             if self.config.layout == Layout::QueryTop {
                                 self.query_ui(
                                     ui,
@@ -2654,9 +2551,7 @@ where
         {
             self.completion_ui(ctx, placement.bounds, appearance);
         }
-        if submit && event.is_none() {
-            event = Some(PickerEvent::Submitted(self.query.clone()));
-        } else if event.is_none()
+        if event.is_none()
             && self.result_actions_enabled
             && let Some(selection) = self.selection()
         {
@@ -2719,7 +2614,23 @@ where
         }
     }
 }
-fn divider(ui: &mut egui::Ui, appearance: &Appearance) {
+/// The frame a page is drawn in.
+pub(crate) fn panel_frame(appearance: &Appearance) -> egui::Frame {
+    egui::Frame::new()
+        .fill(appearance.palette.background)
+        .stroke(egui::Stroke::new(PANEL_BORDER, appearance.palette.divider))
+        .corner_radius(PANEL_RADIUS)
+        .inner_margin(PANEL_MARGIN)
+}
+/// Rows that touch, and the palette's text, cursor and selection colors.
+pub(crate) fn panel_style(ui: &mut egui::Ui, appearance: &Appearance) {
+    ui.spacing_mut().item_spacing.y = 0.0;
+    ui.visuals_mut().override_text_color = Some(appearance.palette.text);
+    ui.visuals_mut().text_cursor.stroke = egui::Stroke::new(2.0, appearance.palette.text);
+    ui.visuals_mut().selection.bg_fill = appearance.palette.selection_background;
+    ui.visuals_mut().selection.stroke.color = appearance.palette.selection_text;
+}
+pub(crate) fn divider(ui: &mut egui::Ui, appearance: &Appearance) {
     let (rect, _) = ui.allocate_exact_size(
         egui::vec2(ui.available_width(), DIVIDER_HEIGHT),
         egui::Sense::hover(),
@@ -4086,62 +3997,6 @@ mod query_parity_tests {
         frame.shapes.iter().any(|shape| {
             matches!(&shape.shape, egui::Shape::Text(text) if text.galley.job.text.contains(needle))
         })
-    }
-    #[test]
-    fn an_argument_is_not_searched_and_enter_submits_it_as_typed() {
-        let (ctx, mut picker) = make();
-        picker.config.query_role = QueryRole::Argument;
-        picker.config.prompt = "Grep".into();
-        picker.config.placeholder = "<search text>".into();
-        wait(&mut picker);
-        let revision = picker.revision;
-        draw(&ctx, &mut picker, vec![]);
-        let (frame, event) = draw(&ctx, &mut picker, vec![]);
-        assert!(event.is_none());
-        assert!(shows_text(&frame, "Grep"), "the prompt");
-        assert!(shows_text(&frame, "<search text>"), "the placeholder");
-        assert!(!shows_text(&frame, "3/3"), "an argument has no match count");
-
-        // Text typed in the same frame as Enter is part of the argument.
-        let (_, event) = draw(
-            &ctx,
-            &mut picker,
-            vec![egui::Event::Text("fn \"main\" ".into()), key(Key::Enter)],
-        );
-        assert!(matches!(event, Some(PickerEvent::Submitted(text)) if text == "fn \"main\" "));
-        assert_eq!(picker.revision, revision, "an argument is not searched");
-        assert!(picker.current_results());
-        assert!(!picker.is_closed(), "the host says what comes next");
-        let (frame, _) = draw(&ctx, &mut picker, vec![]);
-        assert!(!shows_text(&frame, "<search text>"));
-        assert!(shows_text(&frame, "alpha one"), "the results are not filtered");
-
-        let (_, event) = draw(&ctx, &mut picker, vec![key(Key::Escape)]);
-        assert!(matches!(event, Some(PickerEvent::Cancelled)));
-        assert!(!picker.is_closed(), "going back or closing is the host's");
-    }
-    #[test]
-    fn an_argument_with_nothing_to_pick_from_does_not_say_no_matches() {
-        let ctx = egui::Context::default();
-        let empty = || {
-            let store = Arc::new(SnapshotStore::new());
-            store.publish(StructuredStreamingSnapshot::from_rows(vec!["Name".into()], vec![]).unwrap());
-            store.complete();
-            store
-        };
-        let mut filter = Picker::new("query-parity", &ctx, empty(), PickerConfig::default());
-        wait(&mut filter);
-        draw(&ctx, &mut filter, vec![]);
-        assert!(shows_text(&draw(&ctx, &mut filter, vec![]).0, "No matches"));
-
-        let config = PickerConfig {
-            query_role: QueryRole::Argument,
-            ..PickerConfig::default()
-        };
-        let mut argument = Picker::new("query-parity", &ctx, empty(), config);
-        wait(&mut argument);
-        draw(&ctx, &mut argument, vec![]);
-        assert!(!shows_text(&draw(&ctx, &mut argument, vec![]).0, "No matches"));
     }
     #[test]
     fn a_page_shown_again_types_at_its_own_cursor() {

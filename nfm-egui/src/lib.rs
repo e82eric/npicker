@@ -13,6 +13,8 @@ mod picker;
 mod placement;
 pub mod preview;
 mod preview_copy;
+mod prompt;
+mod query_box;
 pub mod quick_select;
 #[cfg(feature = "opengl")]
 pub mod renderer;
@@ -27,10 +29,11 @@ pub use nfm_search_core::{fuzzy_search_session::SearchSnapshotProvider, store::I
 pub use pages::{Outcome, PageStack};
 pub use picker::{
     Layout, Picker, PickerAction, PickerBinding, PickerConfig, PickerEvent, PickerOutput,
-    PickerTrigger, PreviewLineNumbers, QueryRole, RowIcon, Selection, default_bindings,
+    PickerTrigger, PreviewLineNumbers, RowIcon, Selection, default_bindings,
     results_height,
 };
 pub use placement::{Placement, Position};
+pub use prompt::{Prompt, PromptConfig, PromptEvent, PromptOutput, prompt_height};
 pub use preview::{Cancellation, GridLines, Preview, PreviewCell, PreviewProvider, PreviewRequest};
 pub use session::SearchTimings;
 pub mod byte_preview;

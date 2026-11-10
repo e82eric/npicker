@@ -11,10 +11,9 @@ use crate::{
     source::{self, Feed, LineSnapshot, Repaint, Source},
 };
 use nfm_egui::{
-    Appearance, Layout, PageStack, Picker, PickerConfig, PickerEvent, Placement, Position,
-    QueryRole, SearchSortMode, Selection, egui,
+    Appearance, Layout, PageStack, Picker, PickerConfig, PickerEvent, Placement, Position, Prompt,
+    PromptConfig, PromptEvent, SearchSortMode, Selection, egui,
 };
-use nfm_search_core::{snapshot_store::SnapshotStore, store::FlatSnapshot};
 use nfm_file_system_egui::{FileEvent, FilePaths, FilePicker};
 use nfm_picker_sources::{
     delimited::{DelimitedPickerItem, DelimitedStreamingSnapshot},
@@ -71,13 +70,14 @@ enum View {
     /// Windows with a command preview instead of the live thumbnail.
     #[cfg(windows)]
     WindowList(Picker<nfm_window_egui::WindowSnapshot>),
-    /// Nothing to pick from: the query box takes text as typed.
-    Argument(Picker<FlatSnapshot<()>>),
+    /// Nothing to pick from: a prompt takes text as typed.
+    Argument(Prompt),
 }
 
-/// Run `$body` with `$p` bound to the view's `&mut Picker<_>`.
+/// Run `$body` with `$p` bound to the view's `&mut Picker<_>`, or `$other`
+/// with `$q` bound to its `&mut Prompt`.
 macro_rules! with_picker {
-    ($view:expr, $p:ident => $body:expr) => {
+    ($view:expr, $p:ident => $body:expr, prompt $q:ident => $other:expr) => {
         match $view {
             View::Lines { picker: $p, .. } => $body,
             View::Delimited { picker: $p, .. } => $body,
@@ -98,7 +98,7 @@ macro_rules! with_picker {
             }
             #[cfg(windows)]
             View::WindowList($p) => $body,
-            View::Argument($p) => $body,
+            View::Argument($q) => $other,
         }
     };
 }
@@ -220,7 +220,7 @@ impl View {
             View::WindowList(picker) => picker
                 .selection()
                 .map(|s| window_chosen(&s.item, s.index)),
-            View::Argument(picker) => Some(argument_chosen(picker.query().to_owned())),
+            View::Argument(prompt) => Some(argument_chosen(prompt.text().to_owned())),
         }
     }
 
@@ -274,7 +274,7 @@ impl View {
                     ctx.copy_text(value);
                     Shown::Nothing
                 }
-                Some(PickerEvent::CustomAction { .. } | PickerEvent::Submitted(_)) | None => Shown::Nothing,
+                Some(PickerEvent::CustomAction { .. }) | None => Shown::Nothing,
             }
         }
         Ok(match self {
@@ -334,10 +334,10 @@ impl View {
             View::WindowList(picker) => plain(ctx, picker, placement, appearance, |s| {
                 window_chosen(&s.item, s.index)
             }),
-            View::Argument(picker) => match picker.show(ctx, placement, appearance, false).event {
-                Some(PickerEvent::Submitted(text)) => Shown::Accepted(Some(argument_chosen(text))),
-                Some(PickerEvent::Cancelled) => Shown::Cancelled,
-                _ => Shown::Nothing,
+            View::Argument(prompt) => match prompt.show(ctx, placement, appearance, false).event {
+                Some(PromptEvent::Submitted(text)) => Shown::Accepted(Some(argument_chosen(text))),
+                Some(PromptEvent::Cancelled) => Shown::Cancelled,
+                None => Shown::Nothing,
             },
         })
     }
@@ -380,6 +380,8 @@ pub struct App {
     hwnd: isize,
     /// The size asked of the window for the page showing, until it has it.
     resizing: Option<egui::Vec2>,
+    /// The size the window was last fitted to.
+    fitted: egui::Vec2,
     first_frame: bool,
 }
 
@@ -404,11 +406,6 @@ pub fn picker_config(options: &Options, preview_visible: bool) -> PickerConfig {
         } else {
             SearchSortMode::Score
         },
-        query_role: if options.command == Command::Argument {
-            QueryRole::Argument
-        } else {
-            QueryRole::Filter
-        },
         prompt: options.prompt.clone().unwrap_or(defaults.prompt.clone()),
         placeholder: options.placeholder.clone().unwrap_or_default(),
         ..defaults
@@ -428,6 +425,11 @@ pub fn preview_initially_visible(options: &Options) -> bool {
     let default = !matches!(options.command, Command::Processes) || spec.has_command();
     available && options.preview_visible.unwrap_or(default)
 }
+
+/// What a prompt's window is taller than the prompt by, and its panel and
+/// query allowance, as `window_size` reckons them before there is a frame.
+const WINDOW_SLACK: f32 = 2.0;
+const PROMPT_OVERHEAD: f32 = 26.0 + WINDOW_SLACK;
 
 /// The window's size in points for a page with these options.
 pub fn window_size(options: &Options) -> egui::Vec2 {
@@ -466,9 +468,12 @@ pub fn window_size(options: &Options) -> egui::Vec2 {
         }
         _ => 0.0,
     };
-    let height = options
-        .height
-        .unwrap_or(row + header + rows * result + preview + overhead);
+    let height = options.height.unwrap_or(if options.command == Command::Argument {
+        // A prompt is its one row and the panel around it.
+        row + PROMPT_OVERHEAD
+    } else {
+        row + header + rows * result + preview + overhead
+    });
     egui::vec2(options.width.unwrap_or(DEFAULT_WIDTH), height)
 }
 
@@ -552,15 +557,16 @@ impl Page {
         for chord in &self.expect {
             help.push((chord.label(), "Accept and print the key".into()));
         }
-        with_picker!(&mut self.view, picker => picker.set_keybinding_help(help));
+        // A prompt has no command palette to list its keys in.
+        with_picker!(&mut self.view, picker => picker.set_keybinding_help(help), prompt _prompt => drop(help));
     }
 
     fn query(&mut self) -> String {
-        with_picker!(&mut self.view, picker => picker.query().to_owned())
+        with_picker!(&mut self.view, picker => picker.query().to_owned(), prompt prompt => prompt.text().to_owned())
     }
 
     fn set_error(&mut self, error: Option<String>) {
-        with_picker!(&mut self.view, picker => picker.set_error(error));
+        with_picker!(&mut self.view, picker => picker.set_error(error), prompt prompt => prompt.set_error(error));
     }
 
     fn start_action(&mut self, ctx: &egui::Context, program: Program) {
@@ -613,7 +619,6 @@ impl App {
         let mut pages = PageStack::new();
         pages.open(Page::new(ctx, options.clone(), source, hwnd)?);
         Ok(Self {
-            root: options,
             base,
             repaint,
             appearance,
@@ -621,6 +626,8 @@ impl App {
             outcome,
             hwnd,
             resizing: None,
+            fitted: window_size(&options),
+            root: options,
             first_frame: true,
         })
     }
@@ -681,16 +688,39 @@ impl App {
         went
     }
 
-    /// Another page is showing: the window takes its size and title.
-    fn page_changed(&mut self, ctx: &egui::Context) {
-        let options = self.page().options.clone();
-        let size = window_size(&options);
+    /// The size the page showing wants of the window: its options', or for a
+    /// prompt what it takes now, which is more while it shows an error.
+    fn page_size(&self, ctx: &egui::Context) -> egui::Vec2 {
+        let page = self.pages.top().expect("the window always has a page");
+        let mut size = window_size(&page.options);
+        if page.options.height.is_none()
+            && let View::Argument(prompt) = &page.view
+        {
+            size.y = prompt.height(ctx, &self.appearance) + WINDOW_SLACK;
+        }
+        size
+    }
+
+    /// Give the window the size the page showing wants, when that changed.
+    fn fit_window(&mut self, ctx: &egui::Context) {
+        let size = self.page_size(ctx);
+        if (self.fitted - size).length() < 1.0 {
+            return;
+        }
+        self.fitted = size;
         if (ctx.content_rect().size() - size).length() >= 1.0 {
             ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
             self.resizing = Some(size);
+            ctx.request_repaint();
         } else {
             self.resizing = None;
         }
+    }
+
+    /// Another page is showing: the window takes its size and title.
+    fn page_changed(&mut self, ctx: &egui::Context) {
+        let options = self.page().options.clone();
+        self.fit_window(ctx);
         let title = options.title.clone().unwrap_or_else(|| "nfm".into());
         ctx.send_viewport_cmd(egui::ViewportCommand::Title(title));
         ctx.request_repaint();
@@ -811,7 +841,7 @@ impl App {
             page.set_error(Some(error));
         }
         let (focused, help) =
-            with_picker!(&mut page.view, picker => (picker.preview_focused(), picker.keybinding_help_visible()));
+            with_picker!(&mut page.view, picker => (picker.preview_focused(), picker.keybinding_help_visible()), prompt _prompt => (false, false));
         if !focused && !help {
             if let Some(chord) = page.expect.iter().find(|chord| chord.consume(ctx)).cloned() {
                 let chosen = page.view.chosen();
@@ -838,6 +868,7 @@ impl App {
                 }
             }
         }
+        self.fit_window(ctx);
         let mut placement = Placement::new(ctx.content_rect());
         placement.position = Position::FullPane;
         placement.margin = 0.0;
@@ -977,13 +1008,14 @@ fn build_view(
         (Command::Processes | Command::Windows, _) => {
             return Err("the processes and windows commands are only available on Windows".into());
         }
-        (Command::Argument, _) => {
-            // Nothing to pick from: the page is its query box.
-            let store = Arc::new(SnapshotStore::new());
-            store.publish(Arc::new(FlatSnapshot::from_items(std::iter::empty::<(&str, ())>())));
-            store.complete();
-            View::Argument(Picker::new("nfm-argument", ctx, store, config))
-        }
+        (Command::Argument, _) => View::Argument(Prompt::new(
+            "nfm-argument",
+            PromptConfig {
+                prompt: config.prompt,
+                placeholder: config.placeholder,
+                initial_text: config.initial_query,
+            },
+        )),
         (_, Some(Source::Lines(feed, values))) => {
             let mut picker = Picker::new("nfm-lines", ctx, feed.store.clone(), config);
             if !preview.is_empty() {

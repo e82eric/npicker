@@ -52,7 +52,6 @@ let frame = ctx.run_ui(egui::RawInput::default(), |ui| {
         Some(PickerEvent::CopyRequested(selection)) => ctx.copy_text(selection.text),
         Some(PickerEvent::Cancelled)
         | Some(PickerEvent::CustomAction { .. })
-        | Some(PickerEvent::Submitted(_))
         | None => {}
     }
 });
@@ -69,6 +68,13 @@ A host that shows one picker on top of another keeps them in a `PageStack` and
 answers each event with an `Outcome`: `Stay`, `Back` to the page beneath as it
 was left, `Close`, or `Push` a page on top. `PageStack::apply` does it and hands
 back the pages that left.
+
+A page that only asks for a line of text is a `Prompt`: one row, with the same
+look and placement as a picker. It reports `PromptEvent::Submitted` with the
+text on Enter and `Cancelled` on Escape, stays as it is like a picker, and
+shows a message beneath the text with `set_error`. `Prompt::height` is what it
+takes now, for a host that sizes a window to it.
+
 The host also handles input routing, IME, platform output, repaint wakeups and
 buffer presentation. The context's repaint callback wakes the host on background
 search/preview updates; `PickerOutput` reports busy state and keyboard ownership.

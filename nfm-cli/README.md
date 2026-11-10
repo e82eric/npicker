@@ -27,7 +27,7 @@ Run `nfm --help` for every option.
 | `filesystem [ROOT...]` | Files and directories; Enter opens directories, Ctrl+U goes up |
 | `processes` | Processes; Ctrl+K kills, Ctrl+R refreshes |
 | `windows` | Top-level windows with a live thumbnail |
-| `argument` | None: the query box takes text as typed and Enter prints it |
+| `argument` | None: a one-row prompt takes text as typed and Enter prints it |
 
 Line inputs also take `--unique`, `--reverse`, `--line-continuation`,
 `--delimiter` with `--text-field`/`--value-field`, and `--input-format csv`
