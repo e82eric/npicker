@@ -170,6 +170,12 @@ pub struct PublishedSnapshot {
     version: u64,
     /// Root paths by root node index when roots are stored with empty names.
     relative_roots: Option<Arc<[PathBuf]>>,
+    /// The directories that `Node::parent` indexes when a scan keeps them
+    /// only as the parents of its entries (`files_only`), so they are not
+    /// items. When this is `None`, parents are in `nodes` and every directory
+    /// is an item.
+    parents: Option<ChunkedSnapshot<Node>>,
+    parent_count: usize,
 }
 
 impl ItemsSource for PublishedSnapshot {
@@ -226,6 +232,16 @@ impl PublishedSnapshot {
             byte_count: 0,
             version: 0,
             relative_roots: None,
+            parents: None,
+            parent_count: 0,
+        }
+    }
+
+    /// The nodes that `Node::parent` indexes, and how many there are.
+    fn parents(&self) -> (&ChunkedSnapshot<Node>, usize) {
+        match &self.parents {
+            Some(parents) => (parents, self.parent_count),
+            None => (&self.nodes, self.node_count),
         }
     }
 
@@ -238,9 +254,13 @@ impl PublishedSnapshot {
         let Some(roots) = &self.relative_roots else {
             return Some(PathBuf::from(path));
         };
+        let (parents, parent_count) = self.parents();
         let mut root = node_index;
-        while self.node(root).parent >= 0 {
-            root = self.node(root).parent as usize;
+        let mut node = self.node(node_index);
+        while node.parent >= 0 {
+            root = node.parent as usize;
+            assert!(root < parent_count);
+            node = parents[root];
         }
         // Roots are inserted before any of their entries, in scan order.
         let root = roots.get(root)?;
@@ -283,11 +303,11 @@ impl PublishedSnapshot {
     }
 
     fn path_utf8_full_len(&self, node_index: usize) -> usize {
+        let (parents, parent_count) = self.parents();
         let mut len = 0usize;
-        let mut current = node_index as i32;
+        let mut node = self.node(node_index);
 
-        while current >= 0 {
-            let node = self.node(current as usize);
+        loop {
             let name = self.name(node.name as usize);
             len += name.len as usize;
             if name.len > 0
@@ -295,10 +315,12 @@ impl PublishedSnapshot {
             {
                 len += 1;
             }
-            current = node.parent;
+            if node.parent < 0 {
+                return len;
+            }
+            assert!((node.parent as usize) < parent_count);
+            node = parents[node.parent as usize];
         }
-
-        len
     }
 
     fn write_path_utf8_backwards(&self, node_index: usize, out: &mut [u8]) {
@@ -306,11 +328,11 @@ impl PublishedSnapshot {
             return;
         }
 
+        let (parents, parent_count) = self.parents();
         let mut position = out.len() - 1;
-        let mut current = node_index as i32;
+        let mut node = self.node(node_index);
 
-        while current >= 0 {
-            let node = self.node(current as usize);
+        loop {
             let name = self.name(node.name as usize);
             if name.len > 0
                 && self.byte_at(name.offset as usize + name.len as usize - 1) != PATH_SEPARATOR
@@ -323,7 +345,11 @@ impl PublishedSnapshot {
             let start = position + 1 - name_len;
             self.copy_name_to_slice(name, &mut out[start..start + name_len]);
             position = start.saturating_sub(1);
-            current = node.parent;
+            if node.parent < 0 {
+                return;
+            }
+            assert!((node.parent as usize) < parent_count);
+            node = parents[node.parent as usize];
         }
     }
 
@@ -346,6 +372,9 @@ pub struct CompactUtf8FileStore {
     published: Arc<PublishedSnapshot>,
     snapshot_version: AtomicU64,
     relative_roots: Option<Arc<[PathBuf]>>,
+    /// Directories kept apart from the items; see
+    /// `PublishedSnapshot::parents`.
+    parents: Option<ChunkedStorage<Node>>,
 }
 
 fn hash_bytes(bytes: &[u8]) -> u64 {
@@ -370,6 +399,7 @@ impl CompactUtf8FileStore {
             published: Arc::new(PublishedSnapshot::empty()),
             snapshot_version: AtomicU64::new(0),
             relative_roots: None,
+            parents: None,
         }
     }
 
@@ -381,6 +411,31 @@ impl CompactUtf8FileStore {
         }
     }
 
+    /// Keep nodes added with `add_parent` apart from the items, so
+    /// directories that are only the parents of other nodes are not listed.
+    /// Every `parent` then indexes the nodes added with `add_parent`.
+    pub fn with_separate_parents(self) -> Self {
+        Self {
+            parents: Some(ChunkedStorage::new(NODE_CHUNK_SIZE)),
+            ..self
+        }
+    }
+
+    /// Add a directory that is only the parent of other nodes, returning the
+    /// index its children use as `parent`. It is an item too, as `add_node`
+    /// makes it, unless the store was made with `with_separate_parents`.
+    pub fn add_parent(&mut self, parent: i32, name: &str) -> u32 {
+        if self.parents.is_none() {
+            return self.add_node(parent, name);
+        }
+        let name = self.get_or_add_name(name.as_bytes());
+        let parents = self.parents.as_mut().expect("checked above");
+        let index = parents.len();
+        parents.push(Node { parent, name });
+        index as u32
+    }
+
+    /// Add an item, returning its index.
     pub fn add_node(&mut self, parent: i32, name: &str) -> u32 {
         let name_index = self.get_or_add_name(name.as_bytes());
         let node_index = self.nodes.len();
@@ -416,6 +471,8 @@ impl CompactUtf8FileStore {
             name_bytes: self.name_bytes.snapshot(),
             version,
             relative_roots: self.relative_roots.clone(),
+            parents: self.parents.as_ref().map(ChunkedStorage::snapshot),
+            parent_count: self.parents.as_ref().map_or(0, ChunkedStorage::len),
         });
     }
 
@@ -518,6 +575,31 @@ mod interning_tests {
         assert_eq!(snapshot.name_count, 1);
         assert_eq!(snapshot.byte_count, 4);
     }
+
+    #[test]
+    fn separate_parents_are_not_items_and_still_build_paths() {
+        let sep = PATH_SEPARATOR as char;
+        let mut store = CompactUtf8FileStore::new().with_separate_parents();
+        let root = store.add_parent(-1, "root");
+        let sub = store.add_parent(root as i32, "sub");
+        assert_eq!((root, sub), (0, 1));
+        // Items are numbered apart from the parents they point at.
+        assert_eq!(store.add_node(root as i32, "a.txt"), 0);
+        assert_eq!(store.add_node(sub as i32, "b.txt"), 1);
+        store.complete_adding();
+        let snapshot = store.snapshot();
+        assert_eq!(snapshot.len(), 2);
+        assert_eq!(snapshot.item(0).unwrap(), format!("root{sep}a.txt"));
+        assert_eq!(snapshot.item(1).unwrap(), format!("root{sep}sub{sep}b.txt"));
+        assert!(snapshot.item(2).is_none());
+
+        // Without separate parents a parent is an item like any other node.
+        let mut store = CompactUtf8FileStore::new();
+        let root = store.add_parent(-1, "root");
+        assert_eq!(store.add_node(root as i32, "a.txt"), 1);
+        store.complete_adding();
+        assert_eq!(store.snapshot().len(), 2);
+    }
 }
 
 struct DirectoryWork {
@@ -531,6 +613,8 @@ enum WriterCommand {
         parent: i32,
         name: String,
         directory: Option<(usize, Vec<u8>)>,
+        /// Whether the node is an item, rather than only a parent.
+        listed: bool,
     },
 }
 
@@ -582,6 +666,13 @@ where
     } else {
         CompactUtf8FileStore::new()
     };
+    // Scanned directories stay as the parents of their entries, but only
+    // files are listed.
+    let store = if options.files_only {
+        store.with_separate_parents()
+    } else {
+        store
+    };
     let writer = std::thread::spawn(move || {
         store_writer_loop(
             store,
@@ -604,12 +695,13 @@ where
         } else {
             root.to_string_lossy().into_owned()
         };
-        add_node(
+        add_node_listed(
             &writer_tx,
             &pending,
             -1,
             name,
             Some((0, platform::path_bytes(root))),
+            !options.files_only,
         );
     }
 
@@ -818,7 +910,14 @@ fn scan_directory(
             !options.directories_only
         };
         if included || directory.is_some() {
-            add_node(writer_tx, pending, work.node_index, entry.name, directory);
+            add_node_listed(
+                writer_tx,
+                pending,
+                work.node_index,
+                entry.name,
+                directory,
+                included,
+            );
         }
     });
 }
@@ -840,11 +939,17 @@ fn store_writer_loop<S>(
                 parent,
                 name,
                 directory,
+                listed,
             } => {
-                let node_index = store.add_node(parent, &name);
-                if node_index == 0 || (node_index + 1) % 1_000 == 0 {
-                    sink.snapshot(store.snapshot());
-                }
+                let node_index = if listed {
+                    let node_index = store.add_node(parent, &name);
+                    if node_index == 0 || (node_index + 1) % 1_000 == 0 {
+                        sink.snapshot(store.snapshot());
+                    }
+                    node_index
+                } else {
+                    store.add_parent(parent, &name)
+                };
                 if let Some((depth, path)) = directory {
                     if cancelled.load(Ordering::Acquire)
                         || directory_tx
@@ -874,12 +979,26 @@ fn store_writer_loop<S>(
     sink.complete(final_status);
 }
 
+#[cfg(test)]
 fn add_node(
     writer_tx: &Sender<WriterCommand>,
     pending: &AtomicUsize,
     parent: i32,
     name: String,
     directory: Option<(usize, Vec<u8>)>,
+) {
+    add_node_listed(writer_tx, pending, parent, name, directory, true);
+}
+
+/// Queue a node for the writer, listed as an item when `listed`, and count a
+/// directory it schedules as pending work.
+fn add_node_listed(
+    writer_tx: &Sender<WriterCommand>,
+    pending: &AtomicUsize,
+    parent: i32,
+    name: String,
+    directory: Option<(usize, Vec<u8>)>,
+    listed: bool,
 ) {
     let schedules_directory = directory.is_some();
     // Count work before enqueueing so workers stay alive while the writer
@@ -892,6 +1011,7 @@ fn add_node(
             parent,
             name,
             directory,
+            listed,
         })
         .is_err()
         && schedules_directory
@@ -1014,6 +1134,27 @@ mod scan_tests {
             ]
         );
         assert_eq!(snapshot.absolute_path(snapshot.len()), None);
+
+        // Files only: the root and `sub` are parents but not items, and
+        // absolute paths still find the root.
+        let files = scan_snapshot(&root, i32::MAX, false, true, true);
+        let mut rows: Vec<_> = (0..files.len())
+            .map(|index| {
+                (
+                    files.item(index).unwrap(),
+                    files.absolute_path(index).unwrap(),
+                )
+            })
+            .collect();
+        rows.sort();
+        assert_eq!(
+            rows,
+            vec![
+                ("a.txt".to_owned(), root.join("a.txt")),
+                (join(&["sub", "b.txt"]), root.join("sub").join("b.txt")),
+            ]
+        );
+        assert_eq!(files.absolute_path(files.len()), None);
         std::fs::remove_dir_all(&root).unwrap();
     }
 
@@ -1049,15 +1190,15 @@ mod scan_tests {
             scan_paths(&root, i32::MAX, true, false),
             [&all[0], &all[2], &all[4]].into_iter().cloned().collect()
         );
-        // Scanned directories stay as parents of their entries, so only
-        // directories that are not descended into are removed.
+        // Scanned directories stay as parents of their entries but are not
+        // listed, the roots included.
         assert_eq!(
             scan_paths(&root, i32::MAX, false, true),
-            all.iter().cloned().collect()
+            [&all[1], &all[3], &all[5]].into_iter().cloned().collect()
         );
         assert_eq!(
             scan_paths(&root, 1, false, true),
-            [&all[0], &all[1]].into_iter().cloned().collect()
+            [&all[1]].into_iter().cloned().collect()
         );
         assert_eq!(
             scan_paths(&root, 1, false, false),
