@@ -33,7 +33,9 @@ pub use picker::{
     results_height,
 };
 pub use placement::{Placement, Position};
-pub use prompt::{Prompt, PromptConfig, PromptEvent, PromptOutput, prompt_height};
+pub use prompt::{
+    PROMPT_FRAME_HEIGHT, Prompt, PromptConfig, PromptEvent, PromptOutput, prompt_height,
+};
 pub use preview::{Cancellation, GridLines, Preview, PreviewCell, PreviewProvider, PreviewRequest};
 pub use session::SearchTimings;
 pub mod byte_preview;

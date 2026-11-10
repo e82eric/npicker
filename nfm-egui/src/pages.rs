@@ -65,6 +65,14 @@ impl<P> PageStack<P> {
     pub fn top_mut(&mut self) -> Option<&mut P> {
         self.pages.last_mut()
     }
+    /// Every page, the first one opened first and the top one last, for a
+    /// host to ask something of the pages beneath the one showing.
+    pub fn iter(&self) -> impl DoubleEndedIterator<Item = &P> {
+        self.pages.iter()
+    }
+    pub fn iter_mut(&mut self) -> impl DoubleEndedIterator<Item = &mut P> {
+        self.pages.iter_mut()
+    }
     /// How many pages there are.
     pub fn len(&self) -> usize {
         self.pages.len()
@@ -87,6 +95,14 @@ mod tests {
         assert!(pages.apply(Outcome::Push("argument")).is_empty());
         assert!(pages.apply(Outcome::Push("results")).is_empty());
         assert_eq!((pages.len(), pages.top()), (3, Some(&"results")));
+        // Every page can be asked, the top one last.
+        assert_eq!(
+            pages.iter().copied().collect::<Vec<_>>(),
+            ["commands", "argument", "results"]
+        );
+        for page in pages.iter_mut() {
+            assert!(!page.is_empty());
+        }
         assert_eq!(pages.apply(Outcome::Back), ["results"]);
         assert_eq!(pages.top(), Some(&"argument"));
         pages.apply(Outcome::Push("results"));

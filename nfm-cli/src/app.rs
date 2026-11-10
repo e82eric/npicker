@@ -429,7 +429,7 @@ pub fn preview_initially_visible(options: &Options) -> bool {
 /// What a prompt's window is taller than the prompt by, and its panel and
 /// query allowance, as `window_size` reckons them before there is a frame.
 const WINDOW_SLACK: f32 = 2.0;
-const PROMPT_OVERHEAD: f32 = 26.0 + WINDOW_SLACK;
+const PROMPT_OVERHEAD: f32 = nfm_egui::PROMPT_FRAME_HEIGHT + WINDOW_SLACK;
 
 /// The window's size in points for a page with these options.
 pub fn window_size(options: &Options) -> egui::Vec2 {

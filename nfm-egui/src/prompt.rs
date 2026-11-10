@@ -56,10 +56,15 @@ pub struct Prompt {
     focus: bool,
 }
 
+/// What a prompt showing no error is taller than its row of text by, in
+/// points: for a host that sizes a window before there is a frame to ask
+/// `prompt_height` in.
+pub const PROMPT_FRAME_HEIGHT: f32 = PANEL_FRAME_HEIGHT + QUERY_HEIGHT_ALLOWANCE;
+
 /// The height, in points, of a prompt showing no error. Hosts that size a
 /// window to a prompt add the placement's margins.
 pub fn prompt_height(ctx: &Context, appearance: &Appearance) -> f32 {
-    appearance.typography.preview_row_height(ctx) + PANEL_FRAME_HEIGHT + QUERY_HEIGHT_ALLOWANCE
+    appearance.typography.preview_row_height(ctx) + PROMPT_FRAME_HEIGHT
 }
 
 impl Prompt {
