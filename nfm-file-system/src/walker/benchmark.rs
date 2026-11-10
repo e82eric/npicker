@@ -286,8 +286,8 @@ mod tests {
             assert_eq!(snapshot.name_count, 300);
             for (index, expected) in names.iter().enumerate() {
                 let node = snapshot.nodes[index];
-                assert_eq!(node.name as usize, index % 300);
-                let name = snapshot.names[node.name as usize];
+                assert_eq!(node.name_index(), index % 300);
+                let name = snapshot.names[node.name_index()];
                 let mut heap = Vec::new();
                 let bytes = snapshot.name_bytes.get_range(
                     name.offset as usize,
@@ -356,7 +356,7 @@ fn record(path: &str, roots: &[PathBuf]) -> Result<()> {
     let mut heap = Vec::new();
     for index in 0..snapshot.node_count {
         let node = snapshot.nodes[index];
-        let name = snapshot.names[node.name as usize];
+        let name = snapshot.names[node.name_index()];
         // get_range was public before copy_range_to, so the harness can also
         // compile against older baseline revisions. Recording is not timed.
         let bytes = snapshot.name_bytes.get_range(

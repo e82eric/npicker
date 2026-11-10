@@ -133,10 +133,28 @@ impl FileWalkerScan {
     }
 }
 
+/// Set in `Node::name` when the node is a directory. Names are counted in the
+/// remaining bits, so the flag costs no memory.
+const DIRECTORY_BIT: u32 = 1 << 31;
+
 #[derive(Clone, Copy, Debug)]
 pub struct Node {
     pub parent: i32,
+    /// The index of the node's name, with `DIRECTORY_BIT` set for a
+    /// directory. Read it with `name_index` and `is_dir`.
     pub name: u32,
+}
+
+impl Node {
+    /// The index of the node's name.
+    pub fn name_index(self) -> usize {
+        (self.name & !DIRECTORY_BIT) as usize
+    }
+
+    /// Whether the node was added as a directory.
+    pub fn is_dir(self) -> bool {
+        self.name & DIRECTORY_BIT != 0
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -245,6 +263,12 @@ impl PublishedSnapshot {
         }
     }
 
+    /// Whether an entry is a directory, as the scan saw it. An index past the
+    /// end is not a directory.
+    pub fn is_dir(&self, node_index: usize) -> bool {
+        node_index < self.node_count && self.nodes[node_index].is_dir()
+    }
+
     /// The full path of an entry, including its root in relative scans.
     pub fn absolute_path(&self, node_index: usize) -> Option<PathBuf> {
         if node_index >= self.node_count {
@@ -308,7 +332,7 @@ impl PublishedSnapshot {
         let mut node = self.node(node_index);
 
         loop {
-            let name = self.name(node.name as usize);
+            let name = self.name(node.name_index());
             len += name.len as usize;
             if name.len > 0
                 && self.byte_at(name.offset as usize + name.len as usize - 1) != PATH_SEPARATOR
@@ -333,7 +357,7 @@ impl PublishedSnapshot {
         let mut node = self.node(node_index);
 
         loop {
-            let name = self.name(node.name as usize);
+            let name = self.name(node.name_index());
             if name.len > 0
                 && self.byte_at(name.offset as usize + name.len as usize - 1) != PATH_SEPARATOR
             {
@@ -422,11 +446,12 @@ impl CompactUtf8FileStore {
     }
 
     /// Add a directory that is only the parent of other nodes, returning the
-    /// index its children use as `parent`. It is an item too, as `add_node`
-    /// makes it, unless the store was made with `with_separate_parents`.
+    /// index its children use as `parent`. It is an item too, as
+    /// `add_directory` makes it, unless the store was made with
+    /// `with_separate_parents`.
     pub fn add_parent(&mut self, parent: i32, name: &str) -> u32 {
         if self.parents.is_none() {
-            return self.add_node(parent, name);
+            return self.add_directory(parent, name);
         }
         let name = self.get_or_add_name(name.as_bytes());
         let parents = self.parents.as_mut().expect("checked above");
@@ -435,13 +460,22 @@ impl CompactUtf8FileStore {
         index as u32
     }
 
-    /// Add an item, returning its index.
+    /// Add a file as an item, returning its index.
     pub fn add_node(&mut self, parent: i32, name: &str) -> u32 {
+        self.add_item(parent, name, 0)
+    }
+
+    /// Add a directory as an item, returning its index.
+    pub fn add_directory(&mut self, parent: i32, name: &str) -> u32 {
+        self.add_item(parent, name, DIRECTORY_BIT)
+    }
+
+    fn add_item(&mut self, parent: i32, name: &str, kind: u32) -> u32 {
         let name_index = self.get_or_add_name(name.as_bytes());
         let node_index = self.nodes.len();
         self.nodes.push(Node {
             parent,
-            name: name_index,
+            name: name_index | kind,
         });
 
         if self.nodes.len() == 15 || self.nodes.len() % PUBLISH_NODE_INTERVAL == 0 {
@@ -511,6 +545,8 @@ impl CompactUtf8FileStore {
         let offset = self.name_bytes.len();
         self.name_bytes.extend_from_slice(bytes);
         let index = self.names.len();
+        // The top bit of a node's name index marks a directory.
+        assert!(index < DIRECTORY_BIT as usize, "too many distinct names");
         self.names.push(Name {
             offset: offset as u32,
             len: bytes.len() as u32,
@@ -593,12 +629,39 @@ mod interning_tests {
         assert_eq!(snapshot.item(1).unwrap(), format!("root{sep}sub{sep}b.txt"));
         assert!(snapshot.item(2).is_none());
 
+        assert!(!snapshot.is_dir(0) && !snapshot.is_dir(1));
+
         // Without separate parents a parent is an item like any other node.
         let mut store = CompactUtf8FileStore::new();
         let root = store.add_parent(-1, "root");
         assert_eq!(store.add_node(root as i32, "a.txt"), 1);
         store.complete_adding();
         assert_eq!(store.snapshot().len(), 2);
+    }
+
+    #[test]
+    fn directories_are_flagged_without_changing_names_or_paths() {
+        let sep = PATH_SEPARATOR as char;
+        let mut store = CompactUtf8FileStore::new();
+        // A directory and a file with the same name share one stored name.
+        let root = store.add_directory(-1, "same");
+        let file = store.add_node(root as i32, "same");
+        let sub = store.add_parent(root as i32, "sub");
+        assert_eq!(store.names.len(), 2);
+        assert_eq!(
+            store.nodes[root as usize].name_index(),
+            store.nodes[file as usize].name_index()
+        );
+        store.complete_adding();
+        let snapshot = store.snapshot();
+        assert_eq!(
+            [root, file, sub].map(|index| snapshot.is_dir(index as usize)),
+            [true, false, true]
+        );
+        assert!(!snapshot.is_dir(snapshot.len()));
+        assert_eq!(snapshot.item(0).unwrap(), "same");
+        assert_eq!(snapshot.item(1).unwrap(), format!("same{sep}same"));
+        assert_eq!(snapshot.item(2).unwrap(), format!("same{sep}sub"));
     }
 }
 
@@ -613,9 +676,19 @@ enum WriterCommand {
         parent: i32,
         name: String,
         directory: Option<(usize, Vec<u8>)>,
-        /// Whether the node is an item, rather than only a parent.
-        listed: bool,
+        kind: EntryKind,
     },
+}
+
+/// What a scanned entry is in the store.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EntryKind {
+    /// A file, listed as an item.
+    File,
+    /// A directory, listed as an item.
+    Directory,
+    /// A directory kept only as the parent of its entries.
+    Parent,
 }
 
 pub fn start_scan<S>(options: ScanOptions, sink: Arc<S>) -> FileWalkerScan
@@ -695,13 +768,17 @@ where
         } else {
             root.to_string_lossy().into_owned()
         };
-        add_node_listed(
+        add_entry(
             &writer_tx,
             &pending,
             -1,
             name,
             Some((0, platform::path_bytes(root))),
-            !options.files_only,
+            if options.files_only {
+                EntryKind::Parent
+            } else {
+                EntryKind::Directory
+            },
         );
     }
 
@@ -910,13 +987,18 @@ fn scan_directory(
             !options.directories_only
         };
         if included || directory.is_some() {
-            add_node_listed(
+            let kind = match (entry.is_dir, included) {
+                (false, _) => EntryKind::File,
+                (true, true) => EntryKind::Directory,
+                (true, false) => EntryKind::Parent,
+            };
+            add_entry(
                 writer_tx,
                 pending,
                 work.node_index,
                 entry.name,
                 directory,
-                included,
+                kind,
             );
         }
     });
@@ -939,16 +1021,20 @@ fn store_writer_loop<S>(
                 parent,
                 name,
                 directory,
-                listed,
+                kind,
             } => {
-                let node_index = if listed {
-                    let node_index = store.add_node(parent, &name);
+                let node_index = if kind == EntryKind::Parent {
+                    store.add_parent(parent, &name)
+                } else {
+                    let node_index = if kind == EntryKind::Directory {
+                        store.add_directory(parent, &name)
+                    } else {
+                        store.add_node(parent, &name)
+                    };
                     if node_index == 0 || (node_index + 1) % 1_000 == 0 {
                         sink.snapshot(store.snapshot());
                     }
                     node_index
-                } else {
-                    store.add_parent(parent, &name)
                 };
                 if let Some((depth, path)) = directory {
                     if cancelled.load(Ordering::Acquire)
@@ -987,18 +1073,23 @@ fn add_node(
     name: String,
     directory: Option<(usize, Vec<u8>)>,
 ) {
-    add_node_listed(writer_tx, pending, parent, name, directory, true);
+    let kind = if directory.is_some() {
+        EntryKind::Directory
+    } else {
+        EntryKind::File
+    };
+    add_entry(writer_tx, pending, parent, name, directory, kind);
 }
 
-/// Queue a node for the writer, listed as an item when `listed`, and count a
-/// directory it schedules as pending work.
-fn add_node_listed(
+/// Queue an entry for the writer, and count a directory it schedules as
+/// pending work.
+fn add_entry(
     writer_tx: &Sender<WriterCommand>,
     pending: &AtomicUsize,
     parent: i32,
     name: String,
     directory: Option<(usize, Vec<u8>)>,
-    listed: bool,
+    kind: EntryKind,
 ) {
     let schedules_directory = directory.is_some();
     // Count work before enqueueing so workers stay alive while the writer
@@ -1011,7 +1102,7 @@ fn add_node_listed(
             parent,
             name,
             directory,
-            listed,
+            kind,
         })
         .is_err()
         && schedules_directory
@@ -1204,6 +1295,25 @@ mod scan_tests {
             scan_paths(&root, 1, false, false),
             [&all[0], &all[1], &all[2]].into_iter().cloned().collect()
         );
+        // Every listed entry knows whether it is a directory, including one
+        // the depth limit keeps the scan out of (`sub` at depth 1).
+        for (max_depth, directories_only, files_only) in [
+            (i32::MAX, false, false),
+            (1, false, false),
+            (i32::MAX, true, false),
+            (i32::MAX, false, true),
+        ] {
+            let snapshot = scan_snapshot(&root, max_depth, directories_only, files_only, false);
+            assert!(!snapshot.is_empty());
+            for index in 0..snapshot.len() {
+                let path = snapshot.item(index).unwrap();
+                assert_eq!(
+                    snapshot.is_dir(index),
+                    Path::new(&path).is_dir(),
+                    "{path} (max_depth={max_depth})"
+                );
+            }
+        }
         std::fs::remove_dir_all(&root).unwrap();
     }
 
