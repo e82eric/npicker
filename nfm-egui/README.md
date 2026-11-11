@@ -251,6 +251,7 @@ Graphics resources can be recreated without recreating picker/search state.
   monitor/work-area bounds and restores its popup geometry when FullPane ends.
 - Ctrl+Shift+L shows or hides preview line numbers.
 - Ctrl+Shift+/ opens the command palette (see Commands below).
+- Ctrl+Enter opens the actions list: the commands for the selected result.
 - Tab applies the first source completion at the query caret. The query displays
   no additional completion row, matching the Ghostty panel. Hosts can also use `completions` and `apply_completion`.
 
@@ -263,6 +264,7 @@ run from the command palette, or run by the host:
 | Command | Default keys |
 |---|---|
 | `ToggleCommandPalette` | Ctrl+Shift+/ (or Ctrl+Shift+?) |
+| `ToggleActions` | Ctrl+Enter |
 | `TogglePreview` | Ctrl+P, Ctrl+Space |
 | `TogglePreviewFocus` | Ctrl+W |
 | `QuickSelect` | Alt+Space |
@@ -309,14 +311,21 @@ it without cancelling the picker.
 Commands without a key, such as `ToggleRelativePreviewLineNumbers`, run from
 here. The palette opens at the top of the picker, sized for the whole list or
 the space available, and keeps that size while filtering. Built-in and custom
-commands are declared the same way, as a `PickerCommand { action, title }`:
+commands are declared the same way, as a `PickerCommand { action, title, scope }`:
 `default_commands()` declares the built-in ones, and `PickerConfig::commands`
 (or `set_commands`) adds the host's after them, such as
 `PickerCommand::custom(id, "Copy resume command")`. No command needs a key: a
 binding to its action gives it one. Choosing a custom command reports
 `PickerEvent::CustomAction` with its id. A command declared for a built-in
-action gives that action a new title. `PickerBinding::description` is the
-older way to title a command and still lists one that is not declared.
+action gives that action a new title and scope. `PickerBinding::description` is
+the older way to title a command and still lists one that is not declared.
+
+A command's `scope` is what it acts on: `CommandScope::Picker`, `Selection` or
+`Preview`. `PickerCommand::custom` makes a `Selection` command, as a host's
+usually is. The actions list (Ctrl+Enter, `ToggleActions`) is the palette
+showing only the `Selection` commands: Copy selection, then the host's. Its key
+closes it, and the palette's key shows every command instead, as the actions
+key does from the palette.
 `set_keybinding_help` is
 deprecated and has no effect.
 

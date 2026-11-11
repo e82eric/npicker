@@ -51,6 +51,9 @@ pub enum PickerTrigger {
 pub enum PickerAction {
     /// Open or close the command palette, which also lists key bindings.
     ToggleCommandPalette,
+    /// Open or close the actions list: the command palette showing only the
+    /// commands for the selected result.
+    ToggleActions,
     TogglePreview,
     /// Enter or leave preview copy mode.
     TogglePreviewFocus,
@@ -78,8 +81,9 @@ pub enum PickerAction {
 }
 impl PickerAction {
     /// Every built-in command, in command palette order.
-    pub const BUILT_IN: [PickerAction; 14] = [
+    pub const BUILT_IN: [PickerAction; 15] = [
         Self::ToggleCommandPalette,
+        Self::ToggleActions,
         Self::TogglePreview,
         Self::TogglePreviewFocus,
         Self::QuickSelect,
@@ -99,6 +103,7 @@ impl PickerAction {
     pub fn name(self) -> Option<&'static str> {
         Some(match self {
             Self::ToggleCommandPalette => "ToggleCommandPalette",
+            Self::ToggleActions => "ToggleActions",
             Self::TogglePreview => "TogglePreview",
             Self::TogglePreviewFocus => "TogglePreviewFocus",
             Self::QuickSelect => "QuickSelect",
@@ -127,6 +132,7 @@ impl PickerAction {
     pub fn title(self) -> Option<&'static str> {
         Some(match self {
             Self::ToggleCommandPalette => "Command palette",
+            Self::ToggleActions => "Actions for the selection",
             Self::TogglePreview => "Toggle preview",
             Self::TogglePreviewFocus => "Focus preview / query",
             Self::QuickSelect => "Quick Select preview",
@@ -142,6 +148,27 @@ impl PickerAction {
             Self::ToggleFullPane => "Toggle full-pane picker",
             Self::Unbind | Self::Custom(_) => return None,
         })
+    }
+    /// What a built-in command acts on; a host's command says for itself.
+    fn scope(self) -> CommandScope {
+        match self {
+            Self::ToggleCommandPalette
+            | Self::ToggleActions
+            | Self::TogglePreview
+            | Self::ToggleFullPane
+            | Self::Unbind => CommandScope::Picker,
+            Self::CopySelection | Self::Custom(_) => CommandScope::Selection,
+            Self::TogglePreviewFocus
+            | Self::QuickSelect
+            | Self::CopyPreviewDocument
+            | Self::ScrollPreviewPageUp
+            | Self::ScrollPreviewPageDown
+            | Self::ScrollPreviewLineUp
+            | Self::ScrollPreviewLineDown
+            | Self::TogglePreviewLineNumbers
+            | Self::ToggleRelativePreviewLineNumbers
+            | Self::TogglePreviewWrap => CommandScope::Preview,
+        }
     }
     /// Whether a key repeat runs the command again. Egui also reports a press
     /// as a repeat when it never saw the key's release, so most commands accept
@@ -213,6 +240,7 @@ pub fn default_bindings() -> Vec<PickerBinding> {
         (Key::Slash, ctrl_shift, ToggleCommandPalette),
         // Shifted slash arrives as a question mark on some layouts.
         (Key::Questionmark, ctrl_shift, ToggleCommandPalette),
+        (Key::Enter, Modifiers::CTRL, ToggleActions),
         (Key::P, Modifiers::CTRL, TogglePreview),
         (Key::Space, Modifiers::CTRL, TogglePreview),
         (Key::W, Modifiers::CTRL, TogglePreviewFocus),
@@ -260,6 +288,8 @@ struct PaletteRow {
 struct CommandPalette {
     picker: Picker<StructuredStreamingSnapshot>,
     actions: Vec<PickerAction>,
+    /// The scope it lists, as the actions list; `None` lists every command.
+    scope: Option<CommandScope>,
 }
 /// Space between the palette and the edge of the picker it covers.
 const PALETTE_MARGIN: f32 = 12.0;
@@ -314,22 +344,35 @@ pub enum PreviewLineNumbers {
 /// Fewest digits the line-number gutter reserves, so that short documents
 /// share one content width.
 const MIN_LINE_NUMBER_DIGITS: usize = 3;
-/// A command as the command palette lists it: what it does and what it is
-/// called. Built-in commands and a host's own are declared alike, the built-in
+/// What a command acts on. The actions list shows the commands for the
+/// selected result.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CommandScope {
+    /// The picker itself, such as showing its preview.
+    Picker,
+    /// The selected result.
+    Selection,
+    /// The preview.
+    Preview,
+}
+/// A command as the command palette lists it: what it does, what it is
+/// called, and what it acts on. Built-in commands and a host's own are declared alike, the built-in
 /// ones by [`default_commands`]. A command needs no key: each binding to its
 /// action gives it one, which its palette row shows.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PickerCommand {
     pub action: PickerAction,
     pub title: String,
+    pub scope: CommandScope,
 }
 impl PickerCommand {
-    /// A host's command: choosing it reports [`PickerEvent::CustomAction`]
-    /// with `id`.
+    /// A host's command for the selected result: choosing it reports
+    /// [`PickerEvent::CustomAction`] with `id`.
     pub fn custom(id: usize, title: impl Into<String>) -> Self {
         Self {
             action: PickerAction::Custom(id),
             title: title.into(),
+            scope: CommandScope::Selection,
         }
     }
 }
@@ -341,12 +384,13 @@ pub fn default_commands() -> Vec<PickerCommand> {
             Some(PickerCommand {
                 action,
                 title: action.title()?.into(),
+                scope: action.scope(),
             })
         })
         .collect()
 }
 /// The built-in commands, then the host's: one for an action already listed
-/// gives it a new title, where it is.
+/// gives it a new title and scope, where it is.
 fn resolved_commands(commands: Vec<PickerCommand>) -> Vec<PickerCommand> {
     let mut resolved = default_commands();
     for command in commands {
@@ -354,7 +398,7 @@ fn resolved_commands(commands: Vec<PickerCommand>) -> Vec<PickerCommand> {
             continue;
         }
         match resolved.iter_mut().find(|it| it.action == command.action) {
-            Some(existing) => existing.title = command.title,
+            Some(existing) => *existing = command,
             None => resolved.push(command),
         }
     }
@@ -1120,9 +1164,10 @@ where
         ctx.request_repaint();
     }
 
-    /// Every palette row: each command, built-in ones first, then any custom
-    /// one that only a binding describes.
-    fn palette_rows(&self) -> Vec<PaletteRow> {
+    /// The palette's rows: each command, built-in ones first, then any custom
+    /// one that only a binding describes; with a `scope`, only those that act
+    /// on it.
+    fn palette_rows(&self, scope: Option<CommandScope>) -> Vec<PaletteRow> {
         let keys = |action: PickerAction| {
             self.config
                 .bindings
@@ -1136,6 +1181,7 @@ where
             .config
             .commands
             .iter()
+            .filter(|command| scope.is_none_or(|scope| command.scope == scope))
             .map(|command| PaletteRow {
                 keys: keys(command.action),
                 title: command.title.clone(),
@@ -1147,7 +1193,12 @@ where
             else {
                 continue;
             };
-            if !rows.iter().any(|row| row.action == binding.action) {
+            // Such a command acts on the selection, as a host's does unless it
+            // says otherwise.
+            if scope.is_none_or(|scope| scope == CommandScope::Selection)
+                && !self.config.commands.iter().any(|it| it.action == binding.action)
+                && !rows.iter().any(|row| row.action == binding.action)
+            {
                 rows.push(PaletteRow {
                     keys: keys(binding.action),
                     title: title.clone(),
@@ -1158,8 +1209,10 @@ where
         rows
     }
 
-    fn open_palette(&mut self, ctx: &Context) {
-        let rows = self.palette_rows();
+    /// Open the palette on every command, or as the actions list on those of a
+    /// `scope`.
+    fn open_palette(&mut self, ctx: &Context, scope: Option<CommandScope>) {
+        let rows = self.palette_rows(scope);
         let source = structured_source(
             vec!["Command".into(), "Keys".into()],
             rows.iter()
@@ -1178,7 +1231,12 @@ where
             .collect();
         let config = PickerConfig {
             layout: Layout::QueryTop,
-            title: "Command palette".into(),
+            title: if scope.is_some() {
+                "Actions"
+            } else {
+                "Command palette"
+            }
+            .into(),
             // Every command has a row, so filtering never resizes the palette.
             result_rows: rows.len().max(1),
             bindings,
@@ -1189,6 +1247,7 @@ where
         self.palette = Some(Box::new(CommandPalette {
             picker,
             actions: rows.into_iter().map(|row| row.action).collect(),
+            scope,
         }));
         self.dismissed_completion = Some((self.query.clone(), self.query_cursor));
         self.suggestions.clear();
@@ -1208,10 +1267,11 @@ where
         if self.palette.is_none() {
             return;
         }
-        // This picker's palette keys close the palette, whatever it shows.
+        // This picker's palette and actions keys work whatever the palette
+        // shows: the open list's key closes it, and the other's shows that one.
         let bindings = &self.config.bindings;
         let toggled = ctx.input_mut(|input| {
-            let mut toggled = false;
+            let mut toggled = None;
             let mut events = std::mem::take(&mut input.events).into_iter().peekable();
             while let Some(event) = events.next() {
                 if let egui::Event::Key {
@@ -1220,14 +1280,16 @@ where
                     modifiers,
                     ..
                 } = &event
-                    && bindings.iter().any(|binding| {
-                        binding.action == PickerAction::ToggleCommandPalette
-                            && binding.trigger == PickerTrigger::Key(*key)
+                    && let Some(binding) = bindings.iter().find(|binding| {
+                        matches!(
+                            binding.action,
+                            PickerAction::ToggleCommandPalette | PickerAction::ToggleActions
+                        ) && binding.trigger == PickerTrigger::Key(*key)
                             && same_binding_modifiers(binding.modifiers, *modifiers)
                     })
                 {
                     if *pressed {
-                        toggled = true;
+                        toggled = Some(binding.action);
                         if matches!(events.peek(), Some(egui::Event::Text(_))) {
                             events.next();
                         }
@@ -1238,8 +1300,14 @@ where
             }
             toggled
         });
-        if toggled {
-            self.close_palette();
+        if let Some(action) = toggled {
+            let actions = self.palette.as_ref().is_some_and(|it| it.scope.is_some());
+            if actions == (action == PickerAction::ToggleActions) {
+                self.close_palette();
+            } else {
+                // The other list, on the next frame.
+                self.execute(ctx, action);
+            }
             return;
         }
         let Some(palette) = &mut self.palette else {
@@ -1385,11 +1453,14 @@ where
         match action {
             Custom(id) => return Some(id),
             Unbind => {}
-            ToggleCommandPalette => {
-                if self.palette.is_some() {
-                    self.close_palette();
-                } else {
-                    self.open_palette(ctx);
+            ToggleCommandPalette | ToggleActions => {
+                let scope = (action == ToggleActions).then_some(CommandScope::Selection);
+                let open = self.palette.as_ref().map(|palette| palette.scope);
+                self.close_palette();
+                // The open list's own command closes it; the other's shows that
+                // list instead.
+                if open != Some(scope) {
+                    self.open_palette(ctx, scope);
                 }
             }
             TogglePreview => {
@@ -3464,7 +3535,7 @@ mod query_parity_tests {
             PickerCommand::custom(8, "Unbound command"),
             PickerCommand::custom(5, "Declared and bound"),
         ]);
-        let rows = picker.palette_rows();
+        let rows = picker.palette_rows(None);
         let row = |title: &str| rows.iter().find(|row| row.title == title).unwrap();
         // Built-in commands come first, in order, with their current keys,
         // then declared commands, then those only a binding describes.
@@ -3504,10 +3575,12 @@ mod query_parity_tests {
             PickerCommand {
                 action: PickerAction::TogglePreviewWrap,
                 title: "Wrap".into(),
+                scope: CommandScope::Preview,
             },
             PickerCommand {
                 action: PickerAction::Unbind,
                 title: "Not a command".into(),
+                scope: CommandScope::Picker,
             },
         ]);
         assert_eq!(commands.len(), PickerAction::BUILT_IN.len() + 1);
@@ -3517,6 +3590,65 @@ mod query_parity_tests {
             .position(|it| it.action == PickerAction::TogglePreviewWrap);
         assert_eq!(wrap, built_in.iter().position(|it| *it == PickerAction::TogglePreviewWrap));
         assert_eq!(commands[wrap.unwrap()].title, "Wrap");
+    }
+
+    #[test]
+    fn the_actions_list_has_the_commands_for_the_selection() {
+        let (ctx, mut picker) = make();
+        wait(&mut picker);
+        picker.set_commands(vec![
+            PickerCommand::custom(3, "Mine"),
+            PickerCommand {
+                scope: CommandScope::Picker,
+                ..PickerCommand::custom(4, "About the picker")
+            },
+        ]);
+        picker.set_bindings(vec![PickerBinding {
+            trigger: PickerTrigger::Key(Key::L),
+            modifiers: Modifiers::CTRL,
+            action: PickerAction::Custom(5),
+            description: Some("Described by its key".into()),
+        }]);
+        let titles = |picker: &Picker<StructuredStreamingSnapshot>, scope| {
+            picker
+                .palette_rows(scope)
+                .into_iter()
+                .map(|row| row.title)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            titles(&picker, Some(CommandScope::Selection)),
+            ["Copy selection", "Mine", "Described by its key"]
+        );
+        assert_eq!(
+            titles(&picker, None).len(),
+            PickerAction::BUILT_IN.len() + 3
+        );
+        let open = |picker: &Picker<StructuredStreamingSnapshot>| {
+            picker.palette.as_ref().map(|palette| palette.scope)
+        };
+        // Ctrl+Enter opens it and closes it; the palette's key swaps the lists.
+        tap(&ctx, &mut picker, Key::Enter, Modifiers::CTRL);
+        assert_eq!(open(&picker), Some(Some(CommandScope::Selection)));
+        let palette = Modifiers::CTRL | Modifiers::SHIFT;
+        tap(&ctx, &mut picker, Key::Slash, palette);
+        draw(&ctx, &mut picker, vec![]);
+        assert_eq!(open(&picker), Some(None));
+        tap(&ctx, &mut picker, Key::Enter, Modifiers::CTRL);
+        draw(&ctx, &mut picker, vec![]);
+        assert_eq!(open(&picker), Some(Some(CommandScope::Selection)));
+        tap(&ctx, &mut picker, Key::Enter, Modifiers::CTRL);
+        draw(&ctx, &mut picker, vec![]);
+        assert_eq!(open(&picker), None);
+        // Choosing a row runs its command: the second is the host's.
+        tap(&ctx, &mut picker, Key::Enter, Modifiers::CTRL);
+        draw(&ctx, &mut picker, vec![key(Key::ArrowDown), key(Key::Enter)]);
+        let (_, event) = draw(&ctx, &mut picker, vec![]);
+        assert!(matches!(
+            event,
+            Some(PickerEvent::CustomAction { action: 3, .. })
+        ));
+        assert_eq!(open(&picker), None);
     }
 
     #[test]
@@ -5329,7 +5461,7 @@ mod query_parity_tests {
             vec![modified_key(Key::P, Modifiers::CTRL)],
         );
         assert!(picker.preview_rect.unwrap().is_positive());
-        picker.open_palette(&ctx);
+        picker.open_palette(&ctx, None);
         let mut bounds = Some(egui::Rect::EVERYTHING);
         let mut frame = ctx.run_ui(
             egui::RawInput {
