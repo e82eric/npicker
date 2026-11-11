@@ -1136,6 +1136,11 @@ impl PreviewCopyMode {
         }
     }
 
+    /// Rows in the document as laid out.
+    pub(crate) fn rows(&self) -> u64 {
+        self.document.rows()
+    }
+
     pub(crate) fn quick_select_active(&self) -> bool {
         self.quick_select.is_some()
     }

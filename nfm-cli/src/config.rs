@@ -19,6 +19,10 @@
 //! program = "open.exe"
 //! args = []
 //!
+//! [actions.walk]            # --action walk push --action-arg walk filesystem ...
+//! type = "push"
+//! args = ["filesystem", "{item}"]
+//!
 //! [bind]                    # --bind ctrl-o open
 //! ctrl-o = "open"
 //! ```
@@ -132,17 +136,23 @@ pub fn tokens(text: &str) -> Result<Vec<String>, String> {
             "actions" => {
                 for (name, action) in section(key, value)? {
                     let at = format!("actions.{name}");
-                    out.extend(["--action".into(), name.clone(), "action-resolver".into()]);
-                    for (field, value) in section(&at, action)? {
+                    let action = section(&at, action)?;
+                    let kind = match action.get("type") {
+                        Some(kind) => string(&format!("{at}.type"), kind)?,
+                        None => "action-resolver".into(),
+                    };
+                    out.extend(["--action".into(), name.clone(), kind]);
+                    for (field, value) in action {
                         let at = format!("{at}.{field}");
                         match field.as_str() {
+                            "type" => {}
                             "program" => out.extend(["--action-program".into(), name.clone(), string(&at, value)?]),
                             "args" => {
                                 for arg in strings(&at, value)? {
                                     out.extend(["--action-arg".into(), name.clone(), arg]);
                                 }
                             }
-                            _ => return Err(format!("unknown key '{at}'; expected program or args")),
+                            _ => return Err(format!("unknown key '{at}'; expected type, program or args")),
                         }
                     }
                 }
@@ -233,6 +243,10 @@ args = ["--color=always", "{item}"]
 [actions.open]
 program = "open.exe"
 
+[actions.walk]
+type = "push"
+args = ["filesystem", "{item}"]
+
 [bind]
 ctrl-o = "open"
 "##,
@@ -249,6 +263,7 @@ ctrl-o = "open"
             "--preview-command code bat",
             "--preview-command-arg code --color=always --preview-command-arg code {item}",
             "--action open action-resolver --action-program open open.exe",
+            "--action walk push --action-arg walk filesystem --action-arg walk {item}",
             "--bind ctrl-o open",
         ] {
             assert!(joined.contains(expected), "{expected} missing from {joined}");

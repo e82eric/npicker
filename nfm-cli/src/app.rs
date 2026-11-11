@@ -1,16 +1,19 @@
-//! The picker window: one view per input kind, keys bound to actions, and the
-//! outcome handed back to `main` when the window closes.
+//! The picker window: a stack of pages, each one view of an input kind with
+//! its keys bound to actions, and the outcome handed back to `main` when the
+//! window closes. An action may push a page on top of the one showing; Esc
+//! goes back a page and closes the window from the first.
 use crate::{
     actions::{self, ActionState, PickerState, Resolution},
     keys::{self, Chord},
-    options::{Command, Options, Program},
+    options::{self, Action, Command, Layer, Options, Program},
     output::{Chosen, Outcome},
     preview::{PreviewSpec, Target},
-    source::{Feed, LineSnapshot, Source},
+    source::{self, Feed, LineSnapshot, Repaint, Source},
 };
 use nfm_egui::{
-    Appearance, Layout, Picker, PickerConfig, PickerEvent, Placement, Position, SearchSortMode,
-    Selection, egui,
+    Appearance, Layout, Output, OutputConfig, OutputEvent, OutputWriter, PageStack, Picker,
+    PickerConfig, PickerEvent, Placement, Position, Prompt, PromptConfig, PromptEvent,
+    SearchSortMode, Selection, egui,
 };
 use nfm_file_system_egui::{FileEvent, FilePaths, FilePicker};
 use nfm_picker_sources::{
@@ -68,11 +71,17 @@ enum View {
     /// Windows with a command preview instead of the live thumbnail.
     #[cfg(windows)]
     WindowList(Picker<nfm_window_egui::WindowSnapshot>),
+    /// Nothing to pick from: a prompt takes text as typed.
+    Argument(Prompt),
+    /// Nothing to pick from: what a program prints, to read.
+    Output(Output),
 }
 
-/// Run `$body` with `$p` bound to the view's `&mut Picker<_>`.
+/// Run `$body` with `$p` bound to the view's `&mut Picker<_>`, or `$other`
+/// with `$q` bound to its `&mut Prompt`, or `$none` for an output page, which
+/// has neither.
 macro_rules! with_picker {
-    ($view:expr, $p:ident => $body:expr) => {
+    ($view:expr, $p:ident => $body:expr, prompt $q:ident => $other:expr, output => $none:expr) => {
         match $view {
             View::Lines { picker: $p, .. } => $body,
             View::Delimited { picker: $p, .. } => $body,
@@ -93,6 +102,8 @@ macro_rules! with_picker {
             }
             #[cfg(windows)]
             View::WindowList($p) => $body,
+            View::Argument($q) => $other,
+            View::Output(_) => $none,
         }
     };
 }
@@ -136,6 +147,15 @@ fn path_chosen(path: String, index: usize) -> Chosen {
         text: path.clone(),
         value: path,
         index,
+    }
+}
+/// What an argument page selects: the text as typed.
+fn argument_chosen(text: String) -> Chosen {
+    Chosen {
+        item: text.clone().into(),
+        text: text.clone(),
+        value: text,
+        index: 0,
     }
 }
 #[cfg(windows)]
@@ -205,6 +225,8 @@ impl View {
             View::WindowList(picker) => picker
                 .selection()
                 .map(|s| window_chosen(&s.item, s.index)),
+            View::Argument(prompt) => Some(argument_chosen(prompt.text().to_owned())),
+            View::Output(_) => None,
         }
     }
 
@@ -220,6 +242,8 @@ impl View {
             View::Processes(_) => PickerState::Processes,
             #[cfg(windows)]
             View::Windows(_) | View::WindowList(_) => PickerState::Windows,
+            View::Argument(_) => PickerState::Argument,
+            View::Output(_) => PickerState::Output,
         }
     }
 
@@ -317,6 +341,15 @@ impl View {
             View::WindowList(picker) => plain(ctx, picker, placement, appearance, |s| {
                 window_chosen(&s.item, s.index)
             }),
+            View::Argument(prompt) => match prompt.show(ctx, placement, appearance, false).event {
+                Some(PromptEvent::Submitted(text)) => Shown::Accepted(Some(argument_chosen(text))),
+                Some(PromptEvent::Cancelled) => Shown::Cancelled,
+                None => Shown::Nothing,
+            },
+            View::Output(page) => match page.show(ctx, placement, appearance, false) {
+                Some(OutputEvent::Cancelled) => Shown::Cancelled,
+                None => Shown::Nothing,
+            },
         })
     }
 }
@@ -333,21 +366,38 @@ impl Drop for Running {
     }
 }
 
-pub struct App {
+/// One page of the window: a picker over one input, with its own options,
+/// keys and running action. A page beneath the top one keeps all of it, so
+/// going back shows it as it was left.
+struct Page {
     options: Arc<Options>,
-    appearance: Appearance,
     view: View,
-    outcome: SharedOutcome,
     bindings: Vec<(Chord, Binding)>,
     expect: Vec<Chord>,
     running: Option<Running>,
     preview: PreviewSpec,
-    hwnd: isize,
     source_error_shown: bool,
+}
+
+pub struct App {
+    /// The first page's options: the window's font, colors and position.
+    root: Arc<Options>,
+    /// The defaults under every page's own command line.
+    base: Vec<Layer>,
+    repaint: Repaint,
+    appearance: Appearance,
+    pages: PageStack<Page>,
+    outcome: SharedOutcome,
+    hwnd: isize,
+    /// The size asked of the window for the page showing, until it has it.
+    resizing: Option<egui::Vec2>,
+    /// The size the window was last fitted to.
+    fitted: egui::Vec2,
     first_frame: bool,
 }
 
 pub fn picker_config(options: &Options, preview_visible: bool) -> PickerConfig {
+    let defaults = PickerConfig::default();
     PickerConfig {
         layout: if options.layout_top {
             Layout::QueryTop
@@ -367,7 +417,9 @@ pub fn picker_config(options: &Options, preview_visible: bool) -> PickerConfig {
         } else {
             SearchSortMode::Score
         },
-        ..PickerConfig::default()
+        prompt: options.prompt.clone().unwrap_or(defaults.prompt.clone()),
+        placeholder: options.placeholder.clone().unwrap_or_default(),
+        ..defaults
     }
 }
 
@@ -378,30 +430,93 @@ pub fn preview_initially_visible(options: &Options) -> bool {
         Command::FileSystem(_) => true,
         Command::Processes => true,
         Command::Windows => true,
+        Command::Argument | Command::Output(_) => false,
         _ => !spec.is_empty(),
     };
     let default = !matches!(options.command, Command::Processes) || spec.has_command();
     available && options.preview_visible.unwrap_or(default)
 }
 
-impl App {
-    pub fn new(
-        cc: &eframe::CreationContext<'_>,
+/// What a prompt's window is taller than the prompt by, and its panel and
+/// query allowance, as `window_size` reckons them before there is a frame.
+const WINDOW_SLACK: f32 = 2.0;
+const PROMPT_OVERHEAD: f32 = nfm_egui::PROMPT_FRAME_HEIGHT + WINDOW_SLACK;
+/// Rows of text an output page's window has unless `--rows` says.
+const DEFAULT_OUTPUT_ROWS: usize = 24;
+
+/// The window's size in points for a page with these options.
+pub fn window_size(options: &Options) -> egui::Vec2 {
+    // Picker rows are the font's line height plus 3 points of padding on each
+    // side; the panel frame, query and dividers add a fixed overhead.
+    let font_size = options.font_size.unwrap_or(14.0);
+    let row = (font_size * 1.2 + 6.0).ceil();
+    let rows = options.rows.unwrap_or(DEFAULT_ROWS) as f32;
+    // Cards (--row-template) are a line per template line, a larger title
+    // line, 6 points of padding above and below, and 1 point between lines.
+    let result = options.row_template.as_deref().map_or(row, |spec| {
+        let lines = spec.split(';').filter(|line| !line.trim().is_empty());
+        let line = font_size * 1.2;
+        let height: f32 = lines
+            .map(|l| {
+                if l.contains(":title") {
+                    (line * 1.15).ceil() + 1.0
+                } else {
+                    line + 1.0
+                }
+            })
+            .sum();
+        (height - 1.0 + 12.0).ceil()
+    });
+    let (preview, overhead) = if preview_initially_visible(options) {
+        let rows = options.preview_rows.unwrap_or(DEFAULT_PREVIEW_ROWS) as f32;
+        (rows * row, 58.0)
+    } else {
+        (0.0, 43.0)
+    };
+    // Tables (processes, windows, csv rows without cards) add a header row.
+    let header = match options.command {
+        Command::Processes | Command::Windows => row,
+        _ if options.input_format == options::InputFormat::Csv && options.row_template.is_none() => {
+            row
+        }
+        _ => 0.0,
+    };
+    let height = options.height.unwrap_or(match options.command {
+        // A prompt is its one row and the panel around it.
+        Command::Argument => row + PROMPT_OVERHEAD,
+        // An output page is its rows of text and the panel around them.
+        Command::Output(_) => {
+            options.rows.unwrap_or(DEFAULT_OUTPUT_ROWS) as f32 * row
+                + nfm_egui::OUTPUT_FRAME_HEIGHT
+                + WINDOW_SLACK
+        }
+        _ => row + header + rows * result + preview + overhead,
+    });
+    egui::vec2(options.width.unwrap_or(DEFAULT_WIDTH), height)
+}
+
+/// `args` with `{query}` and `{item}` replaced: the command line of the page
+/// a push action shows.
+fn fill(args: &[String], query: &str, item: Option<&str>) -> Result<Vec<String>, String> {
+    args.iter()
+        .map(|arg| {
+            let arg = arg.replace("{query}", query);
+            if !arg.contains("{item}") {
+                return Ok(arg);
+            }
+            item.map(|item| arg.replace("{item}", item))
+                .ok_or_else(|| "{item} requires a selection".to_owned())
+        })
+        .collect()
+}
+
+impl Page {
+    fn new(
+        ctx: &egui::Context,
         options: Arc<Options>,
         source: Option<Source>,
-        outcome: SharedOutcome,
+        hwnd: isize,
     ) -> Result<Self, String> {
-        let ctx = &cc.egui_ctx;
-        let mut appearance = crate::theme::appearance(&options.colors, options.font_size);
-        if let Some(font) = &options.font {
-            crate::theme::install_font(ctx, &mut appearance, font)?;
-        }
-        let hwnd = window_handle(cc);
-        #[cfg(windows)]
-        {
-            crate::window::make_popup(hwnd);
-            crate::window::place(hwnd, options.position);
-        }
         let preview = PreviewSpec::new(&options);
         let view = build_view(ctx, &options, source, hwnd, &preview)?;
         let mut bindings: Vec<(Chord, Binding)> = options
@@ -424,21 +539,17 @@ impl App {
             }
         }
         keys::sort_specific_first(&mut bindings);
-        let mut app = Self {
+        let mut page = Self {
             expect: options.expect.clone(),
             options,
-            appearance,
             view,
-            outcome,
             bindings,
             running: None,
             preview,
-            hwnd,
             source_error_shown: false,
-            first_frame: true,
         };
-        app.install_help();
-        Ok(app)
+        page.install_help();
+        Ok(page)
     }
 
     fn install_help(&mut self) {
@@ -464,68 +575,16 @@ impl App {
         for chord in &self.expect {
             help.push((chord.label(), "Accept and print the key".into()));
         }
-        with_picker!(&mut self.view, picker => picker.set_keybinding_help(help));
-    }
-
-    fn finish(&mut self, ctx: &egui::Context, outcome: Outcome) {
-        #[cfg(windows)]
-        if self.options.activate
-            && let Outcome::Selected {
-                chosen: Some(chosen),
-                ..
-            } = &outcome
-            && let Some(hwnd) = chosen.item.get("native_window").and_then(|v| v.as_i64())
-        {
-            crate::window::activate(hwnd as isize);
-        }
-        *self.outcome.lock().unwrap_or_else(|e| e.into_inner()) = Some(outcome);
-        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        // A prompt has no command palette to list its keys in.
+        with_picker!(&mut self.view, picker => picker.set_keybinding_help(help), prompt _prompt => drop(help), output => drop(help));
     }
 
     fn query(&mut self) -> String {
-        with_picker!(&mut self.view, picker => picker.query().to_owned())
+        with_picker!(&mut self.view, picker => picker.query().to_owned(), prompt prompt => prompt.text().to_owned(), output => String::new())
     }
 
     fn set_error(&mut self, error: Option<String>) {
-        with_picker!(&mut self.view, picker => picker.set_error(error));
-    }
-
-    fn run(&mut self, ctx: &egui::Context, binding: Binding) -> Result<(), String> {
-        match binding {
-            Binding::Accept => {
-                if let Some(chosen) = self.view.chosen() {
-                    let query = self.query();
-                    self.finish(
-                        ctx,
-                        Outcome::Selected {
-                            chosen: Some(chosen),
-                            key: None,
-                            query,
-                        },
-                    );
-                }
-            }
-            Binding::Cancel => self.finish(ctx, Outcome::Cancelled),
-            Binding::Parent => {
-                if let View::Files(menu) = &mut self.view {
-                    let roots = nfm_file_system::parent_roots(
-                        &menu.options().roots,
-                        nfm_file_system::default_roots(),
-                    );
-                    menu.navigate(ctx, roots)?;
-                }
-            }
-            Binding::Action(name) => {
-                let program = if name == ACCEPT_RESOLVER {
-                    self.options.accept_resolver.clone()
-                } else {
-                    self.options.actions.get(&name).cloned()
-                }
-                .ok_or_else(|| format!("undefined action '{name}'"))?;
-                self.start_action(ctx, program);
-            }
-        }
-        Ok(())
+        with_picker!(&mut self.view, picker => picker.set_error(error), prompt prompt => prompt.set_error(error), output => drop(error));
     }
 
     fn start_action(&mut self, ctx: &egui::Context, program: Program) {
@@ -553,9 +612,190 @@ impl App {
             query,
         });
     }
+}
+
+impl App {
+    pub fn new(
+        cc: &eframe::CreationContext<'_>,
+        options: Arc<Options>,
+        source: Option<Source>,
+        outcome: SharedOutcome,
+        base: Vec<Layer>,
+        repaint: Repaint,
+    ) -> Result<Self, String> {
+        let ctx = &cc.egui_ctx;
+        let mut appearance = crate::theme::appearance(&options.colors, options.font_size);
+        if let Some(font) = &options.font {
+            crate::theme::install_font(ctx, &mut appearance, font)?;
+        }
+        let hwnd = window_handle(cc);
+        #[cfg(windows)]
+        {
+            crate::window::make_popup(hwnd);
+            crate::window::place(hwnd, options.position);
+        }
+        let mut pages = PageStack::new();
+        pages.open(Page::new(ctx, options.clone(), source, hwnd)?);
+        Ok(Self {
+            base,
+            repaint,
+            appearance,
+            pages,
+            outcome,
+            hwnd,
+            resizing: None,
+            fitted: window_size(&options),
+            root: options,
+            first_frame: true,
+        })
+    }
+
+    /// The page showing.
+    fn page(&mut self) -> &mut Page {
+        self.pages.top_mut().expect("the window always has a page")
+    }
+
+    fn finished(&self) -> bool {
+        self.outcome.lock().unwrap_or_else(|e| e.into_inner()).is_some()
+    }
+
+    fn finish(&mut self, ctx: &egui::Context, outcome: Outcome) {
+        #[cfg(windows)]
+        if self.page().options.activate
+            && let Outcome::Selected {
+                chosen: Some(chosen),
+                ..
+            } = &outcome
+            && let Some(hwnd) = chosen.item.get("native_window").and_then(|v| v.as_i64())
+        {
+            crate::window::activate(hwnd as isize);
+        }
+        *self.outcome.lock().unwrap_or_else(|e| e.into_inner()) = Some(outcome);
+        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+    }
+
+    /// Show the page `args`, an nfm command line, describes on top of the one
+    /// showing.
+    fn push(&mut self, ctx: &egui::Context, args: Vec<String>) -> Result<(), String> {
+        let mut options = options::parse_page(&self.base, args)?;
+        // The font, colors and position are the window's, set by the first page.
+        options.font = self.root.font.clone();
+        options.font_size = self.root.font_size;
+        options.colors = self.root.colors.clone();
+        options.position = self.root.position;
+        options.width = options.width.or(self.root.width);
+        let source = if options.command.is_line_input() {
+            Some(source::start(&options, self.repaint.clone())?)
+        } else {
+            None
+        };
+        let page = Page::new(ctx, Arc::new(options), source, self.hwnd)?;
+        self.pages.apply(nfm_egui::Outcome::Push(page));
+        self.page_changed(ctx);
+        Ok(())
+    }
+
+    /// Go back a page; false from the first one, which stays for the window
+    /// to draw until it closes.
+    fn back(&mut self, ctx: &egui::Context) -> bool {
+        let went = self.pages.len() > 1;
+        if went {
+            self.pages.apply(nfm_egui::Outcome::Back);
+            self.page_changed(ctx);
+        }
+        went
+    }
+
+    /// The size the page showing wants of the window: its options', or for a
+    /// prompt what it takes now, which is more while it shows an error.
+    fn page_size(&self, ctx: &egui::Context) -> egui::Vec2 {
+        let page = self.pages.top().expect("the window always has a page");
+        let mut size = window_size(&page.options);
+        if page.options.height.is_none()
+            && let View::Argument(prompt) = &page.view
+        {
+            size.y = prompt.height(ctx, &self.appearance) + WINDOW_SLACK;
+        }
+        size
+    }
+
+    /// Give the window the size the page showing wants, when that changed.
+    fn fit_window(&mut self, ctx: &egui::Context) {
+        let size = self.page_size(ctx);
+        if (self.fitted - size).length() < 1.0 {
+            return;
+        }
+        self.fitted = size;
+        if (ctx.content_rect().size() - size).length() >= 1.0 {
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
+            self.resizing = Some(size);
+            ctx.request_repaint();
+        } else {
+            self.resizing = None;
+        }
+    }
+
+    /// Another page is showing: the window takes its size and title.
+    fn page_changed(&mut self, ctx: &egui::Context) {
+        let options = self.page().options.clone();
+        self.fit_window(ctx);
+        let title = options.title.clone().unwrap_or_else(|| "nfm".into());
+        ctx.send_viewport_cmd(egui::ViewportCommand::Title(title));
+        ctx.request_repaint();
+    }
+
+    fn run(&mut self, ctx: &egui::Context, binding: Binding) -> Result<(), String> {
+        match binding {
+            Binding::Accept => {
+                let page = self.page();
+                if let Some(chosen) = page.view.chosen() {
+                    let query = page.query();
+                    self.finish(
+                        ctx,
+                        Outcome::Selected {
+                            chosen: Some(chosen),
+                            key: None,
+                            query,
+                        },
+                    );
+                }
+            }
+            Binding::Cancel => self.finish(ctx, Outcome::Cancelled),
+            Binding::Parent => {
+                if let View::Files(menu) = &mut self.page().view {
+                    let roots = nfm_file_system::parent_roots(
+                        &menu.options().roots,
+                        nfm_file_system::default_roots(),
+                    );
+                    menu.navigate(ctx, roots)?;
+                }
+            }
+            Binding::Action(name) => {
+                let page = self.page();
+                let action = if name == ACCEPT_RESOLVER {
+                    page.options.accept_resolver.clone().map(Action::Resolver)
+                } else {
+                    page.options.actions.get(&name).cloned()
+                }
+                .ok_or_else(|| format!("undefined action '{name}'"))?;
+                match action {
+                    Action::Resolver(program) => page.start_action(ctx, program),
+                    Action::Push(args) => {
+                        let chosen = page.view.chosen();
+                        let query = page.query();
+                        let args = fill(&args, &query, chosen.as_ref().map(|c| c.value.as_str()))?;
+                        self.push(ctx, args)?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
 
     fn poll_action(&mut self, ctx: &egui::Context) -> Result<(), String> {
-        let Some(running) = &self.running else {
+        let hwnd = self.hwnd;
+        let page = self.page();
+        let Some(running) = &page.running else {
             return Ok(());
         };
         let result = match running.receive.try_recv() {
@@ -563,7 +803,7 @@ impl App {
             Err(mpsc::TryRecvError::Empty) => return Ok(()),
             Err(mpsc::TryRecvError::Disconnected) => Err("action resolver stopped".into()),
         };
-        let running = self.running.take().expect("checked above");
+        let running = page.running.take().expect("checked above");
         match result? {
             Resolution::None => {}
             Resolution::Complete => {
@@ -579,16 +819,17 @@ impl App {
                 );
             }
             Resolution::Filewalker(roots) => {
-                if let View::Files(menu) = &mut self.view {
+                if let View::Files(menu) = &mut page.view {
                     menu.navigate(ctx, roots)?;
                 } else {
-                    let mut options = (*self.options).clone();
+                    let mut options = (*page.options).clone();
                     options.command = Command::FileSystem(roots);
                     options.query.clear();
-                    self.view = build_view(ctx, &options, None, self.hwnd, &self.preview)?;
-                    self.install_help();
+                    page.view = build_view(ctx, &options, None, hwnd, &page.preview)?;
+                    page.install_help();
                 }
             }
+            Resolution::Push(args) => self.push(ctx, args)?,
         }
         Ok(())
     }
@@ -597,22 +838,32 @@ impl App {
         if std::mem::take(&mut self.first_frame) {
             ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
         }
+        // Once the window has the size a page asked for, it goes back to
+        // where windows of that size open.
+        if let Some(size) = self.resizing
+            && (ctx.content_rect().size() - size).length() < 1.0
+        {
+            self.resizing = None;
+            #[cfg(windows)]
+            crate::window::place_again(self.hwnd, self.root.position);
+        }
         self.poll_action(ctx)?;
-        if self.outcome.lock().unwrap_or_else(|e| e.into_inner()).is_some() {
+        if self.finished() {
             return Ok(());
         }
-        if !self.source_error_shown
-            && let Some(error) = self.view.source_error()
+        let page = self.page();
+        if !page.source_error_shown
+            && let Some(error) = page.view.source_error()
         {
-            self.source_error_shown = true;
-            self.set_error(Some(error));
+            page.source_error_shown = true;
+            page.set_error(Some(error));
         }
         let (focused, help) =
-            with_picker!(&mut self.view, picker => (picker.preview_focused(), picker.keybinding_help_visible()));
+            with_picker!(&mut page.view, picker => (picker.preview_focused(), picker.keybinding_help_visible()), prompt _prompt => (false, false), output => (false, false));
         if !focused && !help {
-            if let Some(chord) = self.expect.iter().find(|chord| chord.consume(ctx)).cloned() {
-                let chosen = self.view.chosen();
-                let query = self.query();
+            if let Some(chord) = page.expect.iter().find(|chord| chord.consume(ctx)).cloned() {
+                let chosen = page.view.chosen();
+                let query = page.query();
                 self.finish(
                     ctx,
                     Outcome::Selected {
@@ -623,26 +874,33 @@ impl App {
                 );
                 return Ok(());
             }
-            let pressed = self
+            let pressed = page
                 .bindings
                 .iter()
                 .find(|(chord, _)| chord.consume(ctx))
                 .map(|(_, binding)| binding.clone());
             if let Some(binding) = pressed {
                 self.run(ctx, binding)?;
-                if self.outcome.lock().unwrap_or_else(|e| e.into_inner()).is_some() {
+                if self.finished() {
                     return Ok(());
                 }
             }
         }
+        self.fit_window(ctx);
         let mut placement = Placement::new(ctx.content_rect());
         placement.position = Position::FullPane;
         placement.margin = 0.0;
-        match self.view.show(ctx, placement, &self.appearance)? {
+        let page = self.pages.top_mut().expect("the window always has a page");
+        match page.view.show(ctx, placement, &self.appearance)? {
             Shown::Nothing => {}
-            Shown::Cancelled => self.finish(ctx, Outcome::Cancelled),
+            // Esc goes back a page, and closes the window from the first.
+            Shown::Cancelled => {
+                if !self.back(ctx) {
+                    self.finish(ctx, Outcome::Cancelled);
+                }
+            }
             Shown::Accepted(chosen) => {
-                let query = self.query();
+                let query = self.page().query();
                 self.finish(
                     ctx,
                     Outcome::Selected {
@@ -661,7 +919,7 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         if let Err(error) = self.frame(&ctx) {
-            self.set_error(Some(error));
+            self.page().set_error(Some(error));
         }
     }
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
@@ -768,6 +1026,29 @@ fn build_view(
         (Command::Processes | Command::Windows, _) => {
             return Err("the processes and windows commands are only available on Windows".into());
         }
+        (Command::Output(program), _) => {
+            // The program is stopped when the page goes, with its writer.
+            let writer = OutputWriter::new();
+            let mut spec = nfm_output::CommandSpec::new(&program[0]);
+            spec.arguments = program[1..].to_vec();
+            nfm_output::run(spec, writer.clone(), options.format)
+                .map_err(|error| format!("cannot run {}: {error}", program[0]))?;
+            View::Output(Output::new(
+                "nfm-output",
+                OutputConfig {
+                    rows: options.rows.unwrap_or(DEFAULT_OUTPUT_ROWS),
+                },
+                writer,
+            ))
+        }
+        (Command::Argument, _) => View::Argument(Prompt::new(
+            "nfm-argument",
+            PromptConfig {
+                prompt: config.prompt,
+                placeholder: config.placeholder,
+                initial_text: config.initial_query,
+            },
+        )),
         (_, Some(Source::Lines(feed, values))) => {
             let mut picker = Picker::new("nfm-lines", ctx, feed.store.clone(), config);
             if !preview.is_empty() {

@@ -18,6 +18,8 @@ supply the stores, search, pickers and previews.
 | [`nfm-preview-file`](nfm-preview-file/README.md) | Host-selected text, image and command preview plans |
 | [`nfm-preview-text`](nfm-preview-text/README.md) | Syntax-highlighted text previews |
 | [`nfm-preview-command`](nfm-preview-command/README.md) | Bounded, cancellable command execution for previews |
+| `nfm-output` | Runs a program and shows what it prints in an output page, as text or markdown |
+| `nfm-markdown` | Markdown laid out as styled documents, with highlighted code |
 | `nfm-egui-demo` | A standalone window hosting the picker |
 
 ANSI previews are parsed in pure Rust (`vte` plus a small line model in

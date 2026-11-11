@@ -212,6 +212,11 @@ impl eframe::App for Demo {
         placement.anchor = Some(egui::pos2(bounds.center().x, bounds.bottom() - 80.0));
         if let Some(picker) = &mut self.picker {
             let output = picker.show(ctx, placement, &self.appearance, false);
+            // The picker reports; ending it is the host's.
+            let ended = matches!(
+                output.event,
+                Some(PickerEvent::Accepted(_) | PickerEvent::Cancelled)
+            );
             match output.event {
                 Some(PickerEvent::Accepted(selection)) => {
                     self.status = format!("Accepted payload {}: {}", selection.item, selection.text)
@@ -231,7 +236,7 @@ impl eframe::App for Demo {
                 self.screenshot_requested = true;
                 ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::default()));
             }
-            if picker.is_closed() {
+            if ended {
                 self.picker = None;
             }
         }

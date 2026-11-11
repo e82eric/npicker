@@ -50,16 +50,42 @@ let frame = ctx.run_ui(egui::RawInput::default(), |ui| {
             assert!(selection.item == 101 || selection.item == 202);
         }
         Some(PickerEvent::CopyRequested(selection)) => ctx.copy_text(selection.text),
-        Some(PickerEvent::Cancelled) | Some(PickerEvent::CustomAction { .. }) | None => {}
+        Some(PickerEvent::Cancelled)
+        | Some(PickerEvent::CustomAction { .. })
+        | None => {}
     }
 });
 // A real host paints this output with its existing egui renderer.
 frame.drop_without_applying_deltas();
 ```
 
-Acceptance and cancellation close the control and stop its workers. Drop and
-recreate it to open a new session. Copy leaves it open. Handle events inside the
-UI callback: egui may run multiple passes, and a terminal event is emitted once.
+The picker reports acceptance and cancellation and stays as it is: ending it is
+the host's. Drop it, or call `close` to stop its workers and keep it around
+drawing nothing. Handle events inside the UI callback: egui may run multiple
+passes, and an event is emitted once.
+
+A host that shows one picker on top of another keeps them in a `PageStack` and
+answers each event with an `Outcome`: `Stay`, `Back` to the page beneath as it
+was left, `Close`, or `Push` a page on top. `PageStack::apply` does it and hands
+back the pages that left.
+
+A page that only asks for a line of text is a `Prompt`: one row, with the same
+look and placement as a picker. It reports `PromptEvent::Submitted` with the
+text on Enter and `Cancelled` on Escape, stays as it is like a picker, and
+shows a message beneath the text with `set_error`. `Prompt::height` is what it
+takes now, for a host that sizes a window to it.
+
+A page that shows text as it is produced is an `Output`. The host makes an
+`OutputWriter`, gives a clone to whatever produces the text, and that calls
+`publish` with each new version of the document and `finish` at the end. The
+page follows the end until the reader moves away from it, is read with the
+preview's keys (move, search, select, copy), and reports only
+`OutputEvent::Cancelled`. Dropping the page closes the writer; a producer
+learns of it with `on_close` or `is_closed` and stops. The `nfm-output` crate
+is such a producer: `nfm_output::run(spec, writer, format)` runs a program and
+publishes what it prints, as a terminal shows it or laid out as markdown (the
+`nfm-markdown` crate).
+
 The host also handles input routing, IME, platform output, repaint wakeups and
 buffer presentation. The context's repaint callback wakes the host on background
 search/preview updates; `PickerOutput` reports busy state and keyboard ownership.

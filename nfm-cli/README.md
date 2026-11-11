@@ -27,6 +27,8 @@ Run `nfm --help` for every option.
 | `filesystem [ROOT...]` | Files and directories; Enter opens directories, Ctrl+U goes up |
 | `processes` | Processes; Ctrl+K kills, Ctrl+R refreshes |
 | `windows` | Top-level windows with a live thumbnail |
+| `argument` | None: a one-row prompt takes text as typed and Enter prints it |
+| `output [OPTIONS] -- PROGRAM ARGS...` | None: what the program prints is shown as it prints it, to read |
 
 Line inputs also take `--unique`, `--reverse`, `--line-continuation`,
 `--delimiter` with `--text-field`/`--value-field`, and `--input-format csv`
@@ -157,6 +159,57 @@ ago") next to the `updated` timestamp it sorts by.
 - `--expect ctrl-o,alt-enter` accepts with those keys too and prints the key
   on the line before the selection.
 
+### Pages
+
+An action can show another picker on top of the one showing, as a page. Esc
+goes back a page, to the one beneath exactly as it was left, and closes the
+window from the first; the built-in `cancel` action closes it from any page.
+Accepting on any page prints that page's selection.
+
+A page is an nfm command line. It reads the same config file and
+`NFM_DEFAULT_OPTS` as the first page, but none of the first page's own flags,
+and it cannot read standard input. The window keeps the first page's font,
+colors and position and takes each page's size.
+
+- `--action NAME push` with one `--action-arg NAME ARG` per argument of the
+  page's command line; `{query}` and `{item}` are replaced in them. Put text
+  that may start with `-` after `--`.
+- An action program answers `{"action":"push","args":[...]}`.
+- `nfm argument` is a page that only asks for text, with `--prompt` and
+  `--placeholder` to say what for. Its selection is the text, so an action
+  bound to Enter gets it as `{query}` (or `query` in `NFM_ACTION_STATE`, where
+  the picker kind is `argument`).
+- `nfm output -- PROGRAM ARGS...` is a page that shows what a program prints,
+  standard output and standard error together with their colors, while it
+  runs. It stays at the end as more arrives until you move up, and follows
+  again from the last row. `j`/`k` and the arrows move, `/` searches, `v` and
+  `y` select and copy, Ctrl+Shift+C copies everything. Esc ends a search or a
+  selection first, then goes back; the program is stopped when the page goes.
+  `--rows` is its height. `--format markdown` lays what is printed out as
+  markdown instead: `nfm output --format markdown -- cmd /c type README.md`.
+
+```powershell
+# Ask for a host, then watch it being pinged; Esc stops the ping and asks again.
+nfm argument --prompt "Ping:" --placeholder "<host>" --bind enter go `
+  --action go push --action-arg go output --action-arg go -- `
+  --action-arg go ping --action-arg go "{query}"
+```
+
+```powershell
+# Ask for text, then pick among the lines that match it; Esc asks again.
+nfm argument --prompt "Grep:" --placeholder "<text>" --bind enter grep `
+  --action grep push `
+  --action-arg grep command --action-arg grep --delimiter --action-arg grep : `
+  --action-arg grep --text-field --action-arg grep 3 `
+  --action-arg grep --preview-file-field --action-arg grep 1 `
+  --action-arg grep --preview-center-line-field --action-arg grep 2 `
+  --action-arg grep -- --action-arg grep rg --action-arg grep -n `
+  --action-arg grep --no-heading --action-arg grep -- --action-arg grep "{query}"
+```
+
+In a config file the same action is `type = "push"` with the page's command
+line as `args`.
+
 ## Scripting
 
 - `--filter QUERY` prints the matches without opening a window.
@@ -186,6 +239,10 @@ args = ["--color=always", "{item}"]
 
 [actions.open]
 program = "open.exe"
+
+[actions.walk]
+type = "push"
+args = ["filesystem", "{item}"]
 
 [bind]
 ctrl-o = "open"

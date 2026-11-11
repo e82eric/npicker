@@ -22,13 +22,13 @@ const PANEL_RADIUS: u8 = 8;
 const PANEL_MARGIN: egui::Margin = egui::Margin::symmetric(18, 10);
 const PANEL_BORDER: f32 = 1.0;
 const PANEL_INSET_BOTTOM: f32 = PANEL_MARGIN.bottom as f32 + PANEL_BORDER;
-const PANEL_FRAME_HEIGHT: f32 =
+pub(crate) const PANEL_FRAME_HEIGHT: f32 =
     (PANEL_MARGIN.top as f32 + PANEL_MARGIN.bottom as f32) + 2.0 * PANEL_BORDER;
-const PANEL_FRAME_WIDTH: f32 =
+pub(crate) const PANEL_FRAME_WIDTH: f32 =
     (PANEL_MARGIN.left as f32 + PANEL_MARGIN.right as f32) + 2.0 * PANEL_BORDER;
-const DIVIDER_HEIGHT: f32 = 15.0;
+pub(crate) const DIVIDER_HEIGHT: f32 = 15.0;
 // Existing query sizing allowance, independent of the panel's margins.
-const QUERY_HEIGHT_ALLOWANCE: f32 = 4.0;
+pub(crate) const QUERY_HEIGHT_ALLOWANCE: f32 = 4.0;
 const RESULTS_OVERHEAD: f32 = PANEL_FRAME_HEIGHT + DIVIDER_HEIGHT + QUERY_HEIGHT_ALLOWANCE;
 const PREVIEW_OVERHEAD: f32 = RESULTS_OVERHEAD + DIVIDER_HEIGHT;
 
@@ -332,6 +332,10 @@ pub struct PickerConfig {
     /// terminal output, are unaffected.
     pub preview_wrap: bool,
     pub sort: SearchSortMode,
+    /// Drawn before the query.
+    pub prompt: String,
+    /// Muted text in the query box while it is empty.
+    pub placeholder: String,
 }
 impl Default for PickerConfig {
     fn default() -> Self {
@@ -347,6 +351,8 @@ impl Default for PickerConfig {
             preview_line_numbers: PreviewLineNumbers::Off,
             preview_wrap: true,
             sort: SearchSortMode::Score,
+            prompt: ">".into(),
+            placeholder: String::new(),
         }
     }
 }
@@ -416,8 +422,48 @@ impl<T> PickerOutput<T> {
 /// [`Picker::set_row_icon`]).
 pub type RowIcon<T> = Arc<dyn Fn(&T) -> Option<String> + Send + Sync>;
 
+/// The egui id of one live picker or prompt. egui keeps state by id: the query box's
+/// cursor and undo history, popups, the picker's area. Pickers made with the
+/// same name may be alive together, as pages are, so each takes the lowest
+/// slot of that name no live picker holds and gives it back when dropped.
+/// The ids in use are as many as were ever alive at once, and a new picker
+/// finds the state of the last one in its slot, as it would under one id.
+pub(crate) struct IdSlot {
+    name: Id,
+    slot: usize,
+}
+static ID_SLOTS: std::sync::Mutex<Vec<(Id, usize)>> = std::sync::Mutex::new(Vec::new());
+impl IdSlot {
+    pub(crate) fn take(name: Id) -> Self {
+        let mut taken = ID_SLOTS.lock().unwrap_or_else(|e| e.into_inner());
+        let slot = (0..)
+            .find(|slot| !taken.contains(&(name, *slot)))
+            .expect("a free slot");
+        taken.push((name, slot));
+        Self { name, slot }
+    }
+    /// The first picker of a name has the name as its id.
+    pub(crate) fn id(&self) -> Id {
+        if self.slot == 0 {
+            self.name
+        } else {
+            self.name.with(("picker", self.slot))
+        }
+    }
+}
+impl Drop for IdSlot {
+    fn drop(&mut self) {
+        ID_SLOTS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|taken| *taken != (self.name, self.slot));
+    }
+}
+
 pub struct Picker<S: ItemsSource + Send + Sync + 'static> {
     id: Id,
+    /// Holds `id` for as long as the picker lives.
+    _id_slot: IdSlot,
     session: Session<S>,
     config: PickerConfig,
     query: String,
@@ -475,11 +521,13 @@ where
         provider: Arc<P>,
         mut config: PickerConfig,
     ) -> Self {
+        let id_slot = IdSlot::take(Id::new(id));
         let query = config.initial_query.clone();
         let query_cursor = query.len();
         config.bindings = resolved_bindings(config.bindings);
         Self {
-            id: Id::new(id),
+            id: id_slot.id(),
+            _id_slot: id_slot,
             session: Session::new(provider, query.clone(), config.sort, ctx.clone()),
             config,
             query,
@@ -533,7 +581,12 @@ where
         self.session.stop();
         self.query = query.into();
         self.query_cursor = self.query.len();
-        self.session = Session::new(provider, self.query.clone(), self.config.sort, ctx.clone());
+        self.session = Session::new(
+            provider,
+            self.query.clone(),
+            self.config.sort,
+            ctx.clone(),
+        );
         self.revision = 0;
         self.transition_pending = true;
         if let Some(displayed) = &mut self.displayed {
@@ -1184,6 +1237,10 @@ where
     pub fn is_closed(&self) -> bool {
         self.closed
     }
+    /// Stop searching and previewing, and draw nothing from here on. The
+    /// picker never does this itself: it reports what the user did, and its
+    /// host decides whether that ends it. A host that drops the picker has
+    /// no need to close it first.
     pub fn close(&mut self) {
         self.leave_preview_focus();
         self.closed = true;
@@ -1920,8 +1977,9 @@ where
                     .as_ref()
                     .is_none_or(|d| d.output.results.is_empty())
             {
-                let text =
-                    if self.current_results() && self.displayed.as_ref().is_some_and(|d| d.done) {
+                let text = if self.current_results()
+                    && self.displayed.as_ref().is_some_and(|d| d.done)
+                {
                         "No matches"
                     } else {
                         " "
@@ -1996,17 +2054,6 @@ where
         let before = self.query.clone();
         let row_height = appearance.typography.preview_row_height(ctx);
         ui.horizontal(|ui| {
-            let prompt_width =
-                ui.fonts_mut(|fonts| fonts.glyph_width(&appearance.typography.normal, '>'));
-            let (prompt_rect, _) =
-                ui.allocate_exact_size(egui::vec2(prompt_width, row_height), egui::Sense::hover());
-            ui.painter().text(
-                prompt_rect.left_center(),
-                egui::Align2::LEFT_CENTER,
-                ">",
-                appearance.typography.normal.clone(),
-                appearance.palette.accent,
-            );
             let total = self.displayed.as_ref().map_or(0, |d| d.output.total);
             let matched = if self.current_results() {
                 self.displayed.as_ref().map_or(0, |d| d.output.matched)
@@ -2029,25 +2076,14 @@ where
                 )
                 .size();
             let status_width = count_size.x + 24.0;
-            let query_width =
-                (ui.available_width() - status_width - ui.spacing().item_spacing.x).max(1.0);
-            let query_interactive = interactive && !self.preview_focused();
-            let edit = egui::TextEdit::singleline(&mut self.query)
-                .id(input_id)
-                .interactive(query_interactive)
-                .font(appearance.typography.normal.clone())
-                .vertical_align(egui::Align::Center)
-                .margin(0)
-                .min_size(egui::vec2(query_width, row_height))
-                .desired_width(query_width)
-                .frame(egui::Frame::NONE)
-                .event_filter(egui::EventFilter {
-                    tab: true,
-                    escape: true,
-                    horizontal_arrows: true,
-                    vertical_arrows: true,
-                })
-                .show(ui);
+            let edit = crate::query_box::QueryBox {
+                id: input_id,
+                prompt: &self.config.prompt,
+                placeholder: &self.config.placeholder,
+                interactive: interactive && !self.preview_focused(),
+                reserve: status_width + ui.spacing().item_spacing.x,
+            }
+            .show(ui, appearance, row_height, &mut self.query);
             if interactive && self.focus_query && !self.preview_focused() {
                 edit.response.request_focus();
                 self.focus_query = false;
@@ -2056,15 +2092,9 @@ where
                 let query = std::mem::replace(&mut self.query, before.clone());
                 self.set_query(query);
             }
-            let cursor = edit.cursor_range.map_or(self.query.len(), |range| {
-                self.query
-                    .char_indices()
-                    .nth(range.primary.index.into())
-                    .map_or(self.query.len(), |(offset, _)| offset)
-            });
-            self.query_cursor = cursor;
+            self.query_cursor = edit.cursor;
             self.query_rect = edit.response.rect;
-            self.query_text_pos = edit.galley_pos;
+            self.query_text_pos = edit.text_pos;
             if !self.preview_focused() {
                 self.refresh_completions();
             }
@@ -2418,24 +2448,13 @@ where
                 .fixed_pos(rect.min)
                 .show(ctx, |ui| {
                     ui.set_clip_rect(rect.intersect(placement.bounds).intersect(ui.clip_rect()));
-                    egui::Frame::new()
-                        .fill(appearance.palette.background)
-                        .stroke(egui::Stroke::new(PANEL_BORDER, appearance.palette.divider))
-                        .corner_radius(PANEL_RADIUS)
-                        .inner_margin(PANEL_MARGIN)
+                    panel_frame(appearance)
                         .show(ui, |ui| {
                             ui.set_width((rect.width() - PANEL_FRAME_WIDTH).max(1.0));
                             if full_pane {
                                 ui.set_min_height((rect.height() - PANEL_FRAME_HEIGHT).max(0.0));
                             }
-                            ui.spacing_mut().item_spacing.y = 0.0;
-                            ui.visuals_mut().override_text_color = Some(appearance.palette.text);
-                            ui.visuals_mut().text_cursor.stroke =
-                                egui::Stroke::new(2.0, appearance.palette.text);
-                            ui.visuals_mut().selection.bg_fill =
-                                appearance.palette.selection_background;
-                            ui.visuals_mut().selection.stroke.color =
-                                appearance.palette.selection_text;
+                            panel_style(ui, appearance);
                             if self.config.layout == Layout::QueryTop {
                                 self.query_ui(
                                     ui,
@@ -2555,12 +2574,6 @@ where
                 event = Some(PickerEvent::CustomAction { action, selection });
             }
         }
-        if matches!(
-            event,
-            Some(PickerEvent::Accepted(_)) | Some(PickerEvent::Cancelled)
-        ) {
-            self.close();
-        }
         let busy = self.busy();
         if busy {
             ctx.request_repaint_after(Duration::from_millis(50));
@@ -2601,7 +2614,23 @@ where
         }
     }
 }
-fn divider(ui: &mut egui::Ui, appearance: &Appearance) {
+/// The frame a page is drawn in.
+pub(crate) fn panel_frame(appearance: &Appearance) -> egui::Frame {
+    egui::Frame::new()
+        .fill(appearance.palette.background)
+        .stroke(egui::Stroke::new(PANEL_BORDER, appearance.palette.divider))
+        .corner_radius(PANEL_RADIUS)
+        .inner_margin(PANEL_MARGIN)
+}
+/// Rows that touch, and the palette's text, cursor and selection colors.
+pub(crate) fn panel_style(ui: &mut egui::Ui, appearance: &Appearance) {
+    ui.spacing_mut().item_spacing.y = 0.0;
+    ui.visuals_mut().override_text_color = Some(appearance.palette.text);
+    ui.visuals_mut().text_cursor.stroke = egui::Stroke::new(2.0, appearance.palette.text);
+    ui.visuals_mut().selection.bg_fill = appearance.palette.selection_background;
+    ui.visuals_mut().selection.stroke.color = appearance.palette.selection_text;
+}
+pub(crate) fn divider(ui: &mut egui::Ui, appearance: &Appearance) {
     let (rect, _) = ui.allocate_exact_size(
         egui::vec2(ui.available_width(), DIVIDER_HEIGHT),
         egui::Sense::hover(),
@@ -2611,7 +2640,7 @@ fn divider(ui: &mut egui::Ui, appearance: &Appearance) {
         egui::Stroke::new(1.5, appearance.palette.divider.gamma_multiply(0.8)),
     );
 }
-fn paint_loading_indicator(ui: &egui::Ui, rect: egui::Rect, color: egui::Color32) {
+pub(crate) fn paint_loading_indicator(ui: &egui::Ui, rect: egui::Rect, color: egui::Color32) {
     let center = rect.center();
     let dot_size = rect.height() / 4.0;
     let dot_step = (rect.height() - dot_size) / 2.0;
@@ -3963,6 +3992,79 @@ mod query_parity_tests {
             repeat: false,
             modifiers,
         }
+    }
+    fn shows_text(frame: &egui::FullOutput, needle: &str) -> bool {
+        frame.shapes.iter().any(|shape| {
+            matches!(&shape.shape, egui::Shape::Text(text) if text.galley.job.text.contains(needle))
+        })
+    }
+    #[test]
+    fn a_page_shown_again_types_at_its_own_cursor() {
+        let (ctx, mut under) = make();
+        wait(&mut under);
+        draw(&ctx, &mut under, vec![]);
+        draw(&ctx, &mut under, vec![egui::Event::Text("abc".into())]);
+        // A page on top, made with the same name, keeps its own cursor.
+        let store = Arc::new(SnapshotStore::new());
+        store.publish(StructuredStreamingSnapshot::from_rows(vec!["Name".into()], vec![]).unwrap());
+        store.complete();
+        let mut top = Picker::new("query-parity", &ctx, store, PickerConfig::default());
+        draw(&ctx, &mut top, vec![]);
+        draw(&ctx, &mut top, vec![egui::Event::Text("x".into())]);
+        draw(&ctx, &mut top, vec![]);
+        assert_eq!(top.query(), "x");
+        assert_ne!(top.id, under.id);
+        drop(top);
+        // Typed as the page comes back, and once it has the focus again.
+        draw(&ctx, &mut under, vec![egui::Event::Text("d".into())]);
+        assert_eq!(under.query(), "abcd");
+        draw(&ctx, &mut under, vec![]);
+        draw(&ctx, &mut under, vec![egui::Event::Text("e".into())]);
+        assert_eq!(under.query(), "abcde");
+    }
+    #[test]
+    fn live_pickers_of_one_name_have_their_own_ids_and_a_dropped_one_gives_its_back() {
+        let ctx = egui::Context::default();
+        let new = || {
+            let store = Arc::new(SnapshotStore::new());
+            store.publish(StructuredStreamingSnapshot::from_rows(vec!["Name".into()], vec![]).unwrap());
+            store.complete();
+            Picker::new("id-slots", &ctx, store, PickerConfig::default())
+        };
+        let first = new();
+        assert_eq!(first.id, Id::new("id-slots"), "one picker has the name as its id");
+        let second = new();
+        let third = new();
+        let ids = [first.id, second.id, third.id];
+        assert!(ids[0] != ids[1] && ids[1] != ids[2] && ids[0] != ids[2]);
+        // The ids in use are as many as the pickers alive at once.
+        drop(second);
+        assert_eq!(new().id, ids[1]);
+        drop(first);
+        assert_eq!(new().id, ids[0]);
+        drop(third);
+        assert_eq!(new().id, ids[0], "the lowest free one");
+    }
+    #[test]
+    fn a_picker_reports_what_the_user_did_and_leaves_closing_to_its_host() {
+        let (ctx, mut picker) = make();
+        wait(&mut picker);
+        draw(&ctx, &mut picker, vec![]);
+        // Accepted, with a page shown on top and then left: the picker is as
+        // it was, and accepts again.
+        for _ in 0..2 {
+            let (_, event) = draw(&ctx, &mut picker, vec![key(Key::Enter)]);
+            assert!(matches!(event, Some(PickerEvent::Accepted(_))));
+            assert!(!picker.is_closed());
+        }
+        let (_, event) = draw(&ctx, &mut picker, vec![key(Key::Escape)]);
+        assert!(matches!(event, Some(PickerEvent::Cancelled)));
+        assert!(!picker.is_closed());
+        // Its host closes it, and it takes no more input.
+        picker.close();
+        assert!(picker.is_closed());
+        let (_, event) = draw(&ctx, &mut picker, vec![key(Key::Enter)]);
+        assert!(event.is_none());
     }
     #[test]
     fn alt_space_quick_select_restores_focus_and_selects_without_accepting() {
@@ -5587,7 +5689,7 @@ mod tests {
         }
     }
     #[test]
-    fn keyboard_accept_returns_payload_and_closes_once() {
+    fn keyboard_accept_returns_payload_and_a_closed_picker_accepts_nothing() {
         let (ctx, _, mut picker) = make();
         wait(|| {
             picker.poll();
@@ -5599,7 +5701,8 @@ mod tests {
             output.event,
             Some(PickerEvent::Accepted(Selection { item: 42, .. }))
         ));
-        assert!(picker.is_closed());
+        assert!(!picker.is_closed(), "the host says whether that ends it");
+        picker.close();
         assert!(
             draw(&ctx, &mut picker, vec![key(Key::Enter)])
                 .event

@@ -14,6 +14,8 @@ members = [
     "nfm-preview-text",
     "nfm-win32",
     "nfm-preview",
+    "nfm-output",
+    "nfm-markdown",
 ]
 resolver = "2"
 
