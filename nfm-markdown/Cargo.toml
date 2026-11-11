@@ -1,0 +1,13 @@
+[package]
+name = "nfm-markdown"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Markdown laid out as NFM styled documents"
+
+[dependencies]
+nfm-egui = { path = "../nfm-egui" }
+pulldown-cmark = { version = "0.13", default-features = false }
+two-face = "0.5.2"
+unicode-segmentation = "1.13"
+unicode-width = "0.2.2"

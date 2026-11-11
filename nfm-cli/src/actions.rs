@@ -32,6 +32,8 @@ pub enum PickerState {
     Windows,
     /// The `argument` input: the selection is the text typed.
     Argument,
+    /// The `output` input: there is no selection.
+    Output,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

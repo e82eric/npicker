@@ -1,0 +1,10 @@
+[package]
+name = "nfm-output"
+version = "0.1.0"
+edition = "2024"
+description = "Runs a program and shows what it prints in an NFM output page"
+
+[dependencies]
+nfm-egui = { path = "../nfm-egui" }
+nfm-preview-command = { path = "../nfm-preview-command" }
+nfm-markdown = { path = "../nfm-markdown" }

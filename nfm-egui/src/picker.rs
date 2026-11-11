@@ -2640,7 +2640,7 @@ pub(crate) fn divider(ui: &mut egui::Ui, appearance: &Appearance) {
         egui::Stroke::new(1.5, appearance.palette.divider.gamma_multiply(0.8)),
     );
 }
-fn paint_loading_indicator(ui: &egui::Ui, rect: egui::Rect, color: egui::Color32) {
+pub(crate) fn paint_loading_indicator(ui: &egui::Ui, rect: egui::Rect, color: egui::Color32) {
     let center = rect.center();
     let dot_size = rect.height() / 4.0;
     let dot_step = (rect.height() - dot_size) / 2.0;

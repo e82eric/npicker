@@ -28,6 +28,7 @@ Run `nfm --help` for every option.
 | `processes` | Processes; Ctrl+K kills, Ctrl+R refreshes |
 | `windows` | Top-level windows with a live thumbnail |
 | `argument` | None: a one-row prompt takes text as typed and Enter prints it |
+| `output [OPTIONS] -- PROGRAM ARGS...` | None: what the program prints is shown as it prints it, to read |
 
 Line inputs also take `--unique`, `--reverse`, `--line-continuation`,
 `--delimiter` with `--text-field`/`--value-field`, and `--input-format csv`
@@ -178,6 +179,21 @@ colors and position and takes each page's size.
   `--placeholder` to say what for. Its selection is the text, so an action
   bound to Enter gets it as `{query}` (or `query` in `NFM_ACTION_STATE`, where
   the picker kind is `argument`).
+- `nfm output -- PROGRAM ARGS...` is a page that shows what a program prints,
+  standard output and standard error together with their colors, while it
+  runs. It stays at the end as more arrives until you move up, and follows
+  again from the last row. `j`/`k` and the arrows move, `/` searches, `v` and
+  `y` select and copy, Ctrl+Shift+C copies everything. Esc ends a search or a
+  selection first, then goes back; the program is stopped when the page goes.
+  `--rows` is its height. `--format markdown` lays what is printed out as
+  markdown instead: `nfm output --format markdown -- cmd /c type README.md`.
+
+```powershell
+# Ask for a host, then watch it being pinged; Esc stops the ping and asks again.
+nfm argument --prompt "Ping:" --placeholder "<host>" --bind enter go `
+  --action go push --action-arg go output --action-arg go -- `
+  --action-arg go ping --action-arg go "{query}"
+```
 
 ```powershell
 # Ask for text, then pick among the lines that match it; Esc asks again.

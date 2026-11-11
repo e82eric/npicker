@@ -75,6 +75,17 @@ text on Enter and `Cancelled` on Escape, stays as it is like a picker, and
 shows a message beneath the text with `set_error`. `Prompt::height` is what it
 takes now, for a host that sizes a window to it.
 
+A page that shows text as it is produced is an `Output`. The host makes an
+`OutputWriter`, gives a clone to whatever produces the text, and that calls
+`publish` with each new version of the document and `finish` at the end. The
+page follows the end until the reader moves away from it, is read with the
+preview's keys (move, search, select, copy), and reports only
+`OutputEvent::Cancelled`. Dropping the page closes the writer; a producer
+learns of it with `on_close` or `is_closed` and stops. The `nfm-output` crate
+is such a producer: `nfm_output::run(spec, writer, format)` runs a program and
+publishes what it prints, as a terminal shows it or laid out as markdown (the
+`nfm-markdown` crate).
+
 The host also handles input routing, IME, platform output, repaint wakeups and
 buffer presentation. The context's repaint callback wakes the host on background
 search/preview updates; `PickerOutput` reports busy state and keyboard ownership.

@@ -8,6 +8,7 @@ pub mod copy_document;
 pub mod copy_mode;
 pub mod document_search;
 pub mod icons;
+mod output;
 mod pages;
 mod picker;
 mod placement;
@@ -26,6 +27,9 @@ pub use appearance::{Appearance, FontFace, Palette, Typography};
 pub use egui;
 pub use nfm_search_core::search::SearchSortMode;
 pub use nfm_search_core::{fuzzy_search_session::SearchSnapshotProvider, store::ItemsSource};
+pub use output::{
+    OUTPUT_FRAME_HEIGHT, Output, OutputConfig, OutputEvent, OutputWriter,
+};
 pub use pages::{Outcome, PageStack};
 pub use picker::{
     Layout, Picker, PickerAction, PickerBinding, PickerConfig, PickerEvent, PickerOutput,

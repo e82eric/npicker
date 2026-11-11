@@ -11,8 +11,9 @@ use crate::{
     source::{self, Feed, LineSnapshot, Repaint, Source},
 };
 use nfm_egui::{
-    Appearance, Layout, PageStack, Picker, PickerConfig, PickerEvent, Placement, Position, Prompt,
-    PromptConfig, PromptEvent, SearchSortMode, Selection, egui,
+    Appearance, Layout, Output, OutputConfig, OutputEvent, OutputWriter, PageStack, Picker,
+    PickerConfig, PickerEvent, Placement, Position, Prompt, PromptConfig, PromptEvent,
+    SearchSortMode, Selection, egui,
 };
 use nfm_file_system_egui::{FileEvent, FilePaths, FilePicker};
 use nfm_picker_sources::{
@@ -72,12 +73,15 @@ enum View {
     WindowList(Picker<nfm_window_egui::WindowSnapshot>),
     /// Nothing to pick from: a prompt takes text as typed.
     Argument(Prompt),
+    /// Nothing to pick from: what a program prints, to read.
+    Output(Output),
 }
 
 /// Run `$body` with `$p` bound to the view's `&mut Picker<_>`, or `$other`
-/// with `$q` bound to its `&mut Prompt`.
+/// with `$q` bound to its `&mut Prompt`, or `$none` for an output page, which
+/// has neither.
 macro_rules! with_picker {
-    ($view:expr, $p:ident => $body:expr, prompt $q:ident => $other:expr) => {
+    ($view:expr, $p:ident => $body:expr, prompt $q:ident => $other:expr, output => $none:expr) => {
         match $view {
             View::Lines { picker: $p, .. } => $body,
             View::Delimited { picker: $p, .. } => $body,
@@ -99,6 +103,7 @@ macro_rules! with_picker {
             #[cfg(windows)]
             View::WindowList($p) => $body,
             View::Argument($q) => $other,
+            View::Output(_) => $none,
         }
     };
 }
@@ -221,6 +226,7 @@ impl View {
                 .selection()
                 .map(|s| window_chosen(&s.item, s.index)),
             View::Argument(prompt) => Some(argument_chosen(prompt.text().to_owned())),
+            View::Output(_) => None,
         }
     }
 
@@ -237,6 +243,7 @@ impl View {
             #[cfg(windows)]
             View::Windows(_) | View::WindowList(_) => PickerState::Windows,
             View::Argument(_) => PickerState::Argument,
+            View::Output(_) => PickerState::Output,
         }
     }
 
@@ -339,6 +346,10 @@ impl View {
                 Some(PromptEvent::Cancelled) => Shown::Cancelled,
                 None => Shown::Nothing,
             },
+            View::Output(page) => match page.show(ctx, placement, appearance, false) {
+                Some(OutputEvent::Cancelled) => Shown::Cancelled,
+                None => Shown::Nothing,
+            },
         })
     }
 }
@@ -419,7 +430,7 @@ pub fn preview_initially_visible(options: &Options) -> bool {
         Command::FileSystem(_) => true,
         Command::Processes => true,
         Command::Windows => true,
-        Command::Argument => false,
+        Command::Argument | Command::Output(_) => false,
         _ => !spec.is_empty(),
     };
     let default = !matches!(options.command, Command::Processes) || spec.has_command();
@@ -430,6 +441,8 @@ pub fn preview_initially_visible(options: &Options) -> bool {
 /// query allowance, as `window_size` reckons them before there is a frame.
 const WINDOW_SLACK: f32 = 2.0;
 const PROMPT_OVERHEAD: f32 = nfm_egui::PROMPT_FRAME_HEIGHT + WINDOW_SLACK;
+/// Rows of text an output page's window has unless `--rows` says.
+const DEFAULT_OUTPUT_ROWS: usize = 24;
 
 /// The window's size in points for a page with these options.
 pub fn window_size(options: &Options) -> egui::Vec2 {
@@ -468,11 +481,16 @@ pub fn window_size(options: &Options) -> egui::Vec2 {
         }
         _ => 0.0,
     };
-    let height = options.height.unwrap_or(if options.command == Command::Argument {
+    let height = options.height.unwrap_or(match options.command {
         // A prompt is its one row and the panel around it.
-        row + PROMPT_OVERHEAD
-    } else {
-        row + header + rows * result + preview + overhead
+        Command::Argument => row + PROMPT_OVERHEAD,
+        // An output page is its rows of text and the panel around them.
+        Command::Output(_) => {
+            options.rows.unwrap_or(DEFAULT_OUTPUT_ROWS) as f32 * row
+                + nfm_egui::OUTPUT_FRAME_HEIGHT
+                + WINDOW_SLACK
+        }
+        _ => row + header + rows * result + preview + overhead,
     });
     egui::vec2(options.width.unwrap_or(DEFAULT_WIDTH), height)
 }
@@ -558,15 +576,15 @@ impl Page {
             help.push((chord.label(), "Accept and print the key".into()));
         }
         // A prompt has no command palette to list its keys in.
-        with_picker!(&mut self.view, picker => picker.set_keybinding_help(help), prompt _prompt => drop(help));
+        with_picker!(&mut self.view, picker => picker.set_keybinding_help(help), prompt _prompt => drop(help), output => drop(help));
     }
 
     fn query(&mut self) -> String {
-        with_picker!(&mut self.view, picker => picker.query().to_owned(), prompt prompt => prompt.text().to_owned())
+        with_picker!(&mut self.view, picker => picker.query().to_owned(), prompt prompt => prompt.text().to_owned(), output => String::new())
     }
 
     fn set_error(&mut self, error: Option<String>) {
-        with_picker!(&mut self.view, picker => picker.set_error(error), prompt prompt => prompt.set_error(error));
+        with_picker!(&mut self.view, picker => picker.set_error(error), prompt prompt => prompt.set_error(error), output => drop(error));
     }
 
     fn start_action(&mut self, ctx: &egui::Context, program: Program) {
@@ -841,7 +859,7 @@ impl App {
             page.set_error(Some(error));
         }
         let (focused, help) =
-            with_picker!(&mut page.view, picker => (picker.preview_focused(), picker.keybinding_help_visible()), prompt _prompt => (false, false));
+            with_picker!(&mut page.view, picker => (picker.preview_focused(), picker.keybinding_help_visible()), prompt _prompt => (false, false), output => (false, false));
         if !focused && !help {
             if let Some(chord) = page.expect.iter().find(|chord| chord.consume(ctx)).cloned() {
                 let chosen = page.view.chosen();
@@ -1007,6 +1025,21 @@ fn build_view(
         #[cfg(not(windows))]
         (Command::Processes | Command::Windows, _) => {
             return Err("the processes and windows commands are only available on Windows".into());
+        }
+        (Command::Output(program), _) => {
+            // The program is stopped when the page goes, with its writer.
+            let writer = OutputWriter::new();
+            let mut spec = nfm_output::CommandSpec::new(&program[0]);
+            spec.arguments = program[1..].to_vec();
+            nfm_output::run(spec, writer.clone(), options.format)
+                .map_err(|error| format!("cannot run {}: {error}", program[0]))?;
+            View::Output(Output::new(
+                "nfm-output",
+                OutputConfig {
+                    rows: options.rows.unwrap_or(DEFAULT_OUTPUT_ROWS),
+                },
+                writer,
+            ))
         }
         (Command::Argument, _) => View::Argument(Prompt::new(
             "nfm-argument",

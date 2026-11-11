@@ -15,6 +15,8 @@ nfm_search_core = { path = "../nfm-search-core" }
 nfm-picker-sources = { path = "../nfm-picker-sources" }
 nfm-preview = { path = "../nfm-preview" }
 nfm-preview-file = { path = "../nfm-preview-file" }
+nfm-output = { path = "../nfm-output" }
+nfm-preview-command = { path = "../nfm-preview-command" }
 nfm_file_system = { path = "../nfm-file-system" }
 nfm-file-system-egui = { path = "../nfm-file-system-egui" }
 eframe = { version = "=0.36.2", default-features = false, features = ["glow", "default_fonts", "x11", "wayland"] }

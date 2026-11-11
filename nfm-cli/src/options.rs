@@ -15,6 +15,9 @@ pub enum Command {
     Windows,
     /// Nothing to pick from: the query box takes text as typed.
     Argument,
+    /// Nothing to pick from: what a program prints, to read. The program and
+    /// its arguments, everything after `--`.
+    Output(Vec<String>),
 }
 impl Command {
     pub fn is_line_input(&self) -> bool {
@@ -29,6 +32,7 @@ impl Command {
             Self::Processes => "processes",
             Self::Windows => "windows",
             Self::Argument => "argument",
+            Self::Output(_) => "output",
         }
     }
 }
@@ -148,6 +152,8 @@ pub struct Options {
     pub layout_top: bool,
     pub sort_input: bool,
     pub rows: Option<usize>,
+    /// How an output page shows what its program prints.
+    pub format: nfm_output::Format,
     pub preview_rows: Option<usize>,
     pub scroll_padding: Option<u32>,
     pub width: Option<f32>,
@@ -206,6 +212,7 @@ impl Default for Options {
             layout_top: false,
             sort_input: false,
             rows: None,
+            format: nfm_output::Format::Text,
             preview_rows: None,
             scroll_padding: None,
             width: None,
@@ -580,6 +587,13 @@ fn apply_value(
                 other => return Err(format!("{flag} must be score or input, not '{other}'")),
             }
         }
+        "format" => {
+            o.format = match value("text or markdown")?.as_str() {
+                "text" => nfm_output::Format::Text,
+                "markdown" => nfm_output::Format::Markdown,
+                other => return Err(format!("{flag} must be text or markdown, not '{other}'")),
+            }
+        }
         "rows" => o.rows = Some(parse_count(&flag, &value("a number")?)?),
         "preview-rows" => o.preview_rows = Some(parse_count(&flag, &value("a number")?)?),
         "scroll-padding" => o.scroll_padding = Some(parse_number(&flag, &value("a number")?)? as u32),
@@ -659,9 +673,15 @@ fn finish(draft: Draft) -> Result<Options, String> {
         Some("processes") => Command::Processes,
         Some("windows") => Command::Windows,
         Some("argument") => Command::Argument,
+        Some("output") => {
+            if operands.is_empty() {
+                return Err("output requires a program: nfm output [OPTIONS] -- PROGRAM [ARGS...]".into());
+            }
+            Command::Output(operands.clone())
+        }
         Some(other) => {
             return Err(format!(
-                "unknown command '{other}'; expected file, command, filesystem, processes, windows or argument"
+                "unknown command '{other}'; expected file, command, filesystem, processes, windows, argument or output"
             ));
         }
     };
@@ -1031,6 +1051,7 @@ Keys and actions:
 Window:
       --layout <bottom|top>           Query below (default) or above the results
       --rows <N>                      Result rows (default 10)
+      --format <text|markdown>        How an output page shows what is printed (default text)
       --scroll-padding <N>            Preview cursor scroll margin in rows
       --width <POINTS>                Window width (default 1000)
       --height <POINTS>               Window height (default from rows)
@@ -1214,6 +1235,18 @@ mod tests {
             Action::Push(vec!["command".into(), "--".into(), "rg".into(), "{query}".into()])
         );
         assert!(run(&["argument", "x"]).is_err());
+        // An output page is its program, after `--`.
+        let o = run(&["output", "--rows", "30", "--", "ping", "-n", "4", "host"]).unwrap();
+        assert_eq!(
+            o.command,
+            Command::Output(vec!["ping".into(), "-n".into(), "4".into(), "host".into()])
+        );
+        assert_eq!(o.rows, Some(30));
+        assert_eq!(o.format, nfm_output::Format::Text);
+        let o = run(&["output", "--format", "markdown", "--", "cat", "notes.md"]).unwrap();
+        assert_eq!(o.format, nfm_output::Format::Markdown);
+        assert!(run(&["output", "--format", "html", "--", "cat"]).is_err());
+        assert!(run(&["output"]).is_err());
         assert!(run(&["--action", "grep", "push"]).is_err());
         assert!(
             run(&["--action", "grep", "push", "--action-arg", "grep", "windows", "--action-program", "grep", "x"])
