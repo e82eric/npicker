@@ -298,7 +298,7 @@ as if its key had been pressed, so hosts can offer picker commands in their own
 menus or remote-control interfaces.
 
 The command palette (Ctrl+Shift+/) is a list of commands: every built-in
-command, then each custom command whose binding has a `description`, each with
+command, then each custom command in `PickerConfig::commands`, each with
 its current keys. It is a picker over a structured source with Command and Keys
 columns, so it searches like any structured picker: fuzzy text (matching either
 column) ranks commands and highlights the matched characters, and structured
@@ -308,8 +308,16 @@ command on the next frame, as `execute` does; Escape or the palette key closes
 it without cancelling the picker.
 Commands without a key, such as `ToggleRelativePreviewLineNumbers`, run from
 here. The palette opens at the top of the picker, sized for the whole list or
-the space available, and keeps that size while filtering. Custom bindings
-without a `description` stay out of the palette. `set_keybinding_help` is
+the space available, and keeps that size while filtering. Built-in and custom
+commands are declared the same way, as a `PickerCommand { action, title }`:
+`default_commands()` declares the built-in ones, and `PickerConfig::commands`
+(or `set_commands`) adds the host's after them, such as
+`PickerCommand::custom(id, "Copy resume command")`. No command needs a key: a
+binding to its action gives it one. Choosing a custom command reports
+`PickerEvent::CustomAction` with its id. A command declared for a built-in
+action gives that action a new title. `PickerBinding::description` is the
+older way to title a command and still lists one that is not declared.
+`set_keybinding_help` is
 deprecated and has no effect.
 
 ## Demo and checks

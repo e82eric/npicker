@@ -32,9 +32,9 @@ pub use output::{
 };
 pub use pages::{Outcome, PageStack};
 pub use picker::{
-    Layout, Picker, PickerAction, PickerBinding, PickerConfig, PickerEvent, PickerOutput,
-    PickerTrigger, PreviewLineNumbers, RowIcon, Selection, default_bindings,
-    results_height,
+    Layout, Picker, PickerAction, PickerBinding, PickerCommand, PickerConfig, PickerEvent,
+    PickerOutput, PickerTrigger, PreviewLineNumbers, RowIcon, Selection, default_bindings,
+    default_commands, results_height,
 };
 pub use placement::{Placement, Position};
 pub use prompt::{

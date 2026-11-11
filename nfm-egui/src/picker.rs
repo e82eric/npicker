@@ -163,8 +163,9 @@ pub struct PickerBinding {
     pub trigger: PickerTrigger,
     pub modifiers: Modifiers,
     pub action: PickerAction,
-    /// Command palette title of a custom command. Omit it to leave the
-    /// command out of the palette. Built-in commands use their own title.
+    /// Superseded by [`PickerConfig::commands`], which is where a custom
+    /// command's palette title belongs: pass `None`. A title here still lists
+    /// a custom command that `commands` does not declare.
     pub description: Option<String>,
 }
 impl PickerBinding {
@@ -313,6 +314,52 @@ pub enum PreviewLineNumbers {
 /// Fewest digits the line-number gutter reserves, so that short documents
 /// share one content width.
 const MIN_LINE_NUMBER_DIGITS: usize = 3;
+/// A command as the command palette lists it: what it does and what it is
+/// called. Built-in commands and a host's own are declared alike, the built-in
+/// ones by [`default_commands`]. A command needs no key: each binding to its
+/// action gives it one, which its palette row shows.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PickerCommand {
+    pub action: PickerAction,
+    pub title: String,
+}
+impl PickerCommand {
+    /// A host's command: choosing it reports [`PickerEvent::CustomAction`]
+    /// with `id`.
+    pub fn custom(id: usize, title: impl Into<String>) -> Self {
+        Self {
+            action: PickerAction::Custom(id),
+            title: title.into(),
+        }
+    }
+}
+/// Every built-in command, in command palette order.
+pub fn default_commands() -> Vec<PickerCommand> {
+    PickerAction::BUILT_IN
+        .into_iter()
+        .filter_map(|action| {
+            Some(PickerCommand {
+                action,
+                title: action.title()?.into(),
+            })
+        })
+        .collect()
+}
+/// The built-in commands, then the host's: one for an action already listed
+/// gives it a new title, where it is.
+fn resolved_commands(commands: Vec<PickerCommand>) -> Vec<PickerCommand> {
+    let mut resolved = default_commands();
+    for command in commands {
+        if command.action == PickerAction::Unbind {
+            continue;
+        }
+        match resolved.iter_mut().find(|it| it.action == command.action) {
+            Some(existing) => existing.title = command.title,
+            None => resolved.push(command),
+        }
+    }
+    resolved
+}
 #[derive(Clone, Debug)]
 pub struct PickerConfig {
     pub layout: Layout,
@@ -324,6 +371,9 @@ pub struct PickerConfig {
     pub accept_on_click: bool,
     /// Override shared defaults with built-in actions or host custom actions.
     pub bindings: Vec<PickerBinding>,
+    /// Commands to add to the built-in ones, in command palette order;
+    /// `bindings` gives them keys. One for a built-in action retitles it.
+    pub commands: Vec<PickerCommand>,
     pub preview_rows: usize,
     pub preview_visible: bool,
     pub preview_line_numbers: PreviewLineNumbers,
@@ -346,6 +396,7 @@ impl Default for PickerConfig {
             result_rows: 7,
             accept_on_click: false,
             bindings: Vec::new(),
+            commands: Vec::new(),
             preview_rows: 12,
             preview_visible: true,
             preview_line_numbers: PreviewLineNumbers::Off,
@@ -525,6 +576,7 @@ where
         let query = config.initial_query.clone();
         let query_cursor = query.len();
         config.bindings = resolved_bindings(config.bindings);
+        config.commands = resolved_commands(config.commands);
         Self {
             id: id_slot.id(),
             _id_slot: id_slot,
@@ -1054,10 +1106,10 @@ where
         self.config.preview_visible = preview_visible;
         self.full_pane_preview = false;
     }
-    /// Has no effect: the command palette lists only commands. Give a custom
-    /// command a `PickerBinding::description` to list it.
+    /// Has no effect: the command palette lists only commands. Declare a custom
+    /// command in `PickerConfig::commands` to list it.
     #[deprecated(
-        note = "the command palette lists only commands; describe custom commands with PickerBinding::description"
+        note = "the command palette lists only commands; declare custom commands in PickerConfig::commands"
     )]
     pub fn set_keybinding_help(&mut self, _bindings: Vec<(String, String)>) {}
 
@@ -1068,8 +1120,8 @@ where
         ctx.request_repaint();
     }
 
-    /// Every palette row: built-in commands, then the host's described custom
-    /// commands.
+    /// Every palette row: each command, built-in ones first, then any custom
+    /// one that only a binding describes.
     fn palette_rows(&self) -> Vec<PaletteRow> {
         let keys = |action: PickerAction| {
             self.config
@@ -1080,12 +1132,14 @@ where
                 .collect::<Vec<_>>()
                 .join(", ")
         };
-        let mut rows: Vec<PaletteRow> = PickerAction::BUILT_IN
-            .into_iter()
-            .map(|action| PaletteRow {
-                keys: keys(action),
-                title: action.title().unwrap_or_default().into(),
-                action,
+        let mut rows: Vec<PaletteRow> = self
+            .config
+            .commands
+            .iter()
+            .map(|command| PaletteRow {
+                keys: keys(command.action),
+                title: command.title.clone(),
+                action: command.action,
             })
             .collect();
         for binding in &self.config.bindings {
@@ -1278,6 +1332,10 @@ where
     }
     pub fn set_bindings(&mut self, bindings: Vec<PickerBinding>) {
         self.config.bindings = resolved_bindings(bindings);
+    }
+    /// Replace the commands added to the built-in ones.
+    pub fn set_commands(&mut self, commands: Vec<PickerCommand>) {
+        self.config.commands = resolved_commands(commands);
     }
     /// Effective placement after built-in actions, for hosts that resize a native window.
     pub fn effective_position(&self, configured: crate::Position) -> crate::Position {
@@ -3400,10 +3458,16 @@ mod query_parity_tests {
                 description: None,
             },
         ]);
+        // Commands need no binding; one that is bound too is listed once, with
+        // the title it was declared with.
+        picker.set_commands(vec![
+            PickerCommand::custom(8, "Unbound command"),
+            PickerCommand::custom(5, "Declared and bound"),
+        ]);
         let rows = picker.palette_rows();
         let row = |title: &str| rows.iter().find(|row| row.title == title).unwrap();
         // Built-in commands come first, in order, with their current keys,
-        // followed only by described custom commands.
+        // then declared commands, then those only a binding describes.
         let actions: Vec<_> = rows.iter().map(|row| row.action).collect();
         assert_eq!(
             actions[..PickerAction::BUILT_IN.len()],
@@ -3411,8 +3475,13 @@ mod query_parity_tests {
         );
         assert_eq!(
             actions[PickerAction::BUILT_IN.len()..],
-            [PickerAction::Custom(5), PickerAction::Custom(6)]
+            [
+                PickerAction::Custom(8),
+                PickerAction::Custom(5),
+                PickerAction::Custom(6)
+            ]
         );
+        assert_eq!(row("Unbound command").keys, "");
         assert_eq!(row("Toggle full-pane picker").keys, "Ctrl+G");
         assert_eq!(row("Toggle preview").keys, "Ctrl+P, Ctrl+Space");
         assert_eq!(row("Command palette").keys, "Ctrl+Shift+/, Ctrl+Shift+?");
@@ -3420,8 +3489,34 @@ mod query_parity_tests {
         // Unbound commands stay runnable from the palette.
         assert_eq!(row("Toggle line numbers").keys, "");
         assert_eq!(row("Toggle relative line numbers").keys, "");
-        assert_eq!(row("Custom command").keys, "Ctrl+Shift+F");
+        assert_eq!(row("Declared and bound").keys, "Ctrl+Shift+F");
+        assert!(rows.iter().all(|row| row.title != "Custom command"));
         assert_eq!(row("Open clicked item").keys, "Alt+Double click");
+    }
+
+    #[test]
+    fn built_in_and_host_commands_are_declared_alike() {
+        let built_in: Vec<_> = default_commands().iter().map(|it| it.action).collect();
+        assert_eq!(built_in, PickerAction::BUILT_IN);
+        let commands = resolved_commands(vec![
+            PickerCommand::custom(1, "Mine"),
+            // A built-in action keeps its place and takes the new title.
+            PickerCommand {
+                action: PickerAction::TogglePreviewWrap,
+                title: "Wrap".into(),
+            },
+            PickerCommand {
+                action: PickerAction::Unbind,
+                title: "Not a command".into(),
+            },
+        ]);
+        assert_eq!(commands.len(), PickerAction::BUILT_IN.len() + 1);
+        assert_eq!(commands.last(), Some(&PickerCommand::custom(1, "Mine")));
+        let wrap = commands
+            .iter()
+            .position(|it| it.action == PickerAction::TogglePreviewWrap);
+        assert_eq!(wrap, built_in.iter().position(|it| *it == PickerAction::TogglePreviewWrap));
+        assert_eq!(commands[wrap.unwrap()].title, "Wrap");
     }
 
     #[test]
