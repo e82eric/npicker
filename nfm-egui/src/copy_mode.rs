@@ -28,6 +28,7 @@ pub struct CellRange {
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 pub const YANK_HIGHLIGHT_DURATION: Duration = Duration::from_millis(250);
 /// How strongly the yank highlight shows over `YANK_HIGHLIGHT_DURATION`, in
@@ -1800,6 +1801,37 @@ impl CopyMode {
             line.text[line.glyphs[span.start].byte_start..line.glyphs[span.end - 1].byte_end]
                 .to_owned(),
         )
+    }
+    /// The line the cursor is on, whole: the rows a long line wraps over,
+    /// joined. With it, the byte where the cursor's cell starts, so the text
+    /// before the cursor is `line[..byte]` and the character under it begins
+    /// `line[byte..]`. A cursor past the row's last character is at the end
+    /// of that row's text.
+    pub fn line_under_cursor(
+        &self,
+        mut read: impl FnMut(u64) -> Option<TextRow>,
+    ) -> Option<(String, usize)> {
+        let line = self.logical_word_line(true, &mut read)?;
+        let cursor = self.cursor;
+        let mut byte = 0;
+        for (index, glyph) in line.glyphs.iter().enumerate() {
+            if (glyph.cell.y, glyph.cell.x) > (cursor.y, cursor.x) {
+                break;
+            }
+            // The cells it takes: up to the next one on its row, or its own
+            // width if it is the row's last.
+            let width = match line.glyphs.get(index + 1) {
+                Some(next) if next.cell.y == glyph.cell.y => next.cell.x - glyph.cell.x,
+                _ => UnicodeWidthStr::width(&line.text[glyph.byte_start..glyph.byte_end]) as u32,
+            };
+            let under = glyph.cell.y == cursor.y && cursor.x < glyph.cell.x + width.max(1);
+            byte = if under {
+                glyph.byte_start
+            } else {
+                glyph.byte_end
+            };
+        }
+        Some((line.text, byte))
     }
     pub fn text_target(
         &self,
@@ -4262,6 +4294,51 @@ mod tests {
         let read = |y: u64| rows.get(y as usize).cloned();
         // A keyword on another physical row is not a search fallback.
         assert_eq!(copy_at(1, 1, 3).word_under_cursor(read), None);
+    }
+
+    #[test]
+    fn the_line_under_the_cursor_is_split_at_the_cursors_cell() {
+        let rows = [row("foo bar baz", false)];
+        let read = |y: u64| rows.get(y as usize).cloned();
+        // The cursor is on the `b` of `bar`.
+        let (line, byte) = copy_at(4, 0, 1).line_under_cursor(read).unwrap();
+        assert_eq!((&line[..byte], &line[byte..]), ("foo ", "bar baz"));
+        // Past the last character, all of the line is before the cursor.
+        let (line, byte) = copy_at(15, 0, 1).line_under_cursor(read).unwrap();
+        assert_eq!((line.as_str(), byte), ("foo bar baz", 11));
+
+        // Cells count, not bytes: `é` is two bytes in one cell, `漢` three
+        // bytes in two cells. On either cell of `漢` the cursor is on it.
+        let wide = TextRow {
+            text: "café 漢x".into(),
+            columns: vec![0, 1, 2, 3, 3, 4, 5, 5, 5, 7],
+            wraps_to_next: false,
+        };
+        for (x, before) in [(3, "caf"), (5, "café "), (6, "café "), (7, "café 漢")] {
+            let (line, byte) = copy_at(x, 0, 1)
+                .line_under_cursor(|_| Some(wide.clone()))
+                .unwrap();
+            assert_eq!(&line[..byte], before, "cell {x}");
+        }
+    }
+
+    #[test]
+    fn the_line_under_the_cursor_is_whole_when_it_wraps() {
+        // A word runs over the end of the first row.
+        let rows = [row("open src/ter", true), row("minal/pane.rs now", false)];
+        let read = |y: u64| rows.get(y as usize).cloned();
+        let (line, byte) = copy_at(3, 1, 2).line_under_cursor(read).unwrap();
+        assert_eq!(line, "open src/terminal/pane.rs now");
+        assert_eq!(&line[..byte], "open src/termin");
+        let (line, byte) = copy_at(5, 0, 2).line_under_cursor(read).unwrap();
+        assert_eq!(&line[..byte], "open ");
+        // A line that does not wrap is only its own row.
+        let rows = [row("one", false), row("two", false)];
+        let read = |y: u64| rows.get(y as usize).cloned();
+        assert_eq!(
+            copy_at(1, 1, 2).line_under_cursor(read),
+            Some(("two".to_owned(), 1))
+        );
     }
 
     #[test]
