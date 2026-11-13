@@ -583,7 +583,7 @@ pub struct Picker<S: ItemsSource + Send + Sync + 'static> {
     external_preview: bool,
     preview_rect: Option<egui::Rect>,
     preview_rendered: bool,
-    copied_until: Option<Instant>,
+    notice_until: Option<Instant>,
     suggestions: Vec<nfm_search_core::store::SearchCompletion>,
     suggestion_selected: usize,
     query_cursor: usize,
@@ -593,7 +593,7 @@ pub struct Picker<S: ItemsSource + Send + Sync + 'static> {
     palette: Option<Box<CommandPalette>>,
     /// Commands from `execute`, run at the start of the next frame.
     pending_actions: Vec<PickerAction>,
-    copy_notice: String,
+    notice: String,
     preview_viewport: Option<crate::preview_copy::PreviewCopyMode>,
     preview_focus: bool,
     placement_override: Option<crate::Position>,
@@ -646,7 +646,7 @@ where
             external_preview: false,
             preview_rect: None,
             preview_rendered: false,
-            copied_until: None,
+            notice_until: None,
             suggestions: Vec::new(),
             suggestion_selected: 0,
             query_cursor,
@@ -655,7 +655,7 @@ where
             dismissed_completion: None,
             palette: None,
             pending_actions: Vec::new(),
-            copy_notice: "Copied".into(),
+            notice: "Copied".into(),
             preview_viewport: None,
             preview_focus: false,
             placement_override: None,
@@ -704,7 +704,7 @@ where
         self.error = None;
         self.closed = false;
         self.focus_query = true;
-        self.copied_until = None;
+        self.notice_until = None;
         self.store_query_cursor(ctx);
         ctx.request_repaint();
     }
@@ -742,7 +742,7 @@ where
         self.suggestions.clear();
         self.suggestion_selected = 0;
         self.dismissed_completion = None;
-        self.copied_until = None;
+        self.notice_until = None;
         self.transition_pending = true;
         self.result_actions_enabled = false;
         self.store_query_cursor(ctx);
@@ -1341,7 +1341,7 @@ where
     }
     /// Confirm the actual clipboard value when it differs from the displayed candidate.
     pub fn notify_copied_value(&mut self, ctx: &Context, value: &str) {
-        self.copy_notice = if value.is_empty() {
+        let notice = if value.is_empty() {
             "Copied".into()
         } else {
             format!(
@@ -1352,7 +1352,14 @@ where
                     .replace('\t', "\\t")
             )
         };
-        self.copied_until = Some(Instant::now() + Duration::from_secs(2));
+        self.notify(ctx, notice);
+    }
+    /// Say `text` over the results for a moment, as a copy is confirmed:
+    /// what an action did that the picker stayed open through. A later
+    /// notice takes the place of one still showing.
+    pub fn notify(&mut self, ctx: &Context, text: impl Into<String>) {
+        self.notice = text.into();
+        self.notice_until = Some(Instant::now() + Duration::from_secs(2));
         ctx.request_repaint();
         ctx.request_repaint_after(Duration::from_secs(2));
     }
@@ -2123,7 +2130,7 @@ where
             }
         }
         if self
-            .copied_until
+            .notice_until
             .is_some_and(|until| until > Instant::now())
             && let Some(top) = first_rect
         {
@@ -2132,7 +2139,7 @@ where
                 egui::vec2(top.width(), self.visible_result_rows as f32 * result_height),
             );
             let galley = ui.painter().layout(
-                self.copy_notice.clone(),
+                self.notice.clone(),
                 appearance.typography.normal.clone(),
                 appearance.palette.success,
                 (results_rect.width() - 32.0).max(1.0),
@@ -3370,6 +3377,19 @@ mod query_parity_tests {
             assert!(Instant::now() < deadline);
             std::thread::sleep(Duration::from_millis(2));
         }
+    }
+
+    #[test]
+    fn a_host_says_what_an_action_did_as_a_copy_is_confirmed() {
+        let (ctx, mut picker) = make();
+        picker.notify(&ctx, "Closed workspace 2");
+        assert_eq!(picker.notice, "Closed workspace 2");
+        assert!(picker.notice_until.is_some_and(|until| until > Instant::now()));
+        // A copy after it says so in the notice's place, as before.
+        picker.notify_copied_value(&ctx, "a\tb");
+        assert_eq!(picker.notice, "Copied: a\\tb");
+        picker.notify_copied_value(&ctx, "");
+        assert_eq!(picker.notice, "Copied");
     }
 
     #[test]
