@@ -41,6 +41,6 @@ pub use prompt::{
     PROMPT_FRAME_HEIGHT, Prompt, PromptConfig, PromptEvent, PromptOutput, prompt_height,
 };
 pub use preview::{Cancellation, GridLines, Preview, PreviewCell, PreviewProvider, PreviewRequest};
-pub use session::SearchTimings;
+pub use session::{MAX_MEMBERS, Member, SearchTimings};
 pub mod byte_preview;
 pub mod styled_document;

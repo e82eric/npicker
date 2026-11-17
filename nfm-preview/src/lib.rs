@@ -290,6 +290,7 @@ mod tests {
                 text: item.clone(),
                 item,
                 index: 0,
+                member: 0,
                 source_version: 0,
                 snapshot: Arc::new(()),
             },

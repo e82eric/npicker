@@ -773,6 +773,7 @@ mod tests {
                 item: (),
                 text: "a".into(),
                 index: 0,
+                member: 0,
                 source_version: 1,
                 snapshot: Arc::new(()),
             },

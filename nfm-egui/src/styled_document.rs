@@ -979,6 +979,7 @@ mod tests {
                 item: index,
                 text: index.to_string(),
                 index,
+                member: 0,
                 source_version: 1,
                 snapshot: Arc::new(()),
             },

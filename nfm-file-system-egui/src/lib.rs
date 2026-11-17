@@ -35,6 +35,7 @@ impl<S: ItemsSource + 'static> PathPreview<S> {
                 item: path,
                 text: request.selection.text,
                 index: request.selection.index,
+                member: request.selection.member,
                 source_version: request.selection.source_version,
                 snapshot: request.selection.snapshot,
             },

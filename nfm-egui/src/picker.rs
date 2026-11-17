@@ -455,8 +455,13 @@ impl Default for PickerConfig {
 pub struct Selection<T> {
     pub item: T,
     pub text: String,
+    /// Where the row is in its source.
     pub index: usize,
+    /// Which of the picker's members the row is of: 0 in a picker of one
+    /// source.
+    pub member: usize,
     pub source_version: u64,
+    /// The source the row is of, as it was searched.
     pub snapshot: Arc<dyn std::any::Any + Send + Sync>,
 }
 impl<T> Selection<T> {
@@ -470,6 +475,7 @@ impl<T: std::fmt::Debug> std::fmt::Debug for Selection<T> {
             .field("item", &self.item)
             .field("text", &self.text)
             .field("index", &self.index)
+            .field("member", &self.member)
             .field("source_version", &self.source_version)
             .finish_non_exhaustive()
     }
@@ -565,7 +571,7 @@ pub struct Picker<S: ItemsSource + Send + Sync + 'static> {
     revision: u64,
     transition_pending: bool,
     displayed: Option<Update<S>>,
-    completion_snapshot: Option<Arc<S>>,
+    completion_snapshot: Option<Arc<crate::session::Joined<S>>>,
     selected: usize,
     visible_start: usize,
     focus_query: bool,
@@ -614,8 +620,30 @@ where
         id: impl egui::AsId,
         ctx: &Context,
         provider: Arc<P>,
-        mut config: PickerConfig,
+        config: PickerConfig,
     ) -> Self {
+        let session = Session::new(provider, config.initial_query.clone(), config.sort, ctx.clone());
+        Self::with_session(id, session, config)
+    }
+    /// A picker of several sources, its members, shown as one list: the
+    /// rows of the first that match, then those of the next. Each member is
+    /// searched by itself, with its own ranking and its own limit on how
+    /// many matches are kept, and is searched again only when its own
+    /// source changes; a selected row stays selected while a source other
+    /// than its own changes. A [`Selection`] says which member it is of.
+    ///
+    /// A header is shown for the first member that has one and has a row
+    /// on screen. Rows are lines: a member's card template is not used.
+    pub fn new_union(
+        id: impl egui::AsId,
+        ctx: &Context,
+        members: Vec<crate::Member<S>>,
+        config: PickerConfig,
+    ) -> Self {
+        let session = Session::of(members, config.initial_query.clone(), config.sort, ctx.clone());
+        Self::with_session(id, session, config)
+    }
+    fn with_session(id: impl egui::AsId, session: Session<S>, mut config: PickerConfig) -> Self {
         let id_slot = IdSlot::take(Id::new(id));
         let query = config.initial_query.clone();
         let query_cursor = query.len();
@@ -624,7 +652,7 @@ where
         Self {
             id: id_slot.id(),
             _id_slot: id_slot,
-            session: Session::new(provider, query.clone(), config.sort, ctx.clone()),
+            session,
             config,
             query,
             revision: 0,
@@ -673,16 +701,41 @@ where
         provider: Arc<P>,
         query: impl Into<String>,
     ) {
+        let query = query.into();
+        let session = Session::new(provider, query.clone(), self.config.sort, ctx.clone());
+        self.replace_session(ctx, session, query);
+    }
+    /// As `replace_source`, for the members of a picker of several sources;
+    /// see `new_union`.
+    pub fn replace_sources(
+        &mut self,
+        ctx: &Context,
+        members: Vec<crate::Member<S>>,
+        query: impl Into<String>,
+    ) {
+        let query = query.into();
+        let session = Session::of(members, query.clone(), self.config.sort, ctx.clone());
+        self.replace_session(ctx, session, query);
+    }
+    /// Give one member another source and leave the rest of the picker as
+    /// it is: the query, the other members' rows, and the selection if it
+    /// is on one of those. The member's old rows are shown until the new
+    /// source has been searched. Nothing is done for a member there is not.
+    pub fn replace_member<P: SearchSnapshotProvider<S> + ?Sized>(
+        &mut self,
+        ctx: &Context,
+        member: usize,
+        provider: Arc<P>,
+    ) {
+        self.session.replace_member(member, provider);
+        ctx.request_repaint();
+    }
+    fn replace_session(&mut self, ctx: &Context, session: Session<S>, query: String) {
         self.leave_preview_focus();
         self.session.stop();
-        self.query = query.into();
+        self.query = query;
         self.query_cursor = self.query.len();
-        self.session = Session::new(
-            provider,
-            self.query.clone(),
-            self.config.sort,
-            ctx.clone(),
-        );
+        self.session = session;
         self.revision = 0;
         self.transition_pending = true;
         if let Some(displayed) = &mut self.displayed {
@@ -1386,12 +1439,15 @@ where
     fn displayed_selection(&self) -> Option<Selection<S::Item>> {
         let displayed = self.displayed.as_ref()?;
         let result = displayed.output.results.get(self.selected)?;
+        let (member, index) = crate::session::place(result.node_index);
+        let source = displayed.snapshot.source(result.node_index)?;
         Some(Selection {
             item: displayed.snapshot.item(result.node_index)?,
             text: result.path.clone(),
-            index: result.node_index,
-            source_version: displayed.snapshot.version(),
-            snapshot: displayed.snapshot.clone(),
+            index,
+            member,
+            source_version: source.version(),
+            snapshot: source,
         })
     }
     /// Monotonic timestamps for the initial search and first nonempty result.
@@ -1598,14 +1654,17 @@ where
                 .displayed
                 .as_ref()
                 .is_some_and(|d| d.revision == update.revision);
-            let stable_indices = self.displayed.as_ref().is_some_and(|d| {
-                d.snapshot.version() == update.snapshot.version() || update.append_only
-            });
             let old_index = self
                 .displayed
                 .as_ref()
                 .and_then(|d| d.output.results.get(self.selected))
                 .map(|r| r.node_index);
+            // The selected row is the same row if its own member's source
+            // is the same or has only been added to, whatever the other
+            // members' have come to.
+            let stable_indices = self.displayed.as_ref().is_some_and(|d| {
+                old_index.is_some_and(|index| update.snapshot.keeps(&d.snapshot, index))
+            });
             self.selected = if same_query && stable_indices {
                 old_index
                     .and_then(|index| {
@@ -1731,11 +1790,15 @@ where
         let background = appearance.palette.background;
         // Append-only publications do not change an existing selected item's
         // preview. Avoid restarting it for every incoming candidate batch.
-        let version = if self.displayed.as_ref().is_some_and(|d| d.append_only) {
+        let row = crate::session::row(selection.member, selection.index);
+        let version = if self.displayed.as_ref().is_some_and(|d| d.snapshot.append_only(row)) {
             0
         } else {
             selection.source_version
         };
+        // Rows of two members can be at the same place in sources of the
+        // same version. The member is part of what a preview is of.
+        let version = version ^ ((selection.member as u64) << 56);
         let key = (
             version,
             selection.index,
@@ -1934,10 +1997,6 @@ where
         // Rows are rebuilt every frame. Input lines are capped (16 KiB by
         // default), so text and match positions for the visible rows are
         // cheap enough not to cache. The query is the same for every row.
-        let effective_query = self
-            .displayed
-            .as_ref()
-            .map(|displayed| displayed.snapshot.effective_query(&displayed.query));
         let template = self
             .displayed
             .as_ref()
@@ -1963,6 +2022,9 @@ where
             if let Some(displayed) = &self.displayed
                 && let Some(result) = displayed.output.results.get(index)
             {
+                // What of the query this row's own source matches against.
+                let effective_query =
+                    displayed.snapshot.effective_query(result.node_index, &displayed.query);
                 let response =
                     ui.interact(rect, self.id.with(("row", index)), egui::Sense::click());
                 let hovered = response.hovered() && index != self.selected;
@@ -2499,11 +2561,11 @@ where
                 2.0 * placement.margin.max(0.0)
             })
         .max(0.0);
-        let header = self
+        let has_header = self
             .displayed
             .as_ref()
-            .and_then(|displayed| displayed.snapshot.header(&self.query));
-        let header_height = if header.is_some() { row_height } else { 0.0 };
+            .is_some_and(|displayed| displayed.snapshot.has_header(&self.query));
+        let header_height = if has_header { row_height } else { 0.0 };
         let result_height = self.result_row_height(ctx, appearance);
         // Room for the preview's divider only when a preview can show.
         let overhead =
@@ -2521,6 +2583,16 @@ where
             .floor()
             .max(1.0) as usize,
         );
+        // The header of the rows on screen. With members that have none,
+        // its room is kept while their rows are all there is to see, so the
+        // list does not move as the selection goes from one member's rows
+        // to another's.
+        let header = self.displayed.as_ref().filter(|_| has_header).map(|displayed| {
+            let rows = displayed.output.results.iter();
+            let rows = rows.skip(self.visible_start).take(self.visible_result_rows);
+            let rows = rows.map(|result| result.node_index);
+            displayed.snapshot.header(&self.query, rows).unwrap_or_default()
+        });
         let preview_row_height = appearance.typography.preview_row_height(ctx);
         let remaining = (available
             - row_height
@@ -2633,6 +2705,7 @@ where
                                         appearance.typography.bold.clone(),
                                         appearance.palette.accent,
                                     );
+                                let underline = if header.is_empty() { 0.0 } else { 1.5 };
                                 ui.painter()
                                     .with_clip_rect(rect.intersect(ui.clip_rect()))
                                     .line_segment(
@@ -2641,7 +2714,7 @@ where
                                             egui::pos2(rect.right() - 12.0, rect.bottom() - 1.0),
                                         ],
                                         egui::Stroke::new(
-                                            1.5,
+                                            underline,
                                             egui::Color32::from_rgb(0xd7, 0x99, 0x21),
                                         ),
                                     );
@@ -5636,8 +5709,8 @@ mod query_parity_tests {
         wait(&mut picker);
         // Unknown display columns are ignored by the shared parser.
         let displayed = picker.displayed.as_ref().unwrap();
-        assert!(displayed.snapshot.header(&picker.query).contains("CPU"));
-        assert!(!displayed.snapshot.header(&picker.query).contains("Status"));
+        assert!(displayed.snapshot.header(&picker.query, std::iter::empty()).unwrap().contains("CPU"));
+        assert!(!displayed.snapshot.header(&picker.query, std::iter::empty()).unwrap().contains("Status"));
     }
     #[test]
     fn popup_navigation_enter_tab_and_escape_match_skia() {
@@ -6312,7 +6385,7 @@ mod streaming_presentation_tests {
             picker
                 .displayed
                 .as_ref()
-                .is_some_and(|d| d.snapshot.version() == 2)
+                .is_some_and(|d| d.snapshot.source(0).unwrap().version() == 2)
         });
         assert_eq!(picker.selection().unwrap().item, 50);
         assert_eq!(picker.displayed.as_ref().unwrap().output.matched, 101);
@@ -6338,6 +6411,88 @@ mod streaming_presentation_tests {
             picker.displayed.as_ref().is_some_and(|d| d.done)
         });
         assert_eq!(picker.selection().unwrap().item, 50);
+    }
+    #[test]
+    fn members_are_searched_apart_and_a_row_stays_selected_while_another_member_changes() {
+        let ctx = Context::default();
+        let reads = Arc::new(AtomicUsize::new(0));
+        // A few rows that are given again whole, then many that are only
+        // added to.
+        let few = Arc::new(SnapshotStore::new());
+        few.publish(snapshot(1, 3, &reads));
+        few.complete();
+        let many = Arc::new(SnapshotStore::new_append_only());
+        many.publish(snapshot(1, 2000, &reads));
+        let members: Vec<crate::Member<Counted>> = vec![few.clone(), many.clone()];
+        let config = PickerConfig {
+            initial_query: "item".into(),
+            ..Default::default()
+        };
+        let mut picker = Picker::new_union("union", &ctx, members, config);
+        let mut shows = |picker: &mut Picker<Counted>, total: usize| {
+            wait(|| {
+                picker.poll();
+                picker.displayed.as_ref().is_some_and(|d| d.output.total == total)
+            });
+        };
+        let selected = |picker: &Picker<Counted>| {
+            let selection = picker.selection().unwrap();
+            (selection.member, selection.index, selection.item)
+        };
+        shows(&mut picker, 2003);
+        let displayed = picker.displayed.as_ref().unwrap();
+        // Each member keeps its own best, and all that matched are counted.
+        let limit = nfm_search_core::search::RESULT_LIMIT;
+        assert_eq!(displayed.output.results.len(), 3 + limit);
+        assert_eq!(displayed.output.matched, 2003);
+        assert!(!displayed.done);
+        // The first member's rows come first, then the next's.
+        assert_eq!(selected(&picker), (0, 0, 0));
+        picker.move_selection(2);
+        assert_eq!(selected(&picker), (0, 2, 2));
+        // Rows given again whole are other rows, so the selection is not
+        // kept on one of them.
+        few.publish(snapshot(2, 5, &reads));
+        shows(&mut picker, 2005);
+        assert_eq!(selected(&picker), (0, 0, 0));
+        // A row of the second member is where it is in its own source.
+        picker.move_selection(5 + 40);
+        assert_eq!(selected(&picker), (1, 40, 40));
+        // It stays selected while the other member's rows are given again,
+        reads.store(0, Ordering::SeqCst);
+        few.publish(snapshot(3, 4, &reads));
+        shows(&mut picker, 2004);
+        assert_eq!(selected(&picker), (1, 40, 40));
+        // which does not search its own member again;
+        assert!(reads.load(Ordering::SeqCst) < 100, "the other member was searched again");
+        // while its own source is added to;
+        many.publish(snapshot(2, 2100, &reads));
+        shows(&mut picker, 2104);
+        assert_eq!(selected(&picker), (1, 40, 40));
+        // and while the other member is given another source.
+        let other = Arc::new(SnapshotStore::new());
+        other.publish(snapshot(1, 1, &reads));
+        other.complete();
+        picker.replace_member(&ctx, 0, other);
+        shows(&mut picker, 2101);
+        assert_eq!(selected(&picker), (1, 40, 40));
+        // A query is every member's: no rows are shown for it until each
+        // has been searched for it.
+        picker.set_query("item 04");
+        wait(|| {
+            picker.poll();
+            picker.selection().is_some()
+        });
+        let displayed = picker.displayed.as_ref().unwrap();
+        assert_eq!(displayed.query, "item 04");
+        assert!(displayed.output.matched < 2101);
+        assert_eq!(displayed.output.total, 2101);
+        // Done when every member is.
+        many.complete();
+        wait(|| {
+            picker.poll();
+            picker.displayed.as_ref().is_some_and(|d| d.done)
+        });
     }
     #[test]
     fn pending_query_retains_rows_and_geometry_but_blocks_acceptance() {
@@ -6376,6 +6531,7 @@ mod output_selection_tests {
             item,
             text: item.to_string(),
             index: item,
+            member: 0,
             source_version: item as u64,
             snapshot: Arc::new(item),
         }

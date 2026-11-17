@@ -599,6 +599,7 @@ mod tests {
             selection: Selection {
                 item: (),
                 index,
+                member: 0,
                 text: index.to_string(),
                 source_version: 1,
                 snapshot: Arc::new(()),
