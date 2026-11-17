@@ -269,6 +269,13 @@ impl PublishedSnapshot {
         node_index < self.node_count && self.nodes[node_index].is_dir()
     }
 
+    /// Whether an entry is one of the roots the scan was given. Those are
+    /// entries whether or not they are there to scan. An index past the end
+    /// is not a root.
+    pub fn is_root(&self, node_index: usize) -> bool {
+        node_index < self.node_count && self.node(node_index).parent < 0
+    }
+
     /// An entry's own name and the directory it is in: the two parts of the
     /// text `item` returns, without the separator between them. A root has
     /// no directory and is all name.
