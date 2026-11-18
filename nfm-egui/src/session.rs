@@ -1,3 +1,4 @@
+use crate::fed::{Asked, FED_ROWS, Feed};
 use crate::{ItemsSource, SearchSnapshotProvider, SearchSortMode};
 use egui::Context;
 use nfm_search_core::{
@@ -6,7 +7,10 @@ use nfm_search_core::{
     store::SearchCompletion,
 };
 use std::{
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::Instant,
 };
 
@@ -18,7 +22,7 @@ pub struct SearchTimings {
     pub first_matches_ready: Option<Instant>,
     pub first_matches_taken: Option<Instant>,
 }
-type WakeCallback = Arc<dyn Fn(SearchTimings) + Send + Sync>;
+pub(crate) type WakeCallback =Arc<dyn Fn(SearchTimings) + Send + Sync>;
 
 /// A source a picker can be given along with others; see [`Session`].
 pub type Member<S> = Arc<dyn SearchSnapshotProvider<S>>;
@@ -215,8 +219,40 @@ pub(crate) struct Session<S: ItemsSource + Send + Sync + 'static> {
     epochs: u64,
     timings: Arc<Mutex<SearchTimings>>,
     wake_callback: Arc<Mutex<Option<WakeCallback>>>,
+    /// For a session with no members, whose rows are found elsewhere.
+    fed: Option<Fed<S>>,
+}
+
+/// What a fed session has in place of members; see [`crate::fed`].
+struct Fed<S> {
+    /// Says what the session wants found. Must not wait.
+    ask: Box<dyn Fn(Asked) + Send + Sync>,
+    latest: Arc<Mutex<Option<crate::fed::Found<S>>>>,
+    skipped: Arc<AtomicUsize>,
 }
 impl<S: ItemsSource + Send + Sync + 'static> Session<S> {
+    /// A search done elsewhere: `ask` is told what to find, at once for the
+    /// query there is and then for each one set, and what is found is said
+    /// to the feed.
+    pub fn fed(
+        query: String,
+        ctx: Context,
+        ask: impl Fn(Asked) + Send + Sync + 'static,
+    ) -> (Self, Feed<S>) {
+        let mut session = Self::empty(query, SearchSortMode::default(), ctx);
+        let latest = Arc::new(Mutex::new(None));
+        let skipped = Arc::new(AtomicUsize::new(0));
+        let feed = Feed {
+            latest: latest.clone(),
+            skipped: skipped.clone(),
+            timings: session.timings.clone(),
+            wake_callback: session.wake_callback.clone(),
+            ctx: session.ctx.clone(),
+        };
+        ask(Asked { revision: 0, query: session.query.clone(), rows: FED_ROWS });
+        session.fed = Some(Fed { ask: Box::new(ask), latest, skipped });
+        (session, feed)
+    }
     pub fn new<P: SearchSnapshotProvider<S> + ?Sized>(
         provider: Arc<P>,
         query: String,
@@ -251,6 +287,7 @@ impl<S: ItemsSource + Send + Sync + 'static> Session<S> {
                 ..Default::default()
             })),
             wake_callback: Arc::new(Mutex::new(None)),
+            fed: None,
         }
     }
     /// Give a member another source, leaving the others as they are: their
@@ -342,6 +379,9 @@ impl<S: ItemsSource + Send + Sync + 'static> Session<S> {
     }
     /// Source records left out, such as overlong lines.
     pub fn skipped(&self) -> usize {
+        if let Some(fed) = &self.fed {
+            return fed.skipped.load(Ordering::Acquire);
+        }
         self.members.iter().map(|member| (member.skipped)()).sum()
     }
     pub fn set_query(&mut self, query: String) -> u64 {
@@ -350,6 +390,9 @@ impl<S: ItemsSource + Send + Sync + 'static> Session<S> {
         for member in &self.members {
             member.search.set_query(self.query.clone());
         }
+        if let Some(fed) = &self.fed {
+            (fed.ask)(Asked { revision: self.revision, query: self.query.clone(), rows: FED_ROWS });
+        }
         self.revision
     }
     /// What the members have found, if any has found anything since this
@@ -357,6 +400,29 @@ impl<S: ItemsSource + Send + Sync + 'static> Session<S> {
     /// member that has found anything has found for the new query: until
     /// then the rows shown stay, as one member's do.
     pub fn take(&mut self) -> Option<Update<S>> {
+        if let Some(fed) = &self.fed {
+            let found = fed.latest.lock().unwrap().take()?;
+            if found.matched > 0 {
+                let mut timings = self.timings.lock().unwrap();
+                timings.first_matches_taken.get_or_insert_with(Instant::now);
+            }
+            let mut output = SearchOutput::default();
+            output.results = found.results;
+            output.matched = found.matched;
+            output.total = found.total;
+            let part = Part {
+                snapshot: found.source,
+                epoch: found.epoch,
+                append_only: found.append_only,
+            };
+            return Some(Update {
+                revision: found.revision,
+                query: found.query,
+                snapshot: Arc::new(Joined { parts: vec![Some(part)] }),
+                output,
+                done: found.done,
+            });
+        }
         let mut found = false;
         for member in &mut self.members {
             let latest = member.latest.lock().unwrap().take();

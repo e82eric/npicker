@@ -643,6 +643,22 @@ where
         let session = Session::of(members, config.initial_query.clone(), config.sort, ctx.clone());
         Self::with_session(id, session, config)
     }
+    /// A picker whose rows are found somewhere else, as in another process:
+    /// `ask` is told what to find, at once for the query the picker starts
+    /// with and then whenever it changes, and what is found is said to the
+    /// feed. `ask` is called where the picker is shown and must not wait.
+    ///
+    /// The picker shows the rows it was last given for the query as it is,
+    /// and one can be accepted only then. It has no completions.
+    pub fn new_fed(
+        id: impl egui::AsId,
+        ctx: &Context,
+        config: PickerConfig,
+        ask: impl Fn(crate::fed::Asked) + Send + Sync + 'static,
+    ) -> (Self, crate::fed::Feed<S>) {
+        let (session, feed) = Session::fed(config.initial_query.clone(), ctx.clone(), ask);
+        (Self::with_session(id, session, config), feed)
+    }
     fn with_session(id: impl egui::AsId, session: Session<S>, mut config: PickerConfig) -> Self {
         let id_slot = IdSlot::take(Id::new(id));
         let query = config.initial_query.clone();
@@ -7322,5 +7338,186 @@ mod card_tests {
         frame(vec![egui::Event::PointerGone]);
         assert!(hover_fills(&frame(vec![])).is_empty());
         assert_eq!(picker.selected, 0);
+    }
+}
+
+#[cfg(test)]
+mod fed_tests {
+    use super::*;
+    use crate::fed::{Asked, FED_ROWS, Feed, Found, Page, Row, Rows};
+    use std::sync::Mutex;
+
+    type Asks = Arc<Mutex<Vec<Asked>>>;
+
+    fn make(query: &str) -> (Context, Asks, Picker<Rows>, Feed<Rows>) {
+        let ctx = Context::default();
+        let asks = Asks::default();
+        let said = asks.clone();
+        let config = PickerConfig { initial_query: query.to_owned(), ..Default::default() };
+        let (picker, feed) =
+            Picker::new_fed("fed", &ctx, config, move |asked| said.lock().unwrap().push(asked));
+        (ctx, asks, picker, feed)
+    }
+    fn page(rows: &[(usize, &str)]) -> Page {
+        Page {
+            version: 1,
+            rows: rows
+                .iter()
+                .map(|(index, text)| Row { index: *index, text: (*text).to_owned(), fields: None })
+                .collect(),
+            ..Default::default()
+        }
+    }
+    /// What was found for `asked`: `rows`, of a source that is only added to.
+    fn found(asked: &Asked, page: Page, matched: usize, total: usize, done: bool) -> Found<Rows> {
+        let (rows, results) = page.into_rows();
+        Found {
+            revision: asked.revision,
+            query: asked.query.clone(),
+            source: Arc::new(rows),
+            epoch: 1,
+            append_only: true,
+            results,
+            matched,
+            total,
+            skipped: 0,
+            done,
+        }
+    }
+    fn last(asks: &Asks) -> Asked {
+        asks.lock().unwrap().last().unwrap().clone()
+    }
+    fn painted(ctx: &Context, picker: &mut Picker<Rows>) -> String {
+        let mut frame = ctx.run_ui(egui::RawInput::default(), |ui| {
+            picker.show(
+                ui.ctx(),
+                crate::Placement::new(ui.ctx().content_rect()),
+                &crate::Appearance::default(),
+                false,
+            );
+        });
+        frame.textures_delta.clear();
+        format!("{:?}", frame.shapes)
+    }
+
+    #[test]
+    fn it_asks_for_the_query_it_starts_with_and_for_each_one_after() {
+        let (_, asks, mut picker, _feed) = make("ab");
+        assert_eq!(
+            *asks.lock().unwrap(),
+            [Asked { revision: 0, query: "ab".into(), rows: FED_ROWS }]
+        );
+        picker.set_query("abc");
+        picker.set_query("abc");
+        picker.set_query("abcd");
+        let asked = asks.lock().unwrap().clone();
+        assert_eq!(asked.len(), 3, "the same query is not asked for again");
+        assert_eq!(asked[1], Asked { revision: 1, query: "abc".into(), rows: FED_ROWS });
+        assert_eq!(asked[2], Asked { revision: 2, query: "abcd".into(), rows: FED_ROWS });
+    }
+
+    #[test]
+    fn rows_it_is_given_are_shown_and_can_be_selected() {
+        let (ctx, asks, mut picker, feed) = make("");
+        assert!(picker.selection().is_none());
+        let mut given = page(&[(40, "alpha.rs"), (7, "beta.rs")]);
+        given.header = Some("Name of file".into());
+        feed.found(found(&last(&asks), given, 2, 9, true));
+        picker.poll();
+        let selection = picker.selection().unwrap();
+        assert_eq!((selection.item, selection.index, selection.text.as_str()), (40, 40, "alpha.rs"));
+        picker.move_selection(1);
+        assert_eq!(picker.selection().unwrap().item, 7);
+        let painted = painted(&ctx, &mut picker);
+        for shown in ["alpha.rs", "beta.rs", "Name of file", "2/9"] {
+            assert!(painted.contains(shown), "{shown} is not painted");
+        }
+    }
+
+    #[test]
+    fn rows_for_a_query_it_no_longer_has_are_not_shown_or_accepted() {
+        let (_, asks, mut picker, feed) = make("");
+        let first = last(&asks);
+        feed.found(found(&first, page(&[(1, "one")]), 1, 1, true));
+        picker.poll();
+        picker.set_query("t");
+        // The rows there were stay painted, and none can be accepted.
+        assert!(picker.selection().is_none());
+        assert_eq!(picker.displayed.as_ref().unwrap().output.results.len(), 1);
+        // An answer to the first query comes late.
+        feed.found(found(&first, page(&[(1, "one"), (2, "two")]), 2, 2, true));
+        picker.poll();
+        assert!(picker.selection().is_none());
+        assert_eq!(picker.displayed.as_ref().unwrap().output.results.len(), 1);
+        feed.found(found(&last(&asks), page(&[(2, "two")]), 1, 2, true));
+        picker.poll();
+        assert_eq!(picker.selection().unwrap().item, 2);
+    }
+
+    #[test]
+    fn the_selection_stays_on_its_row_while_more_is_found_for_the_same_query() {
+        let (_, asks, mut picker, feed) = make("");
+        let asked = last(&asks);
+        feed.found(found(&asked, page(&[(1, "one"), (2, "two")]), 2, 2, false));
+        picker.poll();
+        picker.move_selection(1);
+        assert_eq!(picker.selection().unwrap().item, 2);
+        // A better row is found, and the selected one is now the third.
+        feed.found(found(&asked, page(&[(9, "nine"), (1, "one"), (2, "two")]), 3, 3, false));
+        picker.poll();
+        assert_eq!((picker.selected, picker.selection().unwrap().item), (2, 2));
+        // A source that started again has other rows under the same numbers.
+        let mut again = found(&asked, page(&[(9, "nine"), (1, "one"), (2, "two")]), 3, 3, true);
+        again.epoch = 2;
+        feed.found(again);
+        picker.poll();
+        assert_eq!((picker.selected, picker.selection().unwrap().item), (0, 9));
+    }
+
+    #[test]
+    fn it_is_busy_until_the_source_is_done_and_counts_what_was_left_out() {
+        let (ctx, asks, mut picker, feed) = make("");
+        assert!(picker.busy());
+        let asked = last(&asks);
+        feed.found(found(&asked, page(&[(1, "one")]), 1, 1, false));
+        picker.poll();
+        assert!(picker.busy());
+        let mut done = found(&asked, page(&[(1, "one")]), 1, 1, true);
+        done.skipped = 3;
+        feed.found(done);
+        picker.poll();
+        assert!(!picker.busy());
+        assert!(painted(&ctx, &mut picker).contains("3 skipped"));
+    }
+
+    #[test]
+    fn a_row_shows_its_matches_with_what_the_page_says_it_was_matched_against() {
+        let (_, asks, mut picker, feed) = make("name /:kind==file");
+        let mut given = page(&[(1, "filename")]);
+        given.matched_against = "name".into();
+        feed.found(found(&last(&asks), given, 1, 1, true));
+        picker.poll();
+        let displayed = picker.displayed.as_ref().unwrap();
+        let against = displayed.snapshot.effective_query(1, &displayed.query).unwrap();
+        assert_eq!(against, "name");
+        assert_eq!(
+            nfm_search_core::search::resolve_match_positions(&against, "filename"),
+            [4, 5, 6, 7]
+        );
+    }
+
+    #[test]
+    fn a_page_with_a_template_is_shown_as_cards() {
+        let (_, asks, mut picker, feed) = make("");
+        let template =
+            nfm_search_core::row::RowTemplate::parse("0|1", None, |name| name.parse().ok());
+        let mut given = page(&[(5, "main.rs src")]);
+        given.rows[0].fields = Some(vec!["main.rs".into(), "src".into()]);
+        given.template = Some(template.expect("the template is read"));
+        feed.found(found(&last(&asks), given, 1, 1, true));
+        picker.poll();
+        let displayed = picker.displayed.as_ref().unwrap();
+        assert!(displayed.snapshot.row_template().is_some());
+        assert_eq!(displayed.snapshot.row_fields(5).unwrap().values, ["main.rs", "src"]);
     }
 }

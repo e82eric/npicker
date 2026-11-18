@@ -7,6 +7,7 @@ pub mod copy_controller;
 pub mod copy_document;
 pub mod copy_mode;
 pub mod document_search;
+pub mod fed;
 pub mod icons;
 mod output;
 mod pages;
