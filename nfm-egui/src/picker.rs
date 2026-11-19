@@ -561,6 +561,81 @@ impl Drop for IdSlot {
     }
 }
 
+/// A line of the list of results.
+#[derive(Clone, Debug, PartialEq)]
+enum Line {
+    /// What a group of the rows next to it is called.
+    Title(String),
+    /// The result of that number.
+    Row(usize),
+    Blank,
+}
+
+/// The `slots` lines of a list of `len` results, top to bottom, that shows
+/// result `start` nearest the query and those after it going away from it:
+/// down from a query at the top, up from one at the bottom.
+///
+/// `group(r)` is the group result `r` is in, and its title, if it has one.
+/// Each group with rows on screen has its title over them: where its rows
+/// begin, or on the top line when they go on past it. A title with no room
+/// for a row of its own under it is not shown.
+fn screen_lines<G: PartialEq>(
+    len: usize,
+    start: usize,
+    slots: usize,
+    bottom: bool,
+    group: impl Fn(usize) -> Option<(G, String)>,
+) -> Vec<Line> {
+    // From the query out: a group's rows, with its title on their far side
+    // when the query is under them and on their near side when it is over.
+    let mut lines = Vec::with_capacity(slots);
+    let mut result = start;
+    while result < len && lines.len() < slots {
+        let Some((key, title)) = group(result) else {
+            lines.push(Line::Row(result));
+            result += 1;
+            continue;
+        };
+        if lines.len() + 2 > slots {
+            break;
+        }
+        if !bottom {
+            lines.push(Line::Title(title.clone()));
+        }
+        let room = slots - lines.len() - usize::from(bottom);
+        let first = result;
+        while result < len
+            && result - first < room
+            && group(result).is_some_and(|(other, _)| other == key)
+        {
+            lines.push(Line::Row(result));
+            result += 1;
+        }
+        if bottom {
+            lines.push(Line::Title(title));
+        }
+    }
+    lines.resize(slots, Line::Blank);
+    if bottom {
+        lines.reverse();
+    }
+    lines
+}
+
+/// How many lines results `start` to `last` take on screen, with the titles
+/// of their groups: see `screen_lines`.
+fn lines_through<G: PartialEq>(
+    start: usize,
+    last: usize,
+    group: impl Fn(usize) -> Option<(G, String)>,
+) -> usize {
+    let key = |result| group(result).map(|(key, _)| key);
+    let titles = (start..=last)
+        .filter(|&result| key(result).is_some() && (result == start || key(result) != key(result - 1)))
+        .count();
+    last + 1 - start + titles
+}
+
 pub struct Picker<S: ItemsSource + Send + Sync + 'static> {
     id: Id,
     /// Holds `id` for as long as the picker lives.
@@ -1721,11 +1796,39 @@ where
         }
     }
     fn keep_selected_visible(&mut self) {
+        let slots = self.visible_result_rows;
         if self.selected < self.visible_start {
             self.visible_start = self.selected;
-        } else if self.selected >= self.visible_start + self.visible_result_rows {
-            self.visible_start = self.selected + 1 - self.visible_result_rows;
+        } else {
+            // A title takes a line, so as many rows as there are lines is the
+            // most there can be room for.
+            let mut start = self.visible_start.max((self.selected + 1).saturating_sub(slots));
+            let group = |result| self.group_at(result);
+            while start < self.selected && lines_through(start, self.selected, &group) > slots {
+                start += 1;
+            }
+            self.visible_start = start;
         }
+    }
+    fn query_bottom(&self) -> bool {
+        self.config.layout == Layout::QueryBottom
+    }
+    /// The group result `index` is in, and the group's title. None for a
+    /// row of no group or of one with no title, and in a list with no room
+    /// for titles or of cards.
+    fn group_at(&self, index: usize) -> Option<((usize, u32), String)> {
+        let displayed = self.displayed.as_ref()?;
+        if self.visible_result_rows < 2 || displayed.snapshot.row_template().is_some() {
+            return None;
+        }
+        let row = displayed.output.results.get(index)?.node_index;
+        Some((displayed.snapshot.group(row)?, displayed.snapshot.group_title(row)?))
+    }
+    /// The lines of the list on screen, top to bottom.
+    fn screen_lines(&self) -> Vec<Line> {
+        let len = self.displayed.as_ref().map_or(0, |d| d.output.results.len());
+        let group = |result| self.group_at(result);
+        screen_lines(len, self.visible_start, self.visible_result_rows, self.query_bottom(), group)
     }
     fn move_selection(&mut self, delta: isize) {
         let len = self
@@ -2023,18 +2126,28 @@ where
         let result_height = card.as_ref().map_or(row_height, |card| card.height);
         self.icons.poll();
         let mut first_rect = None;
-        for slot in 0..self.visible_result_rows {
-            let index = if self.config.layout == Layout::QueryBottom {
-                self.visible_start + self.visible_result_rows - 1 - slot
-            } else {
-                self.visible_start + slot
-            };
+        for (slot, line) in self.screen_lines().into_iter().enumerate() {
             let (rect, _) = ui.allocate_exact_size(
                 egui::vec2(ui.available_width(), result_height),
                 egui::Sense::hover(),
             );
             first_rect.get_or_insert(rect);
             let painter = ui.painter().with_clip_rect(rect.intersect(ui.clip_rect()));
+            let index = match line {
+                Line::Row(index) => index,
+                Line::Title(title) => {
+                    painter.text(
+                        rect.left_center() + egui::vec2(12.0, 0.0),
+                        egui::Align2::LEFT_CENTER,
+                        &title,
+                        appearance.typography.bold.clone(),
+                        appearance.palette.muted,
+                    );
+                    continue;
+                }
+                // No result: a line that may say there are none.
+                Line::Blank => usize::MAX,
+            };
             if let Some(displayed) = &self.displayed
                 && let Some(result) = displayed.output.results.get(index)
             {
@@ -7519,5 +7632,210 @@ mod fed_tests {
         let displayed = picker.displayed.as_ref().unwrap();
         assert!(displayed.snapshot.row_template().is_some());
         assert_eq!(displayed.snapshot.row_fields(5).unwrap().values, ["main.rs", "src"]);
+    }
+}
+
+#[cfg(test)]
+mod group_tests {
+    use super::*;
+    use nfm_picker_sources::structured::{StructuredSchema, StructuredStreamingStore};
+    use nfm_search_core::snapshot_store::SnapshotStore;
+    use std::time::{Duration, Instant};
+
+    fn title(text: &str) -> Line {
+        Line::Title(text.into())
+    }
+
+    #[test]
+    fn each_group_on_screen_has_its_title_over_its_rows() {
+        use Line::{Blank, Row};
+        // The group of each result, and its title.
+        let groups = [0, 0, 1, 1, 1];
+        let group = |result: usize| Some((groups[result], format!("g{}", groups[result])));
+        assert_eq!(
+            screen_lines(5, 0, 7, false, group),
+            [title("g0"), Row(0), Row(1), title("g1"), Row(2), Row(3), Row(4)]
+        );
+        // A title with no room for a row under it is not shown.
+        assert_eq!(
+            screen_lines(5, 0, 4, false, group),
+            [title("g0"), Row(0), Row(1), Blank]
+        );
+        // A group whose first row is past the top has its title there.
+        assert_eq!(screen_lines(5, 3, 3, false, group), [title("g1"), Row(3), Row(4)]);
+        // With the query at the bottom, rows go up from it, and each title is
+        // still over its group's rows.
+        assert_eq!(
+            screen_lines(5, 0, 7, true, group),
+            [title("g1"), Row(4), Row(3), Row(2), title("g0"), Row(1), Row(0)]
+        );
+        assert_eq!(screen_lines(5, 0, 4, true, group), [Blank, title("g0"), Row(1), Row(0)]);
+        // There too, a group that goes on past the top has its title there.
+        assert_eq!(screen_lines(5, 2, 3, true, group), [title("g1"), Row(3), Row(2)]);
+        // Rows of no group, or of one with no title, have none.
+        let none = |_| None::<(u32, String)>;
+        assert_eq!(screen_lines(2, 0, 3, false, none), [Row(0), Row(1), Blank]);
+        // Lines taken to show a row: the rows, and a title for each group.
+        assert_eq!(lines_through(0, 2, group), 5);
+        assert_eq!(lines_through(3, 4, group), 3);
+    }
+
+    /// A table with a column of names, each row in the group given.
+    fn table(
+        rows: &[(&str, u32)],
+        titles: &[&str],
+    ) -> Arc<SnapshotStore<StructuredStreamingSnapshot>> {
+        let schema = StructuredSchema::new(vec!["Name".into()]).unwrap();
+        let mut table = StructuredStreamingStore::new(schema);
+        table.set_group_titles(titles.iter().map(|title| title.to_string()).collect());
+        for (name, group) in rows {
+            let record = csv::StringRecord::from(vec![*name]);
+            table.add_record_in_group(&record, *group).unwrap();
+        }
+        let store = Arc::new(SnapshotStore::new());
+        store.publish(table.snapshot());
+        store.complete();
+        store
+    }
+
+    fn draw(ctx: &Context, picker: &mut Picker<StructuredStreamingSnapshot>) {
+        let bounds = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1000.0, 800.0));
+        let input = egui::RawInput {
+            screen_rect: Some(bounds),
+            ..Default::default()
+        };
+        let frame = ctx.run_ui(input, |ui| {
+            picker.show(ui.ctx(), Placement::new(bounds), &Appearance::default(), false);
+        });
+        frame.drop_without_applying_deltas();
+    }
+
+    /// Draw until the rows found for what is typed are shown.
+    fn shown(ctx: &Context, picker: &mut Picker<StructuredStreamingSnapshot>, rows: usize) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            picker.poll();
+            draw(ctx, picker);
+            let query = picker.query.clone();
+            let displayed = picker.displayed.as_ref();
+            if displayed
+                .is_some_and(|d| d.query == query && d.done && d.output.results.len() == rows)
+            {
+                return;
+            }
+            assert!(Instant::now() < deadline, "rows were not found");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// What the lines on screen say, the selected row marked.
+    fn lines(picker: &Picker<StructuredStreamingSnapshot>) -> Vec<String> {
+        let displayed = picker.displayed.as_ref().unwrap();
+        let text = |index: usize| {
+            let result = &displayed.output.results[index];
+            let text = displayed
+                .snapshot
+                .display_text(result.node_index, "")
+                .unwrap_or_default();
+            let mark = if index == picker.selected { ">" } else { " " };
+            format!("{mark}{}", text.trim())
+        };
+        picker
+            .screen_lines()
+            .into_iter()
+            .map(|line| match line {
+                Line::Title(title) => format!("# {title}"),
+                Line::Row(index) => text(index),
+                Line::Blank => String::new(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn groups_of_several_sources_have_titles_and_the_selection_steps_over_them() {
+        let ctx = Context::default();
+        // Out of order: the search puts each group's rows together.
+        let rows = table(
+            &[("beta", 1), ("alpha", 0), ("gamma", 1), ("ant", 0)],
+            &["First", "Second"],
+        );
+        let more = table(&[("delta", 0)], &["Third"]);
+        let members: Vec<crate::Member<StructuredStreamingSnapshot>> = vec![rows, more];
+        let config = PickerConfig {
+            result_rows: 5,
+            preview_visible: false,
+            layout: Layout::QueryTop,
+            ..Default::default()
+        };
+        let mut picker = Picker::new_union("groups", &ctx, members, config);
+        shown(&ctx, &mut picker, 5);
+        assert_eq!(picker.visible_result_rows, 5);
+        assert_eq!(lines(&picker), ["# First", ">alpha", " ant", "# Second", " beta"]);
+
+        // Down goes from row to row; the list moves to keep the selected row
+        // on screen, with the titles before it counted.
+        picker.move_selection(2);
+        draw(&ctx, &mut picker);
+        assert_eq!(lines(&picker), ["# First", " alpha", " ant", "# Second", ">beta"]);
+        picker.move_selection(1);
+        draw(&ctx, &mut picker);
+        // The first group's first row is past the top, and its title there;
+        // the next group's has no room for a row under it.
+        assert_eq!(lines(&picker), ["# First", " ant", "# Second", " beta", ">gamma"]);
+        picker.move_selection(1);
+        draw(&ctx, &mut picker);
+        assert_eq!(lines(&picker), ["# Second", " beta", " gamma", "# Third", ">delta"]);
+        // And back up to the first, whose title is over it again.
+        picker.move_selection(-4);
+        draw(&ctx, &mut picker);
+        assert_eq!(lines(&picker), ["# First", ">alpha", " ant", "# Second", " beta"]);
+
+        // A group none of whose rows match has no title.
+        picker.set_query("an");
+        shown(&ctx, &mut picker, 1);
+        assert_eq!(lines(&picker), ["# First", ">ant", "", "", ""]);
+        picker.set_query("del");
+        shown(&ctx, &mut picker, 1);
+        assert_eq!(lines(&picker), ["# Third", ">delta", "", "", ""]);
+    }
+
+    #[test]
+    fn a_list_with_room_for_one_line_has_no_titles() {
+        let ctx = Context::default();
+        let rows = table(&[("alpha", 0), ("beta", 1)], &["First", "Second"]);
+        let config = PickerConfig {
+            result_rows: 1,
+            preview_visible: false,
+            ..Default::default()
+        };
+        let mut picker = Picker::new("one", &ctx, rows, config);
+        shown(&ctx, &mut picker, 2);
+        assert_eq!(lines(&picker), [">alpha"]);
+        picker.move_selection(1);
+        draw(&ctx, &mut picker);
+        assert_eq!(lines(&picker), [">beta"]);
+    }
+
+    #[test]
+    fn with_the_query_at_the_bottom_titles_are_over_their_rows() {
+        let ctx = Context::default();
+        let rows = table(
+            &[("alpha", 0), ("ant", 0), ("beta", 1), ("bat", 1), ("bee", 1)],
+            &["First", "Second"],
+        );
+        let config = PickerConfig {
+            result_rows: 5,
+            preview_visible: false,
+            layout: Layout::QueryBottom,
+            ..Default::default()
+        };
+        let mut picker = Picker::new("bottom", &ctx, rows, config);
+        shown(&ctx, &mut picker, 5);
+        // The second group goes on past the top, which has its title.
+        assert_eq!(lines(&picker), ["# Second", " beta", "# First", " ant", ">alpha"]);
+        // Up the list, the selection takes the rows of the second with it.
+        picker.move_selection(3);
+        draw(&ctx, &mut picker);
+        assert_eq!(lines(&picker), ["# Second", ">bat", " beta", "# First", " ant"]);
     }
 }

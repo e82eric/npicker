@@ -78,6 +78,17 @@ impl<S: ItemsSource> Joined<S> {
         let (part, index) = self.part(row)?;
         part.snapshot.row_fields(index)
     }
+    /// The group a row is in: the member it is of, and its group there. A
+    /// member's groups are its own.
+    pub fn group(&self, row: usize) -> Option<(usize, u32)> {
+        let (part, index) = self.part(row)?;
+        Some((place(row).0, part.snapshot.group(index)?))
+    }
+    /// What the group a row is in is called.
+    pub fn group_title(&self, row: usize) -> Option<String> {
+        let (part, index) = self.part(row)?;
+        part.snapshot.group_title(part.snapshot.group(index)?)
+    }
     /// What of the query a row's source matches its rows against.
     pub fn effective_query(&self, row: usize, query: &str) -> Option<String> {
         self.part(row).map(|(part, _)| part.snapshot.effective_query(query))

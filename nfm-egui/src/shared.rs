@@ -72,6 +72,15 @@ macro_rules! delegate {
         fn row_fields(&self, index: usize) -> Option<nfm_search_core::row::RowFields> {
             self.$field.row_fields(index)
         }
+        fn has_groups(&self) -> bool {
+            self.$field.has_groups()
+        }
+        fn group(&self, index: usize) -> Option<u32> {
+            self.$field.group(index)
+        }
+        fn group_title(&self, group: u32) -> Option<String> {
+            self.$field.group_title(group)
+        }
     };
 }
 impl<S: ItemsSource + Send + Sync> ItemsSource for Mapped<S>

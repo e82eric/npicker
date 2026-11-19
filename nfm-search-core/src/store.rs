@@ -102,6 +102,68 @@ pub trait ItemsSource {
     fn row_fields(&self, _node_index: usize) -> Option<crate::row::RowFields> {
         None
     }
+
+    /// Whether any of the rows are in groups. A search of a source whose
+    /// rows are finds them group by group, the lowest numbered first, and
+    /// within a group as it would otherwise; rows of no group come last.
+    fn has_groups(&self) -> bool {
+        false
+    }
+
+    /// The group a row is in; see [`ItemsSource::has_groups`].
+    fn group(&self, _node_index: usize) -> Option<u32> {
+        None
+    }
+
+    /// What a group is called, which a picker shows over its rows.
+    fn group_title(&self, _group: u32) -> Option<String> {
+        None
+    }
+}
+
+/// The search of a source whose rows are in groups: its own search, with
+/// what it finds ordered group by group.
+struct GroupedPlan<'a, S: ?Sized> {
+    plan: Box<dyn SearchPlan + 'a>,
+    source: &'a S,
+}
+
+impl<S: ItemsSource + Sync + ?Sized> SearchPlan for GroupedPlan<'_, S> {
+    fn fuzzy_query(&self) -> &str {
+        self.plan.fuzzy_query()
+    }
+    fn filters_items(&self) -> bool {
+        self.plan.filters_items()
+    }
+    fn includes(&self, index: usize) -> bool {
+        self.plan.includes(index)
+    }
+    fn compare(&self, left: usize, right: usize) -> CmpOrdering {
+        let group = |index| self.source.group(index).unwrap_or(u32::MAX);
+        group(left)
+            .cmp(&group(right))
+            .then_with(|| self.plan.compare(left, right))
+    }
+    fn has_custom_sort(&self) -> bool {
+        true
+    }
+    fn display_text(&self, index: usize) -> Option<String> {
+        self.plan.display_text(index)
+    }
+}
+
+/// How `query` is searched for in `source`: as the source says, and group
+/// by group when its rows are in groups.
+pub fn search_plan<'a, S: ItemsSource + Sync + ?Sized>(
+    source: &'a S,
+    query: &str,
+) -> Box<dyn SearchPlan + 'a> {
+    let plan = source.create_search_plan(query);
+    if source.has_groups() {
+        Box::new(GroupedPlan { plan, source })
+    } else {
+        plan
+    }
 }
 
 #[derive(Clone, Copy, Debug)]

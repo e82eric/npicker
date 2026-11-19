@@ -286,6 +286,8 @@ struct StructuredRow {
     preview: Option<ByteRange>,
     first_cell: usize,
     cell_count: usize,
+    /// The group it was added in, if any.
+    group: Option<u32>,
 }
 
 pub struct StructuredStreamingStore {
@@ -300,6 +302,10 @@ pub struct StructuredStreamingStore {
     column_widths: Vec<usize>,
     version: u64,
     template: Option<Arc<CardTemplate>>,
+    /// What each group is called, by its number.
+    group_titles: Arc<[String]>,
+    /// Whether a row has been added in a group.
+    grouped: bool,
 }
 
 /// A card template. Text slots show their column as the table does; a
@@ -328,7 +334,25 @@ impl StructuredStreamingStore {
             distinct_values: Arc::new(RwLock::new(vec![Vec::new(); column_count])),
             version: 0,
             template: None,
+            group_titles: Arc::from([]),
+            grouped: false,
         }
+    }
+
+    /// What the groups rows can be added in are called: group `n` is
+    /// `titles[n]`. A picker shows the title over the group's rows.
+    pub fn set_group_titles(&mut self, titles: Vec<String>) {
+        self.group_titles = titles.into();
+    }
+
+    /// Add a row in a group. A search finds rows group by group, the lowest
+    /// numbered first; rows added with no group come after them all.
+    pub fn add_record_in_group(
+        &mut self,
+        record: &csv::StringRecord,
+        group: u32,
+    ) -> Result<(), String> {
+        self.add(record, None, Some(group))
     }
 
     /// Paint results as cards with `template`. Its fields are column indexes.
@@ -389,6 +413,15 @@ impl StructuredStreamingStore {
         &mut self,
         record: &csv::StringRecord,
         preview: Option<&str>,
+    ) -> Result<(), String> {
+        self.add(record, preview, None)
+    }
+
+    fn add(
+        &mut self,
+        record: &csv::StringRecord,
+        preview: Option<&str>,
+        group: Option<u32>,
     ) -> Result<(), String> {
         if record.len() != self.schema.columns.len() {
             return Err(format!(
@@ -453,7 +486,9 @@ impl StructuredStreamingStore {
             preview,
             first_cell,
             cell_count: record.len(),
+            group,
         });
+        self.grouped |= group.is_some();
 
         Ok(())
     }
@@ -475,6 +510,8 @@ impl StructuredStreamingStore {
             distinct_values: Arc::clone(&self.distinct_values),
             column_widths: Arc::from(self.column_widths.clone()),
             template: self.template.clone(),
+            group_titles: Arc::clone(&self.group_titles),
+            grouped: self.grouped,
         })
     }
 }
@@ -490,6 +527,8 @@ pub struct StructuredStreamingSnapshot {
     distinct_values: Arc<RwLock<Vec<Vec<String>>>>,
     column_widths: Arc<[usize]>,
     template: Option<Arc<CardTemplate>>,
+    group_titles: Arc<[String]>,
+    grouped: bool,
 }
 
 impl StructuredStreamingSnapshot {
@@ -974,6 +1013,18 @@ impl ItemsSource for StructuredStreamingSnapshot {
     fn row_fields(&self, node_index: usize) -> Option<RowFields> {
         (self.template.is_some() && node_index < self.row_count)
             .then(|| self.card_fields(node_index))
+    }
+
+    fn has_groups(&self) -> bool {
+        self.grouped
+    }
+
+    fn group(&self, node_index: usize) -> Option<u32> {
+        (node_index < self.row_count).then(|| self.rows[node_index].group)?
+    }
+
+    fn group_title(&self, group: u32) -> Option<String> {
+        self.group_titles.get(group as usize).cloned()
     }
 }
 
@@ -1473,6 +1524,43 @@ mod tests {
             vec!["alpha", "beta"]
         );
         assert_eq!(snapshot.value(output.results[0].node_index), "alpha,10");
+    }
+
+    #[test]
+    fn rows_added_in_groups_are_found_group_by_group() {
+        let mut store = StructuredStreamingStore::new(
+            StructuredSchema::new(vec!["Name".into(), "Length".into()]).unwrap(),
+        );
+        store.set_group_titles(vec!["First".into(), "Second".into()]);
+        let rows = [("abc", Some(1)), ("alpha", Some(0)), ("ab", None), ("beta", Some(1)), ("gamma", Some(0))];
+        for (name, group) in rows {
+            let record = csv::StringRecord::from(vec![name, "1"]);
+            match group {
+                Some(group) => store.add_record_in_group(&record, group),
+                None => store.add_record(&record),
+            }
+            .unwrap();
+        }
+        let snapshot = store.snapshot();
+        assert!(snapshot.has_groups());
+        assert_eq!((snapshot.group(0), snapshot.group(2)), (Some(1), None));
+        assert_eq!(snapshot.group_title(1).as_deref(), Some("Second"));
+        assert_eq!(snapshot.group_title(2), None);
+        let names = |query: &str| -> Vec<String> {
+            let query = format!("{query} /#Display==Name");
+            let output = nfm_search_core::search::search(Arc::clone(&snapshot), &query, || false);
+            output.unwrap().results.into_iter().map(|result| result.path).collect()
+        };
+        // Group by group, in the order they were added within one, and those
+        // of no group last.
+        assert_eq!(names(""), ["alpha", "gamma", "abc", "beta", "ab"]);
+        // Within a group, the best match first.
+        assert_eq!(names("b"), ["beta", "abc", "ab"]);
+
+        // A table with no rows in groups is not.
+        let mut plain = StructuredStreamingStore::new(StructuredSchema::new(vec!["Name".into()]).unwrap());
+        plain.add_record(&csv::StringRecord::from(vec!["one"])).unwrap();
+        assert!(!plain.snapshot().has_groups());
     }
 
     /// The `Name` of every row `query` matches, in result order.

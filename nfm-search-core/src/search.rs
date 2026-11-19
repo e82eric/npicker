@@ -501,7 +501,7 @@ where
 {
     let timing_enabled = timing::is_enabled();
     let total_start = timing_enabled.then(Instant::now);
-    let plan = snapshot.create_search_plan(query);
+    let plan = crate::store::search_plan(snapshot.as_ref(), query);
     let fuzzy_query = plan.fuzzy_query();
     let filters_items = plan.filters_items();
     let total = snapshot.len();
@@ -717,7 +717,7 @@ where
         .collect()
 }
 
-fn apply_custom_sort(results: &mut [SearchResult], plan: &(dyn SearchPlan + '_)) {
+pub(crate) fn apply_custom_sort(results: &mut [SearchResult], plan: &(dyn SearchPlan + '_)) {
     if plan.has_custom_sort() {
         results.sort_by(|left, right| {
             plan.compare(left.node_index, right.node_index)

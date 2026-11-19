@@ -292,7 +292,11 @@ where
             let Some(delta) = delta else {
                 return;
             };
-            merge_cached_search(cache, &query, delta, self.sort_mode)
+            // What the source says comes first goes on doing so as more is
+            // found, as for its groups.
+            let plan = crate::store::search_plan(snapshot.as_ref(), &query);
+            let sorted = plan.has_custom_sort().then_some(plan.as_ref());
+            merge_cached_search(cache, &query, delta, self.sort_mode, sorted)
         } else if use_extension_cache {
             let Some(output) = search_with_match_cache(
                 Arc::clone(&snapshot),
@@ -366,6 +370,7 @@ fn merge_cached_search(
     query: &str,
     delta: SearchOutput,
     sort_mode: SearchSortMode,
+    sorted: Option<&(dyn crate::store::SearchPlan + '_)>,
 ) -> SearchOutput {
     cache.query = query.to_owned();
     cache.searched_len = delta.total;
@@ -378,7 +383,13 @@ fn merge_cached_search(
         }
     }
 
-    if query.is_empty() {
+    if let Some(plan) = sorted {
+        // In the order the source sets, which those found before and those
+        // found now each are in but not together.
+        cache.results.extend(delta.results);
+        crate::search::apply_custom_sort(&mut cache.results, plan);
+        cache.results.truncate(RESULT_LIMIT);
+    } else if query.is_empty() {
         if cache.results.len() < RESULT_LIMIT {
             let remaining = RESULT_LIMIT - cache.results.len();
             cache
@@ -427,6 +438,71 @@ fn compare_search_results(left: &SearchResult, right: &SearchResult) -> std::cmp
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::snapshot_store::SnapshotStore;
+    use crate::store::FlatSnapshot;
+
+    /// Rows in groups.
+    struct Grouped {
+        rows: FlatSnapshot<u32>,
+    }
+    impl ItemsSource for Grouped {
+        type Item = u32;
+        fn version(&self) -> u64 {
+            self.rows.len() as u64
+        }
+        fn len(&self) -> usize {
+            self.rows.len()
+        }
+        fn is_empty(&self) -> bool {
+            self.rows.is_empty()
+        }
+        fn get_string<'a>(&'a self, i: usize, stack: &'a mut [u8], heap: &'a mut Vec<u8>) -> &'a [u8] {
+            self.rows.get_string(i, stack, heap)
+        }
+        fn get_string_lossy(&self, i: usize, out: &mut Vec<u8>) -> String {
+            self.rows.get_string_lossy(i, out)
+        }
+        fn item(&self, i: usize) -> Option<u32> {
+            self.rows.item(i)
+        }
+        fn has_groups(&self) -> bool {
+            true
+        }
+        fn group(&self, i: usize) -> Option<u32> {
+            self.rows.item(i)
+        }
+    }
+
+    #[test]
+    fn rows_in_groups_stay_group_by_group_as_more_are_found() {
+        // Each row's text, and its group.
+        let rows = [("xb1", 1), ("xa1", 0), ("xb2", 1), ("xa2", 0)];
+        let found = |query: &str| -> Vec<String> {
+            let store = Arc::new(SnapshotStore::new_append_only());
+            let (send, receive) = crossbeam_channel::unbounded();
+            let session = FuzzySearchSession::new(1, store.clone(), query.to_owned(), send);
+            session.start();
+            let mut last = Vec::new();
+            for shown in [2, 4] {
+                let rows = FlatSnapshot::from_items(rows[..shown].iter().copied());
+                store.publish(Arc::new(Grouped { rows }));
+                let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                loop {
+                    let left = deadline.saturating_duration_since(std::time::Instant::now());
+                    let update = receive.recv_timeout(left).unwrap();
+                    if update.searched == shown {
+                        last = update.results.into_iter().map(|result| result.path).collect();
+                        break;
+                    }
+                }
+            }
+            session.stop();
+            last
+        };
+        // The rows found later are put among the first, by their groups.
+        assert_eq!(found(""), ["xa1", "xa2", "xb1", "xb2"]);
+        assert_eq!(found("x"), ["xa1", "xa2", "xb1", "xb2"]);
+    }
 
     #[test]
     fn only_appended_plain_fuzzy_terms_are_cache_compatible() {
