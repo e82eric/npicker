@@ -576,9 +576,10 @@ enum Line {
 /// down from a query at the top, up from one at the bottom.
 ///
 /// `group(r)` is the group result `r` is in, and its title, if it has one.
-/// Each group with rows on screen has its title over them: where its rows
-/// begin, or on the top line when they go on past it. A title with no room
-/// for a row of its own under it is not shown.
+/// A group's title is a line over its rows, and scrolls with them: over the
+/// first with the query at the top, over the last with it at the bottom. A
+/// title on the bottom line, with no room for a row of its own under it, is
+/// not shown.
 fn screen_lines<G: PartialEq>(
     len: usize,
     start: usize,
@@ -586,34 +587,22 @@ fn screen_lines<G: PartialEq>(
     bottom: bool,
     group: impl Fn(usize) -> Option<(G, String)>,
 ) -> Vec<Line> {
-    // From the query out: a group's rows, with its title on their far side
-    // when the query is under them and on their near side when it is over.
-    let mut lines = Vec::with_capacity(slots);
+    // From the query out.
+    let mut lines = Vec::with_capacity(slots + 1);
     let mut result = start;
     while result < len && lines.len() < slots {
-        let Some((key, title)) = group(result) else {
-            lines.push(Line::Row(result));
-            result += 1;
-            continue;
-        };
-        if lines.len() + 2 > slots {
-            break;
-        }
-        if !bottom {
+        let title = titles_at(result, len, bottom, &group);
+        if let (Some(title), false) = (&title.before, bottom) {
+            if lines.len() + 1 == slots {
+                break;
+            }
             lines.push(Line::Title(title.clone()));
         }
-        let room = slots - lines.len() - usize::from(bottom);
-        let first = result;
-        while result < len
-            && result - first < room
-            && group(result).is_some_and(|(other, _)| other == key)
-        {
-            lines.push(Line::Row(result));
-            result += 1;
-        }
-        if bottom {
+        lines.push(Line::Row(result));
+        if let (Some(title), true) = (title.after, bottom) {
             lines.push(Line::Title(title));
         }
+        result += 1;
     }
     lines.resize(slots, Line::Blank);
     if bottom {
@@ -622,16 +611,46 @@ fn screen_lines<G: PartialEq>(
     lines
 }
 
+/// The titles next to result `result` going away from the query: over the
+/// first row of its group, which is before it with the query at the top, and
+/// over the last, which is after it with the query at the bottom.
+struct TitlesAt {
+    before: Option<String>,
+    after: Option<String>,
+}
+
+fn titles_at<G: PartialEq>(
+    result: usize,
+    len: usize,
+    bottom: bool,
+    group: impl Fn(usize) -> Option<(G, String)>,
+) -> TitlesAt {
+    let Some((key, title)) = group(result) else {
+        return TitlesAt { before: None, after: None };
+    };
+    let same = |other: usize| group(other).is_some_and(|(other, _)| other == key);
+    let first = result == 0 || !same(result - 1);
+    let last = result + 1 == len || !same(result + 1);
+    TitlesAt {
+        before: (!bottom && first).then(|| title.clone()),
+        after: (bottom && last).then_some(title),
+    }
+}
+
 /// How many lines results `start` to `last` take on screen, with the titles
-/// of their groups: see `screen_lines`.
+/// over them: see `screen_lines`.
 fn lines_through<G: PartialEq>(
     start: usize,
     last: usize,
+    len: usize,
+    bottom: bool,
     group: impl Fn(usize) -> Option<(G, String)>,
 ) -> usize {
-    let key = |result| group(result).map(|(key, _)| key);
     let titles = (start..=last)
-        .filter(|&result| key(result).is_some() && (result == start || key(result) != key(result - 1)))
+        .filter(|&result| {
+            let at = titles_at(result, len, bottom, &group);
+            at.before.is_some() || at.after.is_some()
+        })
         .count();
     last + 1 - start + titles
 }
@@ -1804,7 +1823,11 @@ where
             // most there can be room for.
             let mut start = self.visible_start.max((self.selected + 1).saturating_sub(slots));
             let group = |result| self.group_at(result);
-            while start < self.selected && lines_through(start, self.selected, &group) > slots {
+            let len = self.displayed.as_ref().map_or(0, |d| d.output.results.len());
+            let bottom = self.query_bottom();
+            while start < self.selected
+                && lines_through(start, self.selected, len, bottom, &group) > slots
+            {
                 start += 1;
             }
             self.visible_start = start;
@@ -7651,7 +7674,7 @@ mod group_tests {
     }
 
     #[test]
-    fn each_group_on_screen_has_its_title_over_its_rows() {
+    fn a_title_is_a_line_over_its_rows_that_scrolls_with_them() {
         use Line::{Blank, Row};
         // The group of each result, and its title.
         let groups = [0, 0, 1, 1, 1];
@@ -7665,23 +7688,28 @@ mod group_tests {
             screen_lines(5, 0, 4, false, group),
             [title("g0"), Row(0), Row(1), Blank]
         );
-        // A group whose first row is past the top has its title there.
-        assert_eq!(screen_lines(5, 3, 3, false, group), [title("g1"), Row(3), Row(4)]);
-        // With the query at the bottom, rows go up from it, and each title is
-        // still over its group's rows.
+        // A group's title is over its first row: scrolled past that, it is
+        // not on screen.
+        assert_eq!(screen_lines(5, 2, 3, false, group), [title("g1"), Row(2), Row(3)]);
+        assert_eq!(screen_lines(5, 3, 3, false, group), [Row(3), Row(4), Blank]);
+        // With the query at the bottom, rows go up from it, and a group's
+        // title is over its last row.
         assert_eq!(
             screen_lines(5, 0, 7, true, group),
             [title("g1"), Row(4), Row(3), Row(2), title("g0"), Row(1), Row(0)]
         );
-        assert_eq!(screen_lines(5, 0, 4, true, group), [Blank, title("g0"), Row(1), Row(0)]);
-        // There too, a group that goes on past the top has its title there.
-        assert_eq!(screen_lines(5, 2, 3, true, group), [title("g1"), Row(3), Row(2)]);
+        assert_eq!(screen_lines(5, 0, 4, true, group), [Row(2), title("g0"), Row(1), Row(0)]);
+        assert_eq!(screen_lines(5, 2, 3, true, group), [Row(4), Row(3), Row(2)]);
+        assert_eq!(screen_lines(5, 3, 3, true, group), [title("g1"), Row(4), Row(3)]);
         // Rows of no group, or of one with no title, have none.
         let none = |_| None::<(u32, String)>;
         assert_eq!(screen_lines(2, 0, 3, false, none), [Row(0), Row(1), Blank]);
-        // Lines taken to show a row: the rows, and a title for each group.
-        assert_eq!(lines_through(0, 2, group), 5);
-        assert_eq!(lines_through(3, 4, group), 3);
+        // Lines taken to show a row: the rows, and the titles between them.
+        assert_eq!(lines_through(0, 2, 5, false, group), 5);
+        assert_eq!(lines_through(3, 4, 5, false, group), 2);
+        assert_eq!(lines_through(0, 2, 5, true, group), 4);
+        // A row with its title over it takes that line too.
+        assert_eq!(lines_through(2, 4, 5, true, group), 4);
     }
 
     /// A table with a column of names, each row in the group given.
@@ -7783,9 +7811,9 @@ mod group_tests {
         assert_eq!(lines(&picker), ["# First", " alpha", " ant", "# Second", ">beta"]);
         picker.move_selection(1);
         draw(&ctx, &mut picker);
-        // The first group's first row is past the top, and its title there;
-        // the next group's has no room for a row under it.
-        assert_eq!(lines(&picker), ["# First", " ant", "# Second", " beta", ">gamma"]);
+        // The first group's title went up with its first row; the third's
+        // has no room for a row under it.
+        assert_eq!(lines(&picker), [" ant", "# Second", " beta", ">gamma", ""]);
         picker.move_selection(1);
         draw(&ctx, &mut picker);
         assert_eq!(lines(&picker), ["# Second", " beta", " gamma", "# Third", ">delta"]);
@@ -7835,11 +7863,15 @@ mod group_tests {
         };
         let mut picker = Picker::new("bottom", &ctx, rows, config);
         shown(&ctx, &mut picker, 5);
-        // The second group goes on past the top, which has its title.
-        assert_eq!(lines(&picker), ["# Second", " beta", "# First", " ant", ">alpha"]);
-        // Up the list, the selection takes the rows of the second with it.
+        // The second group goes on past the top, and so does its title, over
+        // its last row.
+        assert_eq!(lines(&picker), [" bat", " beta", "# First", " ant", ">alpha"]);
         picker.move_selection(3);
         draw(&ctx, &mut picker);
-        assert_eq!(lines(&picker), ["# Second", ">bat", " beta", "# First", " ant"]);
+        assert_eq!(lines(&picker), [">bat", " beta", "# First", " ant", " alpha"]);
+        // At the last row, its title comes into view over it.
+        picker.move_selection(1);
+        draw(&ctx, &mut picker);
+        assert_eq!(lines(&picker), ["", "# Second", ">bee", " bat", " beta"]);
     }
 }
