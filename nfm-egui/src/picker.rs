@@ -2141,7 +2141,7 @@ where
                         egui::Align2::LEFT_CENTER,
                         &title,
                         appearance.typography.bold.clone(),
-                        appearance.palette.muted,
+                        appearance.palette.accent,
                     );
                     continue;
                 }
@@ -2235,11 +2235,13 @@ where
                         .snapshot
                         .display_text(result.node_index, &displayed.query)
                         .unwrap_or_else(|| result.path.clone());
-                    let mut inset = 0.0;
+                    // A row under a title is set in from it.
+                    let mut inset =
+                        if self.group_at(index).is_some() { GROUP_INDENT } else { 0.0 };
                     if let Some(row_icon) = &self.row_icon {
                         let size = (rect.height() - 2.0).max(1.0);
                         let square = egui::Rect::from_min_size(
-                            egui::pos2(rect.left() + 12.0, rect.center().y - size / 2.0),
+                            egui::pos2(rect.left() + 12.0 + inset, rect.center().y - size / 2.0),
                             egui::vec2(size, size),
                         );
                         if let Some(reference) = displayed
@@ -2256,7 +2258,7 @@ where
                                 appearance,
                             );
                         }
-                        inset = size + CARD_ICON_GAP;
+                        inset += size + CARD_ICON_GAP;
                     }
                     paint_result_line(
                         ui,
@@ -3144,6 +3146,8 @@ const CARD_PADDING_Y: f32 = 6.0;
 const CARD_LINE_GAP: f32 = 1.0;
 /// Space between an icon and what follows it.
 const CARD_ICON_GAP: f32 = 6.0;
+/// How far a row under a group's title is set in from it.
+const GROUP_INDENT: f32 = 16.0;
 /// Space between slots on a card line.
 const CARD_SLOT_GAP: f32 = 16.0;
 /// The share of a line that right-aligned slots may take.
