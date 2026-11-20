@@ -118,6 +118,10 @@ impl<S: ItemsSource> Joined<S> {
     pub fn has_header(&self, query: &str) -> bool {
         self.parts.iter().flatten().any(|part| part.snapshot.header(query).is_some())
     }
+    /// Whether the rows of any member are in groups.
+    pub fn has_groups(&self) -> bool {
+        self.parts.iter().flatten().any(|part| part.snapshot.has_groups())
+    }
     /// The header to show over `rows`, the ones on screen: that of the
     /// first member with both a header and a row among them. The one
     /// member of a picker with no others shows its header regardless.
