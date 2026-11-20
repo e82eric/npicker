@@ -721,8 +721,8 @@ where
     /// rows of the first that match, then those of the next. Each member is
     /// searched by itself, with its own ranking and its own limit on how
     /// many matches are kept, and is searched again only when its own
-    /// source changes; a selected row stays selected while a source other
-    /// than its own changes. A [`Selection`] says which member it is of.
+    /// source changes; the selection stays where it is in the list while
+    /// any of them does. A [`Selection`] says which member it is of.
     ///
     /// A header is shown for the first member that has one and has a row
     /// on screen. Rows are lines: a member's card template is not used.
@@ -803,7 +803,8 @@ where
         }
     }
     /// Change sources without clearing the presented rows or preview. Stale
-    /// selections remain disabled until the replacement has results or finishes.
+    /// selections remain disabled until the replacement has results or finishes,
+    /// whose first row is then selected: they are another list.
     pub fn replace_source<P: SearchSnapshotProvider<S> + ?Sized>(
         &mut self,
         ctx: &Context,
@@ -827,9 +828,9 @@ where
         self.replace_session(ctx, session, query);
     }
     /// Give one member another source and leave the rest of the picker as
-    /// it is: the query, the other members' rows, and the selection if it
-    /// is on one of those. The member's old rows are shown until the new
-    /// source has been searched. Nothing is done for a member there is not.
+    /// it is: the query, the other members' rows, and where the selection
+    /// is in the list. The member's old rows are shown until the new source
+    /// has been searched. Nothing is done for a member there is not.
     pub fn replace_member<P: SearchSnapshotProvider<S> + ?Sized>(
         &mut self,
         ctx: &Context,
@@ -1769,31 +1770,28 @@ where
                 .as_ref()
                 .and_then(|d| d.output.results.get(self.selected))
                 .map(|r| r.node_index);
-            // The selected row is the same row if its own member's source
-            // is the same or has only been added to, whatever the other
-            // members' have come to.
-            let stable_indices = self.displayed.as_ref().is_some_and(|d| {
-                old_index.is_some_and(|index| update.snapshot.keeps(&d.snapshot, index))
-            });
-            self.selected = if same_query && stable_indices {
-                old_index
-                    .and_then(|index| {
-                        update
-                            .output
-                            .results
-                            .iter()
-                            .position(|r| r.node_index == index)
-                    })
-                    .unwrap_or(0)
-            } else {
-                0
-            };
+            // More found for the same search, or the rows of one of its
+            // sources given again, keep the selection where it is in the
+            // list, whatever row comes to be there; at most on the last.
+            // Another search starts at the first.
+            let last = update.output.results.len().saturating_sub(1);
+            self.selected = if same_query { self.selected.min(last) } else { 0 };
             let new_index = update
                 .output
                 .results
                 .get(self.selected)
                 .map(|r| r.node_index);
-            if old_index != new_index || !same_query || !stable_indices {
+            // The preview is left when what is selected may be another row:
+            // where its source is not the same, or has had more than rows
+            // added to it.
+            let same_row = old_index.is_some_and(|index| {
+                new_index == Some(index)
+                    && self
+                        .displayed
+                        .as_ref()
+                        .is_some_and(|d| update.snapshot.keeps(&d.snapshot, index))
+            });
+            if !same_query || !same_row {
                 self.leave_preview_focus();
             }
             self.completion_snapshot = Some(update.snapshot.clone());
@@ -6636,32 +6634,33 @@ mod streaming_presentation_tests {
         assert_eq!(selected(&picker), (0, 0, 0));
         picker.move_selection(2);
         assert_eq!(selected(&picker), (0, 2, 2));
-        // Rows given again whole are other rows, so the selection is not
-        // kept on one of them.
+        // The selection stays where it is in the list while rows are given
+        // again whole.
         few.publish(snapshot(2, 5, &reads));
         shows(&mut picker, 2005);
-        assert_eq!(selected(&picker), (0, 0, 0));
+        assert_eq!(selected(&picker), (0, 2, 2));
         // A row of the second member is where it is in its own source.
-        picker.move_selection(5 + 40);
+        picker.move_selection(3 + 40);
         assert_eq!(selected(&picker), (1, 40, 40));
-        // It stays selected while the other member's rows are given again,
+        // Where it is in the list, it is another row once the first
+        // member's rows given again are one fewer,
         reads.store(0, Ordering::SeqCst);
         few.publish(snapshot(3, 4, &reads));
         shows(&mut picker, 2004);
-        assert_eq!(selected(&picker), (1, 40, 40));
+        assert_eq!(selected(&picker), (1, 41, 41));
         // which does not search its own member again;
         assert!(reads.load(Ordering::SeqCst) < 100, "the other member was searched again");
-        // while its own source is added to;
+        // the same row while its own source is added to;
         many.publish(snapshot(2, 2100, &reads));
         shows(&mut picker, 2104);
-        assert_eq!(selected(&picker), (1, 40, 40));
-        // and while the other member is given another source.
+        assert_eq!(selected(&picker), (1, 41, 41));
+        // and another once the first member is given a source of one row.
         let other = Arc::new(SnapshotStore::new());
         other.publish(snapshot(1, 1, &reads));
         other.complete();
         picker.replace_member(&ctx, 0, other);
         shows(&mut picker, 2101);
-        assert_eq!(selected(&picker), (1, 40, 40));
+        assert_eq!(selected(&picker), (1, 44, 44));
         // A query is every member's: no rows are shown for it until each
         // has been searched for it.
         picker.set_query("item 04");
@@ -6671,6 +6670,8 @@ mod streaming_presentation_tests {
         });
         let displayed = picker.displayed.as_ref().unwrap();
         assert_eq!(displayed.query, "item 04");
+        // Another query is another search: its first row is selected.
+        assert_eq!(picker.selected, 0);
         assert!(displayed.output.matched < 2101);
         assert_eq!(displayed.output.total, 2101);
         // Done when every member is.
@@ -6679,6 +6680,35 @@ mod streaming_presentation_tests {
             picker.poll();
             picker.displayed.as_ref().is_some_and(|d| d.done)
         });
+    }
+    #[test]
+    fn another_source_starts_at_its_first_row_whatever_the_query() {
+        let ctx = Context::default();
+        let reads = Arc::new(AtomicUsize::new(0));
+        let store = Arc::new(SnapshotStore::new());
+        store.publish(snapshot(1, 5, &reads));
+        store.complete();
+        let config = PickerConfig {
+            initial_query: "item".into(),
+            ..Default::default()
+        };
+        let mut picker = Picker::new("another", &ctx, store, config);
+        wait(|| {
+            picker.poll();
+            picker.selection().is_some()
+        });
+        picker.move_selection(3);
+        assert_eq!(picker.selected, 3);
+        // The same query, of another list.
+        let other = Arc::new(SnapshotStore::new());
+        other.publish(snapshot(1, 5, &reads));
+        other.complete();
+        picker.replace_source(&ctx, other, "item");
+        wait(|| {
+            picker.poll();
+            picker.selection().is_some()
+        });
+        assert_eq!(picker.selected, 0);
     }
     #[test]
     fn pending_query_retains_rows_and_geometry_but_blocks_acceptance() {
@@ -7625,21 +7655,29 @@ mod fed_tests {
     }
 
     #[test]
-    fn the_selection_stays_on_its_row_while_more_is_found_for_the_same_query() {
+    fn the_selection_stays_where_it_is_in_the_list_while_more_is_found_for_the_same_query() {
         let (_, asks, mut picker, feed) = make("");
         let asked = last(&asks);
         feed.found(found(&asked, page(&[(1, "one"), (2, "two")]), 2, 2, false));
         picker.poll();
         picker.move_selection(1);
         assert_eq!(picker.selection().unwrap().item, 2);
-        // A better row is found, and the selected one is now the third.
+        // A better row is found: the selection is still the second row,
+        // which is now another.
         feed.found(found(&asked, page(&[(9, "nine"), (1, "one"), (2, "two")]), 3, 3, false));
         picker.poll();
-        assert_eq!((picker.selected, picker.selection().unwrap().item), (2, 2));
-        // A source that started again has other rows under the same numbers.
-        let mut again = found(&asked, page(&[(9, "nine"), (1, "one"), (2, "two")]), 3, 3, true);
+        assert_eq!((picker.selected, picker.selection().unwrap().item), (1, 1));
+        // So it is when the source started again,
+        picker.move_selection(1);
+        let mut again = found(&asked, page(&[(9, "nine"), (1, "one"), (2, "two")]), 3, 3, false);
         again.epoch = 2;
         feed.found(again);
+        picker.poll();
+        assert_eq!((picker.selected, picker.selection().unwrap().item), (2, 2));
+        // and at most on the last row when there come to be fewer.
+        let mut fewer = found(&asked, page(&[(9, "nine")]), 1, 1, true);
+        fewer.epoch = 3;
+        feed.found(fewer);
         picker.poll();
         assert_eq!((picker.selected, picker.selection().unwrap().item), (0, 9));
     }
