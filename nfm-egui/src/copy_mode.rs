@@ -1537,6 +1537,11 @@ impl CopyMode {
                 self.numbered_logical_line_target(count, &mut read)
                     .map(|cell| (cell, false)),
             )
+        } else if motion == Motion::ScrollbackBottom {
+            Some(
+                self.last_text_row_target(&mut read)
+                    .map(|cell| (cell, false)),
+            )
         } else if explicit_count && motion == Motion::MatchingBracket {
             Some(self.percent_row_target(count).map(|cell| (cell, false)))
         } else if matches!(motion, Motion::Up | Motion::Down) {
@@ -1658,6 +1663,27 @@ impl CopyMode {
             x: self.preferred_x.min(self.columns.checked_sub(1)?),
             y: line.start,
         })
+    }
+
+    /// The last row that has text. A terminal's snapshot ends with the empty
+    /// rows below its prompt, and neither the cursor nor a yank belongs there.
+    /// A document that is all blank keeps the cursor on its first row; a row
+    /// that cannot be read ends the scan at the document's last row.
+    fn last_text_row_target(
+        &self,
+        read: &mut impl FnMut(u64) -> Option<TextRow>,
+    ) -> Option<CellPosition> {
+        let last = self.rows.checked_sub(1)?;
+        let x = self.cursor.x.min(self.columns.checked_sub(1)?);
+        for y in (0..=last).rev() {
+            let Some(row) = read(y) else {
+                return Some(CellPosition { x, y: last });
+            };
+            if row.glyphs(false).iter().any(|glyph| glyph.nonblank) {
+                return Some(CellPosition { x, y });
+            }
+        }
+        Some(CellPosition { x, y: 0 })
     }
 
     pub fn numbered_row_target(&self, count: u32) -> Option<CellPosition> {
@@ -3834,6 +3860,38 @@ mod tests {
                 end: CellPosition { x: 2, y: 2 },
             })
         );
+    }
+
+    #[test]
+    fn scrollback_bottom_stops_at_the_last_row_with_text() {
+        let rows = [
+            row("one", false),
+            row("", false),
+            row("prompt>", false),
+            row("   ", false),
+            row("", false),
+        ];
+        let mode = copy_at(2, 0, rows.len() as u64);
+        assert_eq!(
+            motion_cell(&mode, Motion::ScrollbackBottom, 1, &rows),
+            CellPosition { x: 2, y: 2 }
+        );
+        // The yank is the lines from the cursor through that row.
+        let read = |y: u64| rows.get(y as usize).cloned();
+        let target = motion_cell(&mode, Motion::ScrollbackBottom, 1, &rows);
+        let (range, linewise) = mode
+            .yank_motion_range(Motion::ScrollbackBottom.result(target), read)
+            .unwrap();
+        assert!(linewise);
+        assert_eq!((range.start.y, range.end.y), (0, 2));
+
+        let full = [row("one", false), row("two", false)];
+        let mode = copy_at(0, 0, 2);
+        assert_eq!(motion_cell(&mode, Motion::ScrollbackBottom, 1, &full).y, 1);
+
+        let blank = [row("", false), row("", false)];
+        let mode = copy_at(0, 1, 2);
+        assert_eq!(motion_cell(&mode, Motion::ScrollbackBottom, 1, &blank).y, 0);
     }
 
     fn motion_cell(mode: &CopyMode, motion: Motion, count: u32, rows: &[TextRow]) -> CellPosition {
