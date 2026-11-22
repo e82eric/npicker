@@ -76,6 +76,16 @@ search matches and copied text work as on any row. What differs:
 The engine itself counts rows and columns only; `PreviewCopyMode` does the
 arithmetic of heights for the picker's preview and the output page.
 
+### Rows that hang under their line
+
+A styled document's line can ask to break between words and to start its
+later rows with a hang (`LineFormat`), as markdown does for list items and
+quotes. The hang is drawn but is not text: the row's text starts past it, so
+word motions and searches run from the end of one row to the text of the next,
+and what is copied is the line as it was written. The cursor can rest on a
+hang's cells, as it can on the blank cells after a row's text. A row that
+breaks between words keeps a cell for the space it ends with.
+
 ## Selecting and yanking
 
 | Keys | Action |

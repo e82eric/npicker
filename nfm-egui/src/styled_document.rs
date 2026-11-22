@@ -51,6 +51,32 @@ struct ColumnMap {
     column: u32,
     step: u32,
 }
+/// How a logical line is laid out, beyond its text.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct LineFormat {
+    /// Styles the cells past the end of the line; see `push_row_filled`.
+    pub fill: Option<Style>,
+    /// The line's size as a multiple of the text size; see
+    /// `push_row_scaled`. Zero is the text size.
+    pub scale: f32,
+    /// Rows break after a space where one is near enough, so words stay
+    /// whole. A word longer than a row still breaks inside.
+    pub word_wrap: bool,
+    /// What every row after the line's first starts with, a cell to each
+    /// text, such as a list item's indent or a quote's bar. It is drawn but
+    /// is not the line's text: it is neither searched nor copied. A pane too
+    /// narrow to leave text room beside it leaves it out.
+    pub hang: Vec<(String, Style)>,
+}
+/// The start of a line's rows after its first, and how the line wraps.
+#[derive(PartialEq)]
+struct Hang {
+    words: bool,
+    /// One cell each.
+    cells: Vec<(String, Style)>,
+}
+/// The cells of text a row keeps beside its hang, at least.
+const HANG_TEXT_ROOM: usize = 8;
 pub struct DocumentBuilder {
     text: ChunkedStorage<u8>,
     lines: Vec<Range<usize>>,
@@ -59,6 +85,10 @@ pub struct DocumentBuilder {
     column_maps: Vec<ColumnMap>,
     fills: Vec<Option<Style>>,
     scales: Vec<f32>,
+    /// Each line's hang, one more than its index in `hangs`; zero, or a line
+    /// past the end, has none. Only as long as the last line with one.
+    line_hangs: Vec<u32>,
+    hangs: Vec<Hang>,
     line_start: usize,
     source_origin: usize,
 }
@@ -125,6 +155,8 @@ impl Default for DocumentBuilder {
             column_maps: Vec::new(),
             fills: Vec::new(),
             scales: Vec::new(),
+            line_hangs: Vec::new(),
+            hangs: Vec::new(),
             line_start: 0,
             source_origin: 0,
         }
@@ -171,6 +203,53 @@ impl DocumentBuilder {
         styles: &[ColumnStyleRun],
         fill: Option<Style>,
         scale: f32,
+    ) -> Result<(), String> {
+        self.push(text, columns, wraps, styles, fill, scale, 0)
+    }
+    /// A whole logical line, laid out as `format` says.
+    pub fn push_line(
+        &mut self,
+        text: &str,
+        columns: &[u32],
+        styles: &[ColumnStyleRun],
+        format: &LineFormat,
+    ) -> Result<(), String> {
+        let mut hang = 0;
+        if format.word_wrap || !format.hang.is_empty() {
+            // A hang is a cell to each text, so a row's cells stay in step.
+            let cells: Vec<(String, Style)> = format
+                .hang
+                .iter()
+                .flat_map(|(text, style)| {
+                    text.graphemes(true).flat_map(move |grapheme| {
+                        let width = UnicodeWidthStr::width(grapheme).max(1);
+                        let cell = if width == 1 { grapheme } else { " " };
+                        std::iter::repeat_n((cell.to_string(), *style), width)
+                    })
+                })
+                .collect();
+            let wanted = Hang {
+                words: format.word_wrap,
+                cells,
+            };
+            // Lines of a block share theirs.
+            if self.hangs.last() != Some(&wanted) {
+                self.hangs.push(wanted);
+            }
+            hang = self.hangs.len() as u32;
+        }
+        self.push(text, columns, false, styles, format.fill, format.scale, hang)
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn push(
+        &mut self,
+        text: &str,
+        columns: &[u32],
+        wraps: bool,
+        styles: &[ColumnStyleRun],
+        fill: Option<Style>,
+        scale: f32,
+        hang: u32,
     ) -> Result<(), String> {
         if columns.len() != text.len() {
             return Err("Invalid document column map".into());
@@ -235,6 +314,10 @@ impl DocumentBuilder {
             wraps,
         });
         if !wraps {
+            if hang != 0 {
+                self.line_hangs.resize(self.lines.len(), 0);
+                self.line_hangs.push(hang);
+            }
             self.lines.push(self.line_start..self.text.len());
             self.fills.push(fill);
             self.scales.push(line_scale(scale));
@@ -270,6 +353,8 @@ impl DocumentBuilder {
             column_maps: self.column_maps,
             fills: self.fills,
             scales: self.scales,
+            line_hangs: self.line_hangs,
+            hangs: self.hangs,
             source_origin: self.source_origin,
         })
     }
@@ -291,9 +376,16 @@ pub struct StyledDocument {
     fills: Vec<Option<Style>>,
     /// Each line's size, as a multiple of the text size.
     scales: Vec<f32>,
+    /// See `DocumentBuilder::line_hangs`.
+    line_hangs: Vec<u32>,
+    hangs: Vec<Hang>,
     source_origin: usize,
 }
 impl StyledDocument {
+    /// The hang numbered `hang`, one more than its index; zero is none.
+    fn hang(&self, hang: u32) -> Option<&Hang> {
+        self.hangs.get((hang as usize).checked_sub(1)?)
+    }
     /// Parse terminal output (SGR styles, carriage-return overwrite, erase and
     /// relative cursor motion; see `crate::ansi`) into a width-independent
     /// document; `layout` wraps it for display. Output past `max_lines` lines
@@ -425,24 +517,54 @@ impl StyledDocument {
             let scale = self.scales.get(line).copied().unwrap_or(1.0);
             scaled |= scale != 1.0;
             let columns = scaled_columns(columns, scale);
-            for (byte, grapheme) in text.grapheme_indices(true) {
+            let hang_id = self.line_hangs.get(line).copied().unwrap_or(0);
+            let words = self.hang(hang_id).is_some_and(|hang| hang.words);
+            // The hang of the rows after the first, where there is room.
+            let hang_width = self.hang(hang_id).map_or(0, |hang| hang.cells.len());
+            let (hang_id, hang_width) = if hang_width + HANG_TEXT_ROOM <= columns {
+                (hang_id, hang_width)
+            } else {
+                (0, 0)
+            };
+            // The row being filled: its hang, and where it can break after
+            // a space, as the byte and the width up to it.
+            let mut hang = 0;
+            let mut space: Option<(usize, usize)> = None;
+            let mut base = 0;
+            let mut graphemes = text.grapheme_indices(true);
+            while let Some((offset, grapheme)) = graphemes.next() {
+                let byte = base + offset;
                 if byte % 4096 == 0 && cancel.is_cancelled() {
                     return Err("preview cancelled".into());
                 }
-                let w = UnicodeWidthStr::width(grapheme).max(1).min(columns);
+                let cells = UnicodeWidthStr::width(grapheme).max(1);
+                let mut w = cells.min(columns - if hang == 0 { 0 } else { hang_width });
                 if width + w > columns {
+                    let (end, row_width) = space.take().unwrap_or((byte, width));
                     rows.push(LayoutRow {
                         start,
-                        end: range.start + byte,
-                        width,
+                        end: range.start + end,
+                        width: row_width,
                         wraps: true,
                         fill: None,
                         scale,
+                        hang,
                     });
-                    start = range.start + byte;
-                    width = 0;
+                    start = range.start + end;
+                    hang = hang_id;
+                    width = hang_width;
+                    if end != byte {
+                        // The word broken off starts the next row.
+                        base = end;
+                        graphemes = text[end..].grapheme_indices(true);
+                        continue;
+                    }
+                    w = cells.min(columns - hang_width);
                 }
                 width += w;
+                if words && grapheme == " " {
+                    space = Some((byte + 1, width));
+                }
             }
             rows.push(LayoutRow {
                 start,
@@ -451,6 +573,7 @@ impl StyledDocument {
                 wraps: false,
                 fill: self.fills.get(line).copied().flatten(),
                 scale,
+                hang,
             });
         }
         static REVISION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -552,7 +675,10 @@ impl<T: Copy> crate::ItemsSource for DocumentItems<T> {
 struct LayoutRow {
     start: usize,
     end: usize,
+    /// The cells used, the hang's among them.
     width: usize,
+    /// What the row starts with before its text; see `StyledDocument::hang`.
+    hang: u32,
     wraps: bool,
     /// Style of the padding after the line's text (final row only).
     fill: Option<Style>,
@@ -597,6 +723,15 @@ impl DocumentLayout {
         }
         rows_in_view(|y| self.scale_of(y), self.rows.len() as u64, top as u64, rows)
     }
+    /// What `row` starts with before its text.
+    fn hang_cells(&self, row: &LayoutRow) -> &[(String, Style)] {
+        self.document
+            .hang(row.hang)
+            .map_or(&[], |hang| hang.cells.as_slice())
+    }
+    fn hang_width(&self, row: &LayoutRow) -> usize {
+        self.hang_cells(row).len()
+    }
     fn scale_of(&self, row: u64) -> f32 {
         self.rows.get(row as usize).map_or(1.0, |row| row.scale)
     }
@@ -625,7 +760,7 @@ impl DocumentLayout {
         while !text.is_char_boundary(boundary) {
             boundary -= 1;
         }
-        let width = UnicodeWidthStr::width(&text[..boundary]);
+        let width = self.hang_width(row) + UnicodeWidthStr::width(&text[..boundary]);
         Some(CellPosition {
             x: width.min(self.columns - 1) as u32,
             y: y as u64,
@@ -636,9 +771,13 @@ impl DocumentLayout {
         let mut text = self.document.text(row.start..row.end);
         let mut offsets = Vec::new();
         let mut widths = vec![0; self.columns];
-        let mut x = 0;
+        // The hang's cells are in the row but not in its text.
+        let mut x = self.hang_width(row);
+        widths[..x].fill(1);
         for grapheme in text.graphemes(true) {
-            let width = UnicodeWidthStr::width(grapheme).max(1).min(self.columns);
+            let width = UnicodeWidthStr::width(grapheme)
+                .max(1)
+                .min(self.columns - x);
             offsets.extend(std::iter::repeat_n(x as u32, grapheme.len()));
             widths[x] = width as u8;
             x += width;
@@ -672,6 +811,13 @@ impl DocumentLayout {
             let text = self.document.text(row.start..row.end);
             let mut run_index = self.document.runs.partition_point(|r| r.end <= row.start);
             let mut x = 0;
+            for (text, style) in self.hang_cells(row) {
+                let mut cell = styled_cell(*style, text, foreground, background);
+                cell.scale = row.scale;
+                apply_highlight(&mut cell, x, y, highlight);
+                cells.push(cell);
+                x += 1;
+            }
             for (byte, grapheme) in text.grapheme_indices(true) {
                 let absolute = row.start + byte;
                 while run_index < self.document.runs.len()
@@ -684,7 +830,9 @@ impl DocumentLayout {
                     .runs
                     .get(run_index)
                     .map_or(Style::default(), |r| r.style);
-                let width = UnicodeWidthStr::width(grapheme).max(1).min(self.columns);
+                let width = UnicodeWidthStr::width(grapheme)
+                    .max(1)
+                    .min(self.columns.saturating_sub(x));
                 for spacer in 0..width {
                     let mut cell = styled_cell(
                         style,
@@ -1169,6 +1317,78 @@ mod tests {
             .unwrap();
         assert!(!plain.scaled());
         assert_eq!((plain.rows_in_view(2, 2), plain.last_page_top(2)), (2, 1));
+    }
+    #[test]
+    fn words_stay_whole_and_later_rows_hang_under_the_first() {
+        let bar = Style {
+            flags: 32,
+            ..Style::default()
+        };
+        let format = LineFormat {
+            word_wrap: true,
+            hang: vec![("│ ".into(), bar)],
+            ..LineFormat::default()
+        };
+        let mut builder = DocumentBuilder::default();
+        let text = "│ one two three abcdefghijklmnopqrstuvwxyz";
+        let columns: Vec<u32> = text
+            .char_indices()
+            .enumerate()
+            .flat_map(|(x, (_, c))| std::iter::repeat_n(x as u32, c.len_utf8()))
+            .collect();
+        builder.push_line(text, &columns, &[], &format).unwrap();
+        builder.push_row("plain words here", &(0..16).collect::<Vec<_>>(), false, &[]).unwrap();
+        let document = builder.finish();
+        let layout = document.layout(12, &Cancellation::test()).unwrap();
+        let rows: Vec<String> = (0..layout.total_rows())
+            .map(|y| {
+                let Preview::Grid { cells, .. } =
+                    layout.grid(y, 1, egui::Color32::WHITE, egui::Color32::BLACK, None)
+                else {
+                    panic!("layouts page as grids");
+                };
+                cells.iter().map(|cell| cell.text.as_str()).collect()
+            })
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                "│ one two   ",
+                "│ three     ",
+                "│ abcdefghij",
+                "│ klmnopqrst",
+                "│ uvwxyz    ",
+                // A line that asks for neither breaks wherever the row ends.
+                "plain words ",
+                "here        ",
+            ]
+        );
+        // The hang is drawn but is not text: rows after the first start
+        // past it, and copying joins the line as it was written.
+        let row = layout.text_row(1).unwrap().unwrap();
+        assert_eq!(row.text.text.trim_end(), "three");
+        assert_eq!(row.text.columns[0], 2);
+        assert!(row.text.wraps_to_next);
+        let selection = CopySelection {
+            range: crate::copy_mode::CellRange {
+                start: CellPosition { x: 0, y: 0 },
+                end: CellPosition { x: 0, y: 4 },
+            },
+            linewise: true,
+            rectangle: false,
+            trim: true,
+        };
+        assert_eq!(layout.selection_text(&selection).unwrap(), format!("{text}\n"));
+        // A place in the line is found past the hang.
+        let three = text.find("three").unwrap();
+        assert_eq!(
+            layout.cell(Position { line: 0, byte: three }),
+            Some(CellPosition { x: 2, y: 1 })
+        );
+        // A pane with no room beside the hang leaves it out.
+        let narrow = document.layout(9, &Cancellation::test()).unwrap();
+        let row = narrow.text_row(1).unwrap().unwrap();
+        assert_eq!((row.text.text.trim_end(), row.text.columns[0]), ("two", 0));
     }
     #[test]
     fn line_sizes_are_kept_between_the_text_size_and_the_largest() {

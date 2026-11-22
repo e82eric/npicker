@@ -3,9 +3,11 @@
 //! and quick select work on them.
 use nfm_egui::egui::Color32;
 use nfm_egui::styled_document::{
-    ColumnStyleRun, DocumentBuilder, DocumentRange, Position, Style, StyledDocument,
+    ColumnStyleRun, DocumentBuilder, DocumentRange, LineFormat, Position, Style, StyledDocument,
 };
-use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
+use pulldown_cmark::{
+    Alignment, BlockQuoteKind, CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd,
+};
 use std::sync::{Arc, OnceLock};
 use two_face::re_exports::syntect::easy::HighlightLines;
 use two_face::re_exports::syntect::highlighting::FontStyle;
@@ -36,6 +38,10 @@ pub struct Theme {
     pub link: Color32,
     pub quote: Color32,
     pub marker: Color32,
+    /// The bars and titles of alerts: note, tip, important, warning, caution.
+    pub alerts: [Color32; 5],
+    /// Whether a link's address is shown after its text.
+    pub link_destinations: bool,
 }
 impl Default for Theme {
     fn default() -> Self {
@@ -53,6 +59,14 @@ impl Default for Theme {
             link: Color32::from_rgb(0x83, 0xa5, 0x98),
             quote: Color32::from_rgb(0xa8, 0x99, 0x84),
             marker: Color32::from_rgb(0xa8, 0x99, 0x84),
+            alerts: [
+                Color32::from_rgb(0x83, 0xa5, 0x98),
+                Color32::from_rgb(0xb8, 0xbb, 0x26),
+                Color32::from_rgb(0xd3, 0x86, 0x9b),
+                Color32::from_rgb(0xfa, 0xbd, 0x2f),
+                Color32::from_rgb(0xfb, 0x49, 0x34),
+            ],
+            link_destinations: true,
         }
     }
 }
@@ -67,8 +81,8 @@ pub struct DocumentWriter {
     last_len: usize,
     /// Whether the last line ended was empty, so blank lines don't repeat.
     blank: bool,
-    /// How large lines are being written; `None` is the text size.
-    scale: Option<f32>,
+    /// How the lines being written are laid out.
+    format: LineFormat,
     /// The lines ended, for tests: nfm lays documents out only for previews.
     #[cfg(test)]
     rows: Vec<Vec<(String, Style)>>,
@@ -94,7 +108,7 @@ impl DocumentWriter {
     /// a heading is: they are that much taller and wrap that much sooner.
     /// 1 is the text size.
     pub fn set_scale(&mut self, scale: f32) {
-        self.scale = (scale != 1.0).then_some(scale);
+        self.format.scale = scale;
     }
     /// Appends `text` to the current line; tabs become spaces and line breaks are
     /// dropped.
@@ -135,15 +149,36 @@ impl DocumentWriter {
         self.blank = text.is_empty();
         self.last_len = text.len();
         // Every row here is well formed, so this cannot fail.
-        let _ = self.builder.push_row_scaled(
-            &text,
-            &columns,
-            false,
-            &styles,
-            None,
-            self.scale.unwrap_or(1.0),
-        );
+        let _ = self
+            .builder
+            .push_line(&text, &columns, &styles, &self.format);
         self.lines += 1;
+    }
+    /// Whether the lines ended from here break between words rather than
+    /// wherever the row ends.
+    pub fn set_word_wrap(&mut self, word_wrap: bool) {
+        self.format.word_wrap = word_wrap;
+    }
+    /// What the rows after the first start with, of the lines ended from
+    /// here: an indent the line's text hangs under.
+    pub fn set_hang(&mut self, hang: Vec<(String, Style)>) {
+        self.format.hang = hang;
+    }
+    /// Styles the cells from the end of the lines ended from here to the
+    /// pane's edge.
+    pub fn set_fill(&mut self, fill: Option<Style>) {
+        self.format.fill = fill;
+    }
+    /// Ends the current line with a rule in `style` from its end to the
+    /// pane's edge.
+    pub fn rule(&mut self, style: Style) {
+        let fill = self.format.fill.replace(Style {
+            flags: style.flags | STRIKE,
+            ..style
+        });
+        self.end_line();
+        self.format.fill = fill;
+        self.blank = false;
     }
     /// Ends the current line if it has text.
     pub fn finish_line(&mut self) {
@@ -209,10 +244,28 @@ fn highlighter(language: &str, theme: Option<&str>) -> Option<HighlightLines<'st
     Some(HighlightLines::new(syntax, theme))
 }
 
-struct List {
-    next: Option<u64>,
-    /// The marker's width, which continuation lines are indented by.
-    width: usize,
+/// What the lines inside a block start with.
+enum Block {
+    /// A bar down the side. A plain quote's text is in the quote color; an
+    /// alert's is not.
+    Quote { bar: Color32, plain: bool },
+    /// A list: its next number if it is numbered, and the width of the
+    /// current item's marker, which the item's other lines are indented by.
+    List { next: Option<u64>, width: usize },
+    /// Lines indented under a marker or a term, as a footnote's are.
+    Indent { width: usize },
+}
+
+/// The bullets of lists by depth, repeating.
+const BULLETS: [&str; 3] = ["• ", "◦ ", "▪ "];
+/// Fences that say only that the code is no language.
+const PLAIN_LANGUAGES: [&str; 4] = ["text", "txt", "plain", "plaintext"];
+
+struct Link {
+    destination: String,
+    /// The text shown for it so far.
+    text: String,
+    image: bool,
 }
 
 struct Markdown<'a> {
@@ -220,20 +273,36 @@ struct Markdown<'a> {
     theme: &'a Theme,
     flags: u8,
     heading: Option<HeadingLevel>,
-    links: usize,
+    links: Vec<Link>,
     code_block: bool,
     /// The fenced code block's highlighter, if its language is known.
     highlighter: Option<HighlightLines<'static>>,
-    quotes: usize,
-    lists: Vec<List>,
-    /// The marker of a list item whose first line has not started.
+    blocks: Vec<Block>,
+    /// The marker of a list item or footnote whose first line has not started.
     marker: Option<String>,
     table: Option<Table>,
+    /// A blank line is owed before the next line, with the bars of the
+    /// quotes that line is in.
+    gap: bool,
+    /// Inside an HTML comment, which can end in a later piece of HTML.
+    comment: bool,
+    /// Inside a front matter block.
+    metadata: bool,
+    /// Inside a definition list's term.
+    term: bool,
 }
 #[derive(Default)]
 struct Table {
-    rows: Vec<Vec<String>>,
+    alignments: Vec<Alignment>,
+    /// Rows of cells of styled text.
+    rows: Vec<Vec<Vec<(String, Style)>>>,
     head_rows: usize,
+}
+
+fn cell_width(cell: &[(String, Style)]) -> usize {
+    cell.iter()
+        .map(|(text, _)| UnicodeWidthStr::width(text.as_str()))
+        .sum()
 }
 
 impl<'a> Markdown<'a> {
@@ -243,23 +312,39 @@ impl<'a> Markdown<'a> {
             theme,
             flags: 0,
             heading: None,
-            links: 0,
+            links: Vec::new(),
             code_block: false,
             highlighter: None,
-            quotes: 0,
-            lists: Vec::new(),
+            blocks: Vec::new(),
             marker: None,
             table: None,
+            gap: false,
+            comment: false,
+            metadata: false,
+            term: false,
         }
     }
 
     fn render(mut self, markdown: &str) {
-        let options =
-            Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS;
+        let options = Options::ENABLE_TABLES
+            | Options::ENABLE_STRIKETHROUGH
+            | Options::ENABLE_TASKLISTS
+            | Options::ENABLE_FOOTNOTES
+            | Options::ENABLE_GFM
+            | Options::ENABLE_MATH
+            | Options::ENABLE_DEFINITION_LIST
+            | Options::ENABLE_HEADING_ATTRIBUTES
+            | Options::ENABLE_YAML_STYLE_METADATA_BLOCKS;
         for event in Parser::new_ext(markdown, options) {
             self.event(event);
         }
         self.out.finish_line();
+        self.out.set_hang(Vec::new());
+        self.out.set_word_wrap(false);
+        self.out.set_fill(None);
+        if self.gap {
+            self.out.blank_line();
+        }
     }
 
     fn style(&self) -> Style {
@@ -276,13 +361,25 @@ impl<'a> Markdown<'a> {
                 .get(index)
                 .or(self.theme.headings.last())
                 .copied();
-            style.flags |= BOLD;
+            // The levels past the sizes and colors are told apart by weight.
+            style.flags |= match level {
+                HeadingLevel::H5 => BOLD | ITALIC,
+                HeadingLevel::H6 => BOLD | FAINT,
+                _ => BOLD,
+            };
             style.underline = level == HeadingLevel::H1;
-        } else if self.links > 0 {
+        } else if !self.links.is_empty() {
             style.foreground = Some(self.theme.link);
             style.underline = true;
-        } else if self.quotes > 0 {
+        } else if self
+            .blocks
+            .iter()
+            .any(|block| matches!(block, Block::Quote { plain: true, .. }))
+        {
             style.foreground = Some(self.theme.quote);
+        }
+        if self.term {
+            style.flags |= BOLD;
         }
         style
     }
@@ -294,45 +391,117 @@ impl<'a> Markdown<'a> {
         }
     }
 
-    /// Starts a line with the quote bars and list indentation it needs.
+    fn code_style(&self) -> Style {
+        Style {
+            foreground: Some(self.theme.code),
+            background: self.theme.code_background,
+            ..Default::default()
+        }
+    }
+
+    /// The background of a code block's rows, out to the pane's edge.
+    fn code_fill(&self) -> Option<Style> {
+        self.theme.code_background.map(|background| Style {
+            background: Some(background),
+            ..Default::default()
+        })
+    }
+
+    /// What a line inside the open blocks starts with when it is not the
+    /// first of a list item: the quotes' bars and the lists' indents. A
+    /// line's later rows hang under it.
+    fn indent(&self) -> Vec<(String, Style)> {
+        self.blocks
+            .iter()
+            .map(|block| match block {
+                Block::Quote { bar, .. } => (
+                    "│ ".to_string(),
+                    Style {
+                        foreground: Some(*bar),
+                        ..Default::default()
+                    },
+                ),
+                Block::List { width, .. } | Block::Indent { width } => {
+                    (" ".repeat(*width), Style::default())
+                }
+            })
+            .collect()
+    }
+
+    /// Starts a line with the quote bars and list indentation it needs,
+    /// after the blank line owed before it.
     fn begin_line(&mut self) {
         if !self.out.current.is_empty() {
             return;
         }
-        let marker = self.marker_style();
-        for _ in 0..self.quotes {
-            self.out.push("│ ", marker);
+        let mut indent = self.indent();
+        // The gap is plain, whatever the block before it was.
+        self.out.set_hang(Vec::new());
+        self.out.set_word_wrap(true);
+        self.out.set_fill(None);
+        if std::mem::take(&mut self.gap) && self.out.lines > 0 {
+            let quoted = self
+                .blocks
+                .iter()
+                .any(|block| matches!(block, Block::Quote { .. }));
+            if quoted {
+                // The quote's bar runs through the gap.
+                for (text, style) in &indent {
+                    self.out.push(text, *style);
+                }
+                self.out.end_line();
+            } else {
+                self.out.blank_line();
+            }
         }
-        let Some((current, outer)) = self.lists.split_last() else {
-            return;
-        };
-        let indent: usize = outer.iter().map(|list| list.width).sum();
-        if indent > 0 {
-            self.out.push(&" ".repeat(indent), Style::default());
+        self.out.set_hang(indent.clone());
+        // The innermost list or footnote takes the marker.
+        if let Some(marker) = self.marker.take() {
+            let marked = self
+                .blocks
+                .iter()
+                .rposition(|block| !matches!(block, Block::Quote { .. }));
+            if let Some(index) = marked {
+                indent[index] = (marker, self.marker_style());
+            }
         }
-        match self.marker.take() {
-            Some(text) => self.out.push(&text, marker),
-            None => self.out.push(&" ".repeat(current.width), Style::default()),
+        for (text, style) in &indent {
+            self.out.push(text, *style);
         }
     }
 
-    fn text(&mut self, text: &str) {
+    /// Text in the line being written, or in the table cell being read.
+    fn inline(&mut self, text: &str, style: Style) {
         if let Some(table) = &mut self.table {
             if let Some(cell) = table.rows.last_mut().and_then(|row| row.last_mut()) {
-                cell.push_str(text);
+                match cell.last_mut() {
+                    Some((last, last_style)) if *last_style == style => last.push_str(text),
+                    _ => cell.push((text.to_string(), style)),
+                }
             }
             return;
         }
         self.begin_line();
-        let style = self.style();
         self.out.push(text, style);
     }
 
+    /// Text a reader sees, which a link around it is shown for.
+    fn shown(&mut self, text: &str, style: Style) {
+        for link in &mut self.links {
+            link.text.push_str(text);
+        }
+        self.inline(text, style);
+    }
+
+    fn text(&mut self, text: &str) {
+        let style = self.style();
+        self.shown(text, style);
+    }
+
+    /// Ends the block being written, leaving a blank line before the next.
     fn end_block(&mut self) {
         self.out.finish_line();
-        if self.lists.is_empty() {
-            self.out.blank_line();
-        }
+        self.gap = true;
     }
 
     fn event(&mut self, event: Event<'_>) {
@@ -340,59 +509,59 @@ impl<'a> Markdown<'a> {
             Event::Start(tag) => self.start(tag),
             Event::End(tag) => self.end(tag),
             Event::Text(text) if self.code_block => self.code_lines(&text),
+            Event::Text(text) if self.metadata => self.metadata_lines(&text),
             Event::Text(text) => self.text(&text),
-            Event::Code(code) => {
-                if self.table.is_some() {
-                    return self.text(&code);
-                }
-                self.begin_line();
-                let style = Style {
-                    foreground: Some(self.theme.code),
-                    background: self.theme.code_background,
-                    ..Default::default()
-                };
-                self.out.push(&code, style);
+            Event::Code(code) | Event::InlineMath(code) | Event::DisplayMath(code) => {
+                let style = self.code_style();
+                self.shown(&code, style);
             }
-            Event::Html(html) | Event::InlineHtml(html) => {
-                for line in html.lines() {
-                    self.begin_line();
-                    let style = Style {
-                        flags: FAINT,
-                        ..self.style()
-                    };
-                    self.out.push(line, style);
-                    if html.ends_with('\n') {
-                        self.out.end_line();
-                    }
-                }
-            }
+            Event::Html(html) => self.html(&html, true),
+            Event::InlineHtml(html) => self.html(&html, false),
             Event::SoftBreak => self.text(" "),
-            Event::HardBreak => self.out.end_line(),
+            Event::HardBreak if self.table.is_some() => self.text(" "),
+            Event::HardBreak => {
+                self.begin_line();
+                self.out.end_line();
+            }
             Event::Rule => {
                 self.out.finish_line();
-                let style = self.marker_style();
-                self.out.line_of(&"─".repeat(40), style);
-                self.out.blank_line();
-            }
-            Event::TaskListMarker(done) => {
                 self.begin_line();
                 let style = self.marker_style();
-                self.out.push(if done { "[x] " } else { "[ ] " }, style);
+                self.out.rule(style);
+                self.gap = true;
             }
-            Event::FootnoteReference(name) => self.text(&format!("[{name}]")),
-            Event::InlineMath(math) | Event::DisplayMath(math) => self.text(&math),
+            Event::TaskListMarker(done) => {
+                let box_ = if done { "[x] " } else { "[ ] " };
+                if self.marker.is_some() {
+                    // The box stands in for the item's bullet.
+                    self.marker = Some(box_.into());
+                    if let Some(Block::List { width, .. }) = self
+                        .blocks
+                        .iter_mut()
+                        .rev()
+                        .find(|block| matches!(block, Block::List { .. }))
+                    {
+                        *width = box_.len();
+                    }
+                } else {
+                    let style = self.marker_style();
+                    self.inline(box_, style);
+                }
+            }
+            Event::FootnoteReference(name) => {
+                let style = Style {
+                    foreground: Some(self.theme.link),
+                    ..Default::default()
+                };
+                self.shown(&format!("[{name}]"), style);
+            }
         }
     }
 
     fn code_lines(&mut self, text: &str) {
-        let style = Style {
-            foreground: Some(self.theme.code),
-            background: self.theme.code_background,
-            ..Default::default()
-        };
+        let style = self.code_style();
         for line in text.split_inclusive('\n') {
-            self.begin_line();
-            self.out.push("  ", style);
+            self.begin_code_line();
             let pieces = self
                 .highlighter
                 .as_mut()
@@ -427,77 +596,240 @@ impl<'a> Markdown<'a> {
         }
     }
 
+    /// Starts a line of a code block, unless it has started: code keeps its
+    /// columns, so it breaks where the row ends, and its background runs to
+    /// the pane's edge.
+    fn begin_code_line(&mut self) {
+        if !self.out.current.is_empty() {
+            return;
+        }
+        self.begin_line();
+        let style = self.code_style();
+        let mut hang = self.indent();
+        hang.push(("  ".into(), style));
+        self.out.set_hang(hang);
+        self.out.set_word_wrap(false);
+        let fill = self.code_fill();
+        self.out.set_fill(fill);
+        self.out.push("  ", style);
+    }
+
+    /// Front matter, shown as it is written.
+    fn metadata_lines(&mut self, text: &str) {
+        let style = Style {
+            flags: FAINT,
+            ..self.marker_style()
+        };
+        for line in text.lines() {
+            self.begin_line();
+            self.out.set_word_wrap(false);
+            self.out.push(line, style);
+            self.out.end_line();
+        }
+    }
+
+    /// `html` without the comments in it; one can end in a later piece.
+    fn without_comments(&mut self, html: &str) -> String {
+        let mut shown = String::new();
+        let mut rest = html;
+        loop {
+            let (mark, keep) = if self.comment {
+                ("-->", false)
+            } else {
+                ("<!--", true)
+            };
+            let Some(at) = rest.find(mark) else {
+                if keep {
+                    shown.push_str(rest);
+                }
+                return shown;
+            };
+            if keep {
+                shown.push_str(&rest[..at]);
+            }
+            rest = &rest[at + mark.len()..];
+            self.comment = !self.comment;
+        }
+    }
+
+    /// HTML is shown as it is written, faint, but for comments, which are
+    /// left out, and line breaks, which break the line.
+    fn html(&mut self, html: &str, block: bool) {
+        let shown = self.without_comments(html);
+        let style = Style {
+            flags: FAINT,
+            ..self.style()
+        };
+        if block {
+            for line in shown.lines().filter(|line| !line.trim().is_empty()) {
+                self.begin_line();
+                self.out.push(line, style);
+                self.out.end_line();
+            }
+            return;
+        }
+        let tag: String = shown
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect::<String>()
+            .to_ascii_lowercase();
+        if tag == "<br>" || tag == "<br/>" {
+            if self.table.is_some() {
+                self.inline(" ", style);
+            } else {
+                self.begin_line();
+                self.out.end_line();
+            }
+        } else if !shown.is_empty() {
+            self.inline(&shown, style);
+        }
+    }
+
     fn start(&mut self, tag: Tag<'_>) {
         match tag {
             Tag::Paragraph => {}
             Tag::Heading { level, .. } => {
-                self.out.finish_line();
+                // A heading stands apart from what is above it.
+                self.end_block();
                 self.heading = Some(level);
-                let scale = self.theme.heading_scales.get(level as usize - 1);
-                self.out.set_scale(scale.copied().unwrap_or(1.0));
+                let scale = self.theme.heading_scales.get(level as usize - 1).copied();
+                self.begin_line();
+                self.out.set_scale(scale.unwrap_or(1.0));
             }
-            Tag::BlockQuote(_) => {
+            Tag::BlockQuote(kind) => {
                 self.out.finish_line();
-                self.quotes += 1;
+                let alert = kind.map(|kind| match kind {
+                    BlockQuoteKind::Note => ("Note", 0),
+                    BlockQuoteKind::Tip => ("Tip", 1),
+                    BlockQuoteKind::Important => ("Important", 2),
+                    BlockQuoteKind::Warning => ("Warning", 3),
+                    BlockQuoteKind::Caution => ("Caution", 4),
+                });
+                let Some((title, index)) = alert else {
+                    self.blocks.push(Block::Quote {
+                        bar: self.theme.marker,
+                        plain: true,
+                    });
+                    return;
+                };
+                let color = self.theme.alerts[index];
+                self.blocks.push(Block::Quote {
+                    bar: color,
+                    plain: false,
+                });
+                self.begin_line();
+                let style = Style {
+                    foreground: Some(color),
+                    flags: BOLD,
+                    ..Default::default()
+                };
+                self.out.push(title, style);
+                self.out.end_line();
             }
             Tag::CodeBlock(kind) => {
                 self.out.finish_line();
                 if let CodeBlockKind::Fenced(language) = kind
                     && !language.is_empty()
                 {
-                    self.begin_line();
-                    let style = Style {
-                        flags: FAINT,
-                        ..self.marker_style()
-                    };
-                    self.out.push(&language, style);
-                    self.out.end_line();
+                    if !PLAIN_LANGUAGES.contains(&language.as_ref()) {
+                        self.begin_line();
+                        let style = Style {
+                            flags: FAINT,
+                            background: self.theme.code_background,
+                            ..self.marker_style()
+                        };
+                        let fill = self.code_fill();
+                        self.out.set_fill(fill);
+                        self.out.push(&language, style);
+                        self.out.end_line();
+                    }
                     self.highlighter = highlighter(&language, self.theme.code_theme.as_deref());
                 }
                 self.code_block = true;
             }
             Tag::List(start) => {
                 self.out.finish_line();
-                self.lists.push(List {
+                self.blocks.push(Block::List {
                     next: start,
                     width: 2,
                 });
             }
             Tag::Item => {
                 self.out.finish_line();
-                if let Some(list) = self.lists.last_mut() {
-                    let marker = match &mut list.next {
+                let depth = self
+                    .blocks
+                    .iter()
+                    .filter(|block| matches!(block, Block::List { .. }))
+                    .count();
+                if let Some(Block::List { next, width }) = self
+                    .blocks
+                    .iter_mut()
+                    .rev()
+                    .find(|block| matches!(block, Block::List { .. }))
+                {
+                    let marker = match next {
                         Some(number) => {
                             *number += 1;
                             format!("{}. ", *number - 1)
                         }
-                        None => "• ".into(),
+                        None => BULLETS[(depth - 1) % BULLETS.len()].into(),
                     };
-                    list.width = UnicodeWidthStr::width(marker.as_str());
+                    *width = UnicodeWidthStr::width(marker.as_str());
                     self.marker = Some(marker);
                 }
+            }
+            Tag::FootnoteDefinition(name) => {
+                self.out.finish_line();
+                let marker = format!("[{name}] ");
+                self.blocks.push(Block::Indent {
+                    width: UnicodeWidthStr::width(marker.as_str()),
+                });
+                self.marker = Some(marker);
+            }
+            Tag::DefinitionListTitle => {
+                self.out.finish_line();
+                self.term = true;
+            }
+            Tag::DefinitionListDefinition => {
+                self.out.finish_line();
+                self.blocks.push(Block::Indent { width: 2 });
+            }
+            Tag::MetadataBlock(_) => {
+                self.out.finish_line();
+                self.metadata = true;
             }
             Tag::Emphasis => self.flags |= ITALIC,
             Tag::Strong => self.flags |= BOLD,
             Tag::Strikethrough => self.flags |= STRIKE,
-            Tag::Link { .. } | Tag::Image { .. } => self.links += 1,
-            Tag::Table(_) => {
+            Tag::Link { dest_url, .. } => self.links.push(Link {
+                destination: dest_url.to_string(),
+                text: String::new(),
+                image: false,
+            }),
+            Tag::Image { dest_url, .. } => {
+                let style = self.marker_style();
+                self.inline("[image: ", style);
+                self.links.push(Link {
+                    destination: dest_url.to_string(),
+                    text: String::new(),
+                    image: true,
+                });
+            }
+            Tag::Table(alignments) => {
                 self.out.finish_line();
-                self.table = Some(Table::default());
+                self.table = Some(Table {
+                    alignments,
+                    ..Table::default()
+                });
             }
-            Tag::TableHead => {
-                if let Some(table) = &mut self.table {
-                    table.rows.push(Vec::new());
-                }
-            }
-            Tag::TableRow => {
+            Tag::TableHead | Tag::TableRow => {
                 if let Some(table) = &mut self.table {
                     table.rows.push(Vec::new());
                 }
             }
             Tag::TableCell => {
                 if let Some(row) = self.table.as_mut().and_then(|t| t.rows.last_mut()) {
-                    row.push(String::new());
+                    row.push(Vec::new());
                 }
             }
             _ => {}
@@ -506,19 +838,16 @@ impl<'a> Markdown<'a> {
 
     fn end(&mut self, tag: TagEnd) {
         match tag {
-            TagEnd::Paragraph => self.end_block(),
+            TagEnd::Paragraph | TagEnd::HtmlBlock => self.end_block(),
             TagEnd::Heading(_) => {
                 self.heading = None;
-                self.out.finish_line();
+                self.end_block();
                 self.out.set_scale(1.0);
-                self.out.blank_line();
             }
             TagEnd::BlockQuote(_) => {
                 self.out.finish_line();
-                self.quotes -= 1;
-                if self.quotes == 0 && self.lists.is_empty() {
-                    self.out.blank_line();
-                }
+                self.blocks.pop();
+                self.gap = true;
             }
             TagEnd::CodeBlock => {
                 self.code_block = false;
@@ -527,10 +856,12 @@ impl<'a> Markdown<'a> {
             }
             TagEnd::List(_) => {
                 self.out.finish_line();
-                self.lists.pop();
-                if self.lists.is_empty() {
-                    self.out.blank_line();
-                }
+                self.blocks.pop();
+                // A list inside another's item ends without a gap.
+                self.gap = !self
+                    .blocks
+                    .iter()
+                    .any(|block| matches!(block, Block::List { .. }));
             }
             TagEnd::Item => {
                 // An item with no text still shows its marker.
@@ -539,10 +870,33 @@ impl<'a> Markdown<'a> {
                 }
                 self.out.finish_line();
             }
+            TagEnd::FootnoteDefinition => {
+                if self.marker.is_some() {
+                    self.begin_line();
+                }
+                self.out.finish_line();
+                self.blocks.pop();
+                self.gap = true;
+            }
+            TagEnd::DefinitionListTitle => {
+                self.out.finish_line();
+                self.term = false;
+                self.gap = false;
+            }
+            TagEnd::DefinitionListDefinition => {
+                self.out.finish_line();
+                self.blocks.pop();
+                self.gap = false;
+            }
+            TagEnd::DefinitionList => self.end_block(),
+            TagEnd::MetadataBlock(_) => {
+                self.metadata = false;
+                self.end_block();
+            }
             TagEnd::Emphasis => self.flags &= !ITALIC,
             TagEnd::Strong => self.flags &= !BOLD,
             TagEnd::Strikethrough => self.flags &= !STRIKE,
-            TagEnd::Link | TagEnd::Image => self.links -= 1,
+            TagEnd::Link | TagEnd::Image => self.end_link(),
             TagEnd::TableHead => {
                 if let Some(table) = &mut self.table {
                     table.head_rows = table.rows.len();
@@ -558,42 +912,87 @@ impl<'a> Markdown<'a> {
         }
     }
 
-    /// Cells padded to their column's widest, between bars.
+    /// After a link's text, where it goes, unless the text says so. An
+    /// image is its description, or its address where it has none.
+    fn end_link(&mut self) {
+        let Some(link) = self.links.pop() else {
+            return;
+        };
+        let style = Style {
+            flags: FAINT,
+            ..self.marker_style()
+        };
+        if link.image {
+            if link.text.is_empty() {
+                let address = self.style();
+                self.inline(&link.destination, address);
+            }
+            let style = self.marker_style();
+            self.inline("]", style);
+            return;
+        }
+        let destination = link.destination.as_str();
+        let said = destination == link.text
+            || destination.strip_prefix("mailto:") == Some(link.text.as_str());
+        // A link to a place in the document goes nowhere a reader can follow.
+        if self.theme.link_destinations
+            && !destination.is_empty()
+            && !destination.starts_with('#')
+            && !said
+            && self.heading.is_none()
+        {
+            self.inline(&format!(" ({destination})"), style);
+        }
+    }
+
+    /// Cells padded to their column's widest, between bars, each column
+    /// aligned as the table says.
     fn table_lines(&mut self, table: Table) {
         let columns = table.rows.iter().map(Vec::len).max().unwrap_or(0);
-        let width = |cell: &str| UnicodeWidthStr::width(cell);
         let widths: Vec<usize> = (0..columns)
             .map(|column| {
                 table
                     .rows
                     .iter()
                     .filter_map(|row| row.get(column))
-                    .map(|cell| width(cell))
+                    .map(|cell| cell_width(cell))
                     .max()
                     .unwrap_or(0)
             })
             .collect();
         let bar = self.marker_style();
+        let plain = self.style();
         for (index, row) in table.rows.iter().enumerate() {
             self.begin_line();
-            let style = Style {
-                flags: if index < table.head_rows { BOLD } else { 0 },
-                ..self.style()
-            };
-            for (column, cell_width) in widths.iter().enumerate() {
+            // A row keeps its columns, so it breaks where the pane ends.
+            self.out.set_word_wrap(false);
+            for (column, width) in widths.iter().enumerate() {
                 if column > 0 {
                     self.out.push(" │ ", bar);
                 }
-                let cell = row.get(column).map_or("", String::as_str);
-                self.out.push(cell, style);
-                let pad = cell_width - width(cell);
-                if pad > 0 && column + 1 < widths.len() {
-                    self.out.push(&" ".repeat(pad), style);
+                let cell = row.get(column).map_or(&[][..], Vec::as_slice);
+                let pad = width - cell_width(cell);
+                let (before, after) = match table.alignments.get(column) {
+                    Some(Alignment::Right) => (pad, 0),
+                    Some(Alignment::Center) => (pad / 2, pad - pad / 2),
+                    _ => (0, pad),
+                };
+                self.out.push(&" ".repeat(before), plain);
+                for (text, style) in cell {
+                    let style = Style {
+                        flags: style.flags | if index < table.head_rows { BOLD } else { 0 },
+                        ..*style
+                    };
+                    self.out.push(text, style);
+                }
+                if column + 1 < widths.len() {
+                    self.out.push(&" ".repeat(after), plain);
                 }
             }
             self.out.end_line();
             if index + 1 == table.head_rows {
                 self.begin_line();
+                self.out.set_word_wrap(false);
                 let rule: Vec<String> = widths.iter().map(|w| "─".repeat(*w)).collect();
                 self.out.push(&rule.join("─┼─"), bar);
                 self.out.end_line();
@@ -629,7 +1028,7 @@ mod tests {
     fn lists_nest_with_markers_and_continuations() {
         assert_eq!(
             lines("- one\n- two\n  - inner\n3. three\n4. four"),
-            ["• one", "• two", "  • inner", "", "3. three", "4. four", ""]
+            ["• one", "• two", "  ◦ inner", "", "3. three", "4. four", ""]
         );
     }
 
@@ -678,6 +1077,7 @@ mod tests {
                 ("x", 0, Some(theme.code)),
                 (" ", 0, None),
                 ("link", 0, Some(theme.link)),
+                (" (u)", FAINT, Some(theme.marker)),
             ]
         );
     }
@@ -752,6 +1152,184 @@ mod tests {
             line.iter()
                 .all(|(_, s)| s.background == theme.code_background)
         );
+    }
+
+    /// The rows `markdown` takes in a pane `columns` cells wide: where each
+    /// row's text starts, and the text.
+    fn laid_out(markdown: &str, columns: usize) -> Vec<(u32, String)> {
+        use nfm_egui::copy_document::CopyDocument;
+        let mut writer = DocumentWriter::default();
+        writer.markdown(markdown, &Theme::default());
+        let layout = writer
+            .finish()
+            .layout(columns, &nfm_egui::Cancellation::never())
+            .unwrap();
+        (0..layout.total_rows() as u64)
+            .map(|y| {
+                let row = layout.text_row(y).unwrap().unwrap().text;
+                (row.columns[0], row.text.trim_end().to_string())
+            })
+            .collect()
+    }
+    fn row(start: u32, text: &str) -> (u32, String) {
+        (start, text.to_string())
+    }
+
+    #[test]
+    fn long_lines_break_between_words_and_hang_under_their_block() {
+        assert_eq!(
+            laid_out("- one two three four\n  - five six seven eight", 12),
+            [
+                row(0, "• one two"),
+                row(2, "three four"),
+                // A row keeps a cell for the space its last word ends with.
+                row(0, "  ◦ five"),
+                row(4, "six"),
+                row(4, "seven"),
+                row(4, "eight"),
+                row(0, ""),
+            ]
+        );
+        assert_eq!(
+            laid_out("> quoted words go on\n\n1. numbered item text", 15),
+            [
+                row(0, "│ quoted words"),
+                row(2, "go on"),
+                row(0, ""),
+                row(0, "1. numbered"),
+                row(3, "item text"),
+                row(0, ""),
+            ]
+        );
+        // Code and tables keep their columns: they break where the row ends.
+        assert_eq!(
+            laid_out("```\nlet value = compute();\n```", 14),
+            [row(0, "  let value ="), row(2, "compute();"), row(0, "")]
+        );
+    }
+
+    #[test]
+    fn blocks_inside_quotes_and_lists_keep_their_gaps() {
+        assert_eq!(
+            lines("> one\n>\n> two\n\nafter"),
+            ["│ one", "│ ", "│ two", "", "after", ""]
+        );
+        assert_eq!(
+            lines("- one\n\n  more\n\n- two"),
+            ["• one", "", "  more", "", "• two", ""]
+        );
+        assert_eq!(
+            lines("- [x] done\n- [ ] open\n- plain"),
+            ["[x] done", "[ ] open", "• plain", ""]
+        );
+        assert_eq!(
+            lines("- a\n  - b\n    - c\n      - d"),
+            ["• a", "  ◦ b", "    ▪ c", "      • d", ""]
+        );
+    }
+
+    #[test]
+    fn table_cells_keep_their_styles_and_columns_their_alignment() {
+        let theme = Theme::default();
+        let writer = written("| name | n | mid |\n|:--|--:|:-:|\n| `a` | 1 | x |\n| bb | 22 | yyy |");
+        assert_eq!(
+            writer.texts(),
+            [
+                "name │  n │ mid",
+                "─────┼────┼────",
+                "a    │  1 │  x",
+                "bb   │ 22 │ yyy",
+                ""
+            ]
+        );
+        let head = &writer.rows[0][0];
+        assert_eq!((head.0.as_str(), head.1.flags), ("name", BOLD));
+        let code = &writer.rows[2][0];
+        assert_eq!((code.0.as_str(), code.1.foreground), ("a", Some(theme.code)));
+    }
+
+    #[test]
+    fn links_say_where_they_go_and_images_what_they_are() {
+        assert_eq!(
+            lines("[site](https://x.test) <https://y.test> [top](#top)"),
+            ["site (https://x.test) https://y.test top", ""]
+        );
+        assert_eq!(
+            lines("![a chart](c.png) ![](d.png)"),
+            ["[image: a chart] [image: d.png]", ""]
+        );
+        let quiet = Theme {
+            link_destinations: false,
+            ..Theme::default()
+        };
+        let mut writer = DocumentWriter::default();
+        writer.markdown("[site](https://x.test)", &quiet);
+        assert_eq!(writer.texts(), ["site", ""]);
+    }
+
+    #[test]
+    fn footnotes_alerts_terms_and_front_matter_are_laid_out() {
+        assert_eq!(
+            lines("Text[^1].\n\n[^1]: The note."),
+            ["Text[1].", "", "[1] The note.", ""]
+        );
+        let theme = Theme::default();
+        let alert = written("> [!WARNING]\n> Careful.");
+        assert_eq!(alert.texts(), ["│ Warning", "│ Careful.", ""]);
+        assert_eq!(alert.rows[0][0].1.foreground, Some(theme.alerts[3]));
+        assert_eq!(alert.rows[0][1].1.flags, BOLD);
+        // An alert's text is the text color, not a quote's.
+        assert_eq!(alert.rows[1][1].1.foreground, None);
+        assert_eq!(
+            lines("Term\n: What it means.\n\nAfter"),
+            ["Term", "  What it means.", "", "After", ""]
+        );
+        assert_eq!(
+            lines("---\ntitle: T\n---\n\n# Head {#id}"),
+            ["title: T", "", "Head", ""]
+        );
+        assert_eq!(lines("Cost $x^2$ here"), ["Cost x^2 here", ""]);
+    }
+
+    #[test]
+    fn html_comments_are_left_out_and_breaks_break() {
+        assert_eq!(
+            lines("<!-- hidden\nover lines -->\n\none<br>two <!-- no --> three\n\n<div>\nkept\n</div>"),
+            ["one", "two  three", "", "<div>", "kept", "</div>", ""]
+        );
+    }
+
+    #[test]
+    fn code_and_rules_run_to_the_edge_and_plain_fences_have_no_label() {
+        use nfm_egui::copy_document::CopyDocument;
+        use nfm_egui::egui::Color32;
+        assert_eq!(lines("```text\nplain\n```"), ["  plain", ""]);
+        let theme = Theme::default();
+        let mut writer = DocumentWriter::default();
+        writer.markdown("```\ncode\n```\n\n---\n\nend", &theme);
+        assert_eq!(writer.texts(), ["  code", "", "", "", "end", ""]);
+        let layout = writer
+            .finish()
+            .layout(10, &nfm_egui::Cancellation::never())
+            .unwrap();
+        let appearance = nfm_egui::Appearance::default();
+        let nfm_egui::Preview::Grid { cells, .. } = layout.viewport(0, 3, &appearance).unwrap()
+        else {
+            panic!("layouts page as grids");
+        };
+        // The code's background, and the rule, reach the last cell.
+        assert_eq!(cells[9].background, theme.code_background.unwrap());
+        assert_ne!(cells[19].background, theme.code_background.unwrap());
+        assert!(cells[20].strikethrough && cells[29].strikethrough);
+        assert_ne!(cells[29].foreground, Color32::TRANSPARENT);
+    }
+
+    #[test]
+    fn deeper_headings_differ_by_weight() {
+        let flags = |markdown: &str| written(markdown).rows[0][0].1.flags;
+        assert_eq!(flags("#### Four"), BOLD);
+        assert_eq!(flags("##### Five"), BOLD | ITALIC);
+        assert_eq!(flags("###### Six"), BOLD | FAINT);
     }
 
     #[test]

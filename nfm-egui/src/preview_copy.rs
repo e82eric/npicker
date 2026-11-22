@@ -837,6 +837,47 @@ mod yank_paint_tests {
     }
 
     #[test]
+    fn words_are_walked_across_rows_that_hang_under_their_line() {
+        let ctx = Context::default();
+        let text = "│ one two three";
+        let columns: Vec<u32> = text
+            .chars()
+            .enumerate()
+            .flat_map(|(x, c)| std::iter::repeat_n(x as u32, c.len_utf8()))
+            .collect();
+        let format = crate::styled_document::LineFormat {
+            word_wrap: true,
+            hang: vec![("│ ".into(), Default::default())],
+            ..Default::default()
+        };
+        let mut builder = crate::styled_document::DocumentBuilder::default();
+        builder.push_line(text, &columns, &[], &format).unwrap();
+        let layout = builder
+            .finish()
+            .layout(12, &crate::Cancellation::test())
+            .unwrap();
+        let mut copy = PreviewCopyMode::host(layout, 0, 4).unwrap();
+        // The rows are "│ one two" and, under it, "│ three".
+        paint(&ctx, &mut copy, &[key(Key::W), key(Key::W)]);
+        assert_eq!(copy.mode.cursor, CellPosition { x: 6, y: 0 });
+        // The next word is past the second row's hang, which is not text.
+        paint(&ctx, &mut copy, &[key(Key::W)]);
+        assert_eq!(copy.mode.cursor, CellPosition { x: 2, y: 1 });
+        let output = paint(&ctx, &mut copy, &[key(Key::B)]);
+        assert_eq!(copy.mode.cursor, CellPosition { x: 6, y: 0 });
+        // The hang is still drawn while copying: a bar on each row.
+        fn bars(shape: &egui::Shape) -> usize {
+            match shape {
+                egui::Shape::Text(text) => usize::from(text.galley.text() == "│"),
+                egui::Shape::Vec(shapes) => shapes.iter().map(bars).sum(),
+                _ => 0,
+            }
+        }
+        let drawn: usize = output.shapes.iter().map(|clipped| bars(&clipped.shape)).sum();
+        assert_eq!(drawn, 2);
+    }
+
+    #[test]
     fn larger_rows_stay_in_view_under_the_cursor_and_the_last_page_is_reached() {
         let ctx = Context::default();
         let mut copy = sized(&[
@@ -2217,7 +2258,10 @@ impl PreviewCopyMode {
             // than the compatibility viewport's fixed codepoint buffer.
             let source = self.document.row(absolute);
             if let Some(source) = &source {
-                for cell in row.iter_mut() {
+                // Cells before the row's text, such as a hanging indent,
+                // keep what they were drawn with.
+                let first = source.text.columns.first().map_or(0, |x| *x as usize);
+                for cell in row.iter_mut().skip(first) {
                     cell.text.clear();
                 }
                 for (byte, text) in source.text.text.grapheme_indices(true) {
