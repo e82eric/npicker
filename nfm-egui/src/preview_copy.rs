@@ -818,6 +818,107 @@ mod yank_paint_tests {
         assert_eq!(cells[0].background, appearance.palette.background);
     }
 
+    /// A viewport four text rows tall on lines drawn at the given sizes.
+    fn sized(lines: &[(&str, f32)]) -> PreviewCopyMode {
+        let mut builder = crate::styled_document::DocumentBuilder::default();
+        for (text, scale) in lines {
+            let columns: Vec<u32> = (0..text.len() as u32).collect();
+            builder
+                .push_row_scaled(text, &columns, false, &[], None, *scale)
+                .unwrap();
+        }
+        let layout = builder
+            .finish()
+            .layout(8, &crate::Cancellation::test())
+            .unwrap();
+        let mut copy = PreviewCopyMode::host(layout, 0, 4).unwrap();
+        copy.set_scroll_padding(0);
+        copy
+    }
+
+    #[test]
+    fn larger_rows_stay_in_view_under_the_cursor_and_the_last_page_is_reached() {
+        let ctx = Context::default();
+        let mut copy = sized(&[
+            ("one", 1.0),
+            ("two", 1.0),
+            ("HEAD", 2.0),
+            ("three", 1.0),
+            ("TAIL", 2.0),
+            ("four", 1.0),
+        ]);
+        // The pane holds two rows of text and the heading, which is two tall.
+        assert_eq!(copy.rows_in_view(4), 3);
+        assert_eq!(copy.row_scales(4), [1.0, 1.0, 2.0, 1.0]);
+        // The row cut off at the pane's end is still numbered.
+        assert_eq!(copy.line_numbers(4, crate::picker::PreviewLineNumbers::Absolute, false).len(), 4);
+        // Counting four rows from the top would leave the cursor's out of view.
+        paint(&ctx, &mut copy, &[key(Key::J), key(Key::J), key(Key::J)]);
+        assert_eq!((copy.mode.cursor.y, copy.top), (3, 1));
+        // The last page is the three rows that fit, not the last four.
+        let end = Event::Key {
+            key: Key::G,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers::SHIFT,
+        };
+        paint(&ctx, &mut copy, &[end]);
+        assert_eq!((copy.mode.cursor.y, copy.top), (5, 3));
+        paint(&ctx, &mut copy, &[key(Key::G), key(Key::G)]);
+        assert_eq!((copy.mode.cursor.y, copy.top), (0, 0));
+        // Scrolling reaches the last page too, and keeps the cursor in view.
+        copy.scroll(10, 4);
+        assert_eq!((copy.top, copy.mode.cursor.y), (3, 3));
+        copy.scroll(10, 4);
+        assert_eq!((copy.top, copy.mode.cursor.y), (3, 3));
+        copy.scroll(-10, 4);
+        assert_eq!((copy.top, copy.mode.cursor.y), (0, 2));
+        // The cursor does not leave the cells a larger row has room for.
+        paint(&ctx, &mut copy, &[key(Key::L), key(Key::L), key(Key::L), key(Key::L)]);
+        assert_eq!(copy.mode.cursor, CellPosition { x: 3, y: 2 });
+    }
+
+    #[test]
+    fn a_selection_is_filled_beside_rows_of_their_own_height() {
+        let ctx = Context::default();
+        let mut copy = sized(&[("HEAD", 2.0), ("text", 1.0), ("more", 1.0)]);
+        let mut height = 0.0;
+        let mut origin = egui::Pos2::ZERO;
+        let visual = Event::Key {
+            key: Key::V,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers::SHIFT,
+        };
+        let events = [visual, key(Key::J)];
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            ui.spacing_mut().item_spacing = egui::Vec2::ZERO;
+            height = Appearance::default().typography.preview_row_height(ui.ctx());
+            origin = ui.cursor().min;
+            copy.input(ui.ctx(), &events, 4);
+            copy.paint(ui, &Appearance::default(), 4);
+        });
+        output.textures_delta.clear();
+        // Linewise rows are filled across the pane: the heading's twice as
+        // tall as the text's, which starts below it.
+        let color = Appearance::default().palette.preview_selection_background;
+        let fills: Vec<(f32, f32)> = output
+            .shapes
+            .iter()
+            .filter_map(|shape| match &shape.shape {
+                egui::Shape::Rect(rect)
+                    if rect.fill == color && rect.rect.left() == origin.x && rect.rect.width() > 100.0 =>
+                {
+                    Some((rect.rect.top() - origin.y, rect.rect.height()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(fills, [(0.0, 2.0 * height), (2.0 * height, height)]);
+    }
+
     fn paint(ctx: &Context, copy: &mut PreviewCopyMode, events: &[Event]) -> egui::FullOutput {
         let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
             copy.input(ui.ctx(), events, 4);
@@ -1061,6 +1162,40 @@ impl PinnedDocument {
     fn grid(&self, top: u64, rows: usize, appearance: &Appearance) -> Option<Preview> {
         self.handle.viewport(top, rows, appearance).ok()
     }
+    /// Whether any row is larger than the text size, so that how many are in
+    /// view depends on which.
+    fn scaled(&self) -> bool {
+        self.handle.scaled()
+    }
+    /// How many rows from `top` are wholly in view in a pane `rows` text
+    /// rows tall; rows past the end count as text rows.
+    fn in_view(&self, top: u64, rows: usize) -> usize {
+        if !self.scaled() {
+            return rows.max(1);
+        }
+        crate::styled_document::rows_in_view(
+            |y| self.handle.row_scale(y),
+            self.rows(),
+            top,
+            rows.max(1),
+        )
+    }
+    /// The first row of the last page of a pane `rows` text rows tall.
+    fn last_top(&self, rows: usize) -> u64 {
+        if !self.scaled() {
+            return self.rows().saturating_sub(rows as u64);
+        }
+        crate::styled_document::last_page_top(|y| self.handle.row_scale(y), self.rows(), rows)
+    }
+    /// Whether rows `top` to `bottom` are wholly in view together in a pane
+    /// `rows` text rows tall.
+    fn fits(&self, top: u64, bottom: u64, rows: usize) -> bool {
+        let count = bottom.saturating_sub(top).saturating_add(1);
+        count <= rows as u64 && {
+            let height: f32 = (top..=bottom).map(|y| self.handle.row_scale(y).max(1.0)).sum();
+            height <= rows as f32 + 0.001
+        }
+    }
 }
 
 /// A line-number gutter entry; `current` marks the focused cursor's line.
@@ -1163,7 +1298,7 @@ impl PreviewCopyMode {
             columns: self.document.columns(),
             total_rows: self.document.rows(),
             viewport_top: self.top,
-            viewport_rows: rows.max(1) as u32,
+            viewport_rows: self.document.in_view(self.top, rows) as u32,
         };
         self.quick_select = crate::quick_select::QuickSelect::new(
             self.mode.generation.unwrap_or(0),
@@ -1230,6 +1365,13 @@ impl PreviewCopyMode {
         };
         let mut previous = self.top.checked_sub(1).and_then(|y| self.line_of(y));
         let mut numbers = Vec::with_capacity(rows);
+        // Larger rows leave room for fewer; one more than fit is cut off at
+        // the pane's end, and numbered as far as it shows.
+        let rows = if self.document.scaled() {
+            (self.document.in_view(self.top, rows) + 1).min(rows)
+        } else {
+            rows
+        };
         for y in self.top..self.top.saturating_add(rows as u64) {
             let line = self.line_of(y);
             let starts = line != previous;
@@ -1249,6 +1391,23 @@ impl PreviewCopyMode {
             }));
         }
         numbers
+    }
+
+    /// How large each row from the top of a pane `rows` text rows tall is
+    /// drawn, for what is laid out beside them. Empty when every row is
+    /// text-sized.
+    pub(crate) fn row_scales(&self, rows: usize) -> Vec<f32> {
+        if !self.document.scaled() {
+            return Vec::new();
+        }
+        (self.top..self.top.saturating_add(rows as u64).min(self.document.rows()))
+            .map(|y| self.document.handle.row_scale(y))
+            .collect()
+    }
+
+    /// How many rows are wholly in view in a pane `rows` text rows tall.
+    pub(crate) fn rows_in_view(&self, rows: usize) -> usize {
+        self.document.in_view(self.top, rows)
     }
 
     pub(crate) fn valid(&self) -> bool {
@@ -1291,7 +1450,7 @@ impl PreviewCopyMode {
             rows,
         );
         // An anchor the viewport has scrolled away from leaves the cursor at its top.
-        let visible = copy.top..copy.top + rows.max(1) as u64;
+        let visible = copy.top..copy.top + copy.document.in_view(copy.top, rows) as u64;
         if let Some(anchor) = anchor.filter(|anchor| visible.contains(&anchor.y)) {
             let anchor = CellPosition {
                 x: anchor.x.min(metadata.columns - 1),
@@ -1316,13 +1475,13 @@ impl PreviewCopyMode {
     }
 
     fn new(document: PinnedDocument, revision: u64, top: usize, rows: usize) -> Self {
-        let top = (top as u64).min(document.rows().saturating_sub(rows as u64));
+        let top = (top as u64).min(document.last_top(rows));
         let view = View {
             cursor: CellPosition { x: 0, y: top },
             viewport_top: top,
             columns: document.columns(),
             total_rows: document.rows(),
-            viewport_rows: rows.max(1) as u32,
+            viewport_rows: document.in_view(top, rows) as u32,
         };
         let mut mode = CopyMode::default();
         mode.start(revision, view);
@@ -1350,17 +1509,77 @@ impl PreviewCopyMode {
         View {
             cursor: self.mode.cursor,
             viewport_top: self.top,
-            viewport_rows: rows.max(1) as u32,
+            // The engine counts rows; larger ones leave fewer in view.
+            viewport_rows: self.document.in_view(self.top, rows) as u32,
             columns: self.document.columns(),
             total_rows: self.document.rows(),
         }
     }
     fn reveal(&mut self, rows: usize) {
+        if self.document.scaled() {
+            return self.reveal_scaled(rows);
+        }
         self.top = crate::copy_controller::revealed_viewport_top(
             self.mode.cursor,
             self.view(rows),
             self.mode.scroll_padding(),
         );
+    }
+    /// `reveal` where rows differ in height. How many are in view depends on
+    /// where the viewport is, which the engine's row arithmetic cannot know:
+    /// it is moved no further than shows the cursor's row whole with its
+    /// margin. Where both margins cannot be kept, the one below is.
+    fn reveal_scaled(&mut self, rows: usize) {
+        let rows = rows.max(1);
+        let Some(last) = self.document.rows().checked_sub(1) else {
+            return;
+        };
+        let cursor = self.mode.cursor.y.min(last);
+        let padding = u64::from(self.mode.scroll_padding()).min((rows as u64 - 1) / 2);
+        let mut top = self
+            .top
+            .min(self.document.last_top(rows))
+            .min(cursor.saturating_sub(padding));
+        let below = cursor.saturating_add(padding).min(last);
+        while top < cursor && !self.document.fits(top, below, rows) {
+            top += 1;
+        }
+        self.top = top;
+    }
+    /// `scroll` where rows differ in height: the engine would stop short of
+    /// a last page that holds fewer rows than the pane does text rows.
+    fn scroll_scaled(&mut self, delta: isize, rows: usize) {
+        let rows = rows.max(1);
+        let last_top = self.document.last_top(rows);
+        let current = self.top.min(last_top);
+        let top = if delta >= 0 {
+            current.saturating_add(delta as u64).min(last_top)
+        } else {
+            current.saturating_sub(delta.unsigned_abs() as u64)
+        };
+        self.top = top;
+        // A scroll stopped at either end does not move the cursor.
+        if top == current {
+            return;
+        }
+        let in_view = (self.document.in_view(top, rows) as u64)
+            .min(self.document.rows().saturating_sub(top))
+            .max(1);
+        let padding = u64::from(self.mode.scroll_padding()).min((in_view - 1) / 2);
+        let cursor = self.mode.cursor;
+        let y = cursor.y.clamp(top + padding, top + in_view - 1 - padding);
+        if y != cursor.y
+            && let Some(target) = self.document.resolve(CellPosition { x: cursor.x, y }, false)
+        {
+            self.mode.moved(
+                if delta >= 0 {
+                    Motion::Down
+                } else {
+                    Motion::Up
+                },
+                target,
+            );
+        }
     }
     fn search(&mut self, ctx: &Context, pattern: &str, forward: bool, count: u32, regex: bool) {
         self.search_job = None;
@@ -1741,6 +1960,9 @@ impl PreviewCopyMode {
     }
 
     pub(crate) fn scroll(&mut self, delta: isize, rows: usize) {
+        if self.document.scaled() {
+            return self.scroll_scaled(delta, rows);
+        }
         let view = self.view(rows);
         match crate::copy_controller::CopyController::new(
             &mut self.mode,
@@ -1812,7 +2034,7 @@ impl PreviewCopyMode {
             return;
         };
         if let Some(quick) = &self.quick_select {
-            if quick.view.viewport_rows != rows.max(1) as u32
+            if quick.view.viewport_rows != self.document.in_view(self.top, rows) as u32
                 || previous_columns != self.viewport_columns
             {
                 let from_copy = quick.from_copy;
@@ -1945,8 +2167,20 @@ impl PreviewCopyMode {
             })
         {
             let origin = ui.cursor().min;
-            let row_height = appearance.typography.preview_row_height(ui.ctx());
-            for y in 0..cells.len() / columns {
+            let pane = egui::Rect::from_min_size(
+                origin,
+                egui::vec2(
+                    ui.available_width(),
+                    rows as f32 * appearance.typography.preview_row_height(ui.ctx()),
+                ),
+            );
+            let painter = ui.painter().with_clip_rect(pane.intersect(ui.clip_rect()));
+            let spans = preview::row_spans(
+                ui.ctx(),
+                &appearance.typography,
+                cells.chunks(columns).map(preview::row_scale),
+            );
+            for (y, (row_top, row_height)) in spans.into_iter().enumerate() {
                 let absolute = self.top + y as u64;
                 if absolute >= selection.range.start.y && absolute <= selection.range.end.y {
                     // The final characterwise row ends at its selected cell;
@@ -1957,15 +2191,16 @@ impl PreviewCopyMode {
                     let left = if !selection.linewise && absolute == selection.range.start.y {
                         selection.range.start.x.saturating_sub(self.left) as f32
                             * appearance.typography.cell_width.max(1.0)
+                            * preview::row_scale(&cells[y * columns..])
                     } else {
                         0.0
                     }
                     .min(ui.available_width());
                     let rect = egui::Rect::from_min_size(
-                        origin + egui::vec2(left, y as f32 * row_height),
+                        origin + egui::vec2(left, row_top),
                         egui::vec2(ui.available_width() - left, row_height),
                     );
-                    ui.painter().rect_filled(rect, 0.0, color);
+                    painter.rect_filled(rect, 0.0, color);
                 }
             }
         }

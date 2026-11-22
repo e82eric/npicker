@@ -24,6 +24,9 @@ pub struct Theme {
     pub text: Option<Color32>,
     /// Headings by level, the last repeating for deeper levels.
     pub headings: Vec<Color32>,
+    /// Heading sizes by level, as multiples of the text size. Deeper levels
+    /// are the text size; empty leaves every heading at it.
+    pub heading_scales: Vec<f32>,
     /// Inline code, and fenced code that isn't highlighted.
     pub code: Color32,
     pub code_background: Option<Color32>,
@@ -43,6 +46,7 @@ impl Default for Theme {
                 Color32::from_rgb(0x83, 0xa5, 0x98),
                 Color32::from_rgb(0x8e, 0xc0, 0x7c),
             ],
+            heading_scales: vec![2.0, 1.5, 1.25],
             code: Color32::from_rgb(0xfe, 0x80, 0x19),
             code_background: Some(Color32::from_rgb(0x32, 0x30, 0x2f)),
             code_theme: Some("gruvbox-dark".into()),
@@ -63,6 +67,8 @@ pub struct DocumentWriter {
     last_len: usize,
     /// Whether the last line ended was empty, so blank lines don't repeat.
     blank: bool,
+    /// How large lines are being written; `None` is the text size.
+    scale: Option<f32>,
     /// The lines ended, for tests: nfm lays documents out only for previews.
     #[cfg(test)]
     rows: Vec<Vec<(String, Style)>>,
@@ -83,6 +89,12 @@ impl DocumentWriter {
             .iter()
             .map(|row| row.iter().map(|(text, _)| text.as_str()).collect())
             .collect()
+    }
+    /// Writes lines `scale` times the text size from the next one ended, as
+    /// a heading is: they are that much taller and wrap that much sooner.
+    /// 1 is the text size.
+    pub fn set_scale(&mut self, scale: f32) {
+        self.scale = (scale != 1.0).then_some(scale);
     }
     /// Appends `text` to the current line; tabs become spaces and line breaks are
     /// dropped.
@@ -123,7 +135,14 @@ impl DocumentWriter {
         self.blank = text.is_empty();
         self.last_len = text.len();
         // Every row here is well formed, so this cannot fail.
-        let _ = self.builder.push_row(&text, &columns, false, &styles);
+        let _ = self.builder.push_row_scaled(
+            &text,
+            &columns,
+            false,
+            &styles,
+            None,
+            self.scale.unwrap_or(1.0),
+        );
         self.lines += 1;
     }
     /// Ends the current line if it has text.
@@ -414,6 +433,8 @@ impl<'a> Markdown<'a> {
             Tag::Heading { level, .. } => {
                 self.out.finish_line();
                 self.heading = Some(level);
+                let scale = self.theme.heading_scales.get(level as usize - 1);
+                self.out.set_scale(scale.copied().unwrap_or(1.0));
             }
             Tag::BlockQuote(_) => {
                 self.out.finish_line();
@@ -489,6 +510,7 @@ impl<'a> Markdown<'a> {
             TagEnd::Heading(_) => {
                 self.heading = None;
                 self.out.finish_line();
+                self.out.set_scale(1.0);
                 self.out.blank_line();
             }
             TagEnd::BlockQuote(_) => {
@@ -658,6 +680,30 @@ mod tests {
                 ("link", 0, Some(theme.link)),
             ]
         );
+    }
+
+    #[test]
+    fn headings_are_larger_by_level_and_the_text_after_them_is_not() {
+        use nfm_egui::copy_document::CopyDocument;
+        let scales = |theme: &Theme| -> Vec<f32> {
+            let mut writer = DocumentWriter::default();
+            writer.markdown("# One\n\n## Two\n\n### Three\n\n#### Four\n\ntext", theme);
+            let layout = writer
+                .finish()
+                .layout(80, &nfm_egui::Cancellation::never())
+                .unwrap();
+            // Rows: a heading and a blank line for each level, then the text.
+            (0..9).map(|row| layout.row_scale(row)).collect()
+        };
+        assert_eq!(
+            scales(&Theme::default()),
+            [2.0, 1.0, 1.5, 1.0, 1.25, 1.0, 1.0, 1.0, 1.0]
+        );
+        let flat = Theme {
+            heading_scales: Vec::new(),
+            ..Theme::default()
+        };
+        assert_eq!(scales(&flat), [1.0; 9]);
     }
 
     /// The distinct colors on the code line `fn main() {}` fenced as `fence`.

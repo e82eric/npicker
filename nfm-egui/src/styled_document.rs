@@ -58,8 +58,62 @@ pub struct DocumentBuilder {
     source_rows: Vec<SourceRow>,
     column_maps: Vec<ColumnMap>,
     fills: Vec<Option<Style>>,
+    scales: Vec<f32>,
     line_start: usize,
     source_origin: usize,
+}
+/// The largest size a line is drawn at, as a multiple of the text size.
+pub const MAX_LINE_SCALE: f32 = 4.0;
+/// A line's size as layouts use it: at least the text size, and finite.
+pub(crate) fn line_scale(scale: f32) -> f32 {
+    if scale.is_finite() {
+        scale.clamp(1.0, MAX_LINE_SCALE)
+    } else {
+        1.0
+    }
+}
+/// The cells a row of a line drawn at `scale` holds, in a pane `columns`
+/// cells wide at the text size.
+fn scaled_columns(columns: usize, scale: f32) -> usize {
+    if scale == 1.0 {
+        columns
+    } else {
+        ((columns as f32 / scale).floor() as usize).max(1)
+    }
+}
+/// Rounding in a sum of row heights never costs a row.
+const ROW_SLACK: f32 = 0.001;
+/// How many of the rows from `top` are wholly in view in a pane `rows` rows
+/// tall at the text size, where row `y` is `scale(y)` times as tall. Rows
+/// past the last, `total` on, count as text rows, so a pane of text rows
+/// holds `rows` wherever it is. At least one.
+pub fn rows_in_view(scale: impl Fn(u64) -> f32, total: u64, top: u64, rows: usize) -> usize {
+    let mut height = 0.0;
+    let mut count = 0;
+    while count < rows {
+        let y = top.saturating_add(count as u64);
+        height += if y < total { line_scale(scale(y)) } else { 1.0 };
+        if height > rows as f32 + ROW_SLACK {
+            break;
+        }
+        count += 1;
+    }
+    count.max(1)
+}
+/// The first row of the last page: the earliest row from which every row to
+/// the end is wholly in view in a pane `rows` rows tall at the text size.
+pub fn last_page_top(scale: impl Fn(u64) -> f32, total: u64, rows: usize) -> u64 {
+    let mut height = 0.0;
+    let mut top = total;
+    while top > 0 {
+        height += line_scale(scale(top - 1));
+        // The last row is shown even where it is taller than the pane.
+        if height > rows as f32 + ROW_SLACK && top < total {
+            break;
+        }
+        top -= 1;
+    }
+    top
 }
 impl Default for DocumentBuilder {
     fn default() -> Self {
@@ -70,6 +124,7 @@ impl Default for DocumentBuilder {
             source_rows: Vec::new(),
             column_maps: Vec::new(),
             fills: Vec::new(),
+            scales: Vec::new(),
             line_start: 0,
             source_origin: 0,
         }
@@ -100,6 +155,22 @@ impl DocumentBuilder {
         wraps: bool,
         styles: &[ColumnStyleRun],
         fill: Option<Style>,
+    ) -> Result<(), String> {
+        self.push_row_scaled(text, columns, wraps, styles, fill, 1.0)
+    }
+    /// Like `push_row_filled`; the logical line is drawn `scale` times the
+    /// text size, such as a heading: its rows are that much taller and hold
+    /// that many fewer cells. `columns` still counts the line's own cells.
+    /// Only the scale of a line's final row applies, and it is kept between
+    /// 1 and `MAX_LINE_SCALE`.
+    pub fn push_row_scaled(
+        &mut self,
+        text: &str,
+        columns: &[u32],
+        wraps: bool,
+        styles: &[ColumnStyleRun],
+        fill: Option<Style>,
+        scale: f32,
     ) -> Result<(), String> {
         if columns.len() != text.len() {
             return Err("Invalid document column map".into());
@@ -166,6 +237,7 @@ impl DocumentBuilder {
         if !wraps {
             self.lines.push(self.line_start..self.text.len());
             self.fills.push(fill);
+            self.scales.push(line_scale(scale));
             self.line_start = self.text.len();
         }
         Ok(())
@@ -188,6 +260,7 @@ impl DocumentBuilder {
         if self.source_rows.last().is_some_and(|r| r.wraps) {
             self.lines.push(self.line_start..self.text.len());
             self.fills.push(None);
+            self.scales.push(1.0);
         }
         Arc::new(StyledDocument {
             text: self.text.snapshot(),
@@ -196,6 +269,7 @@ impl DocumentBuilder {
             source_rows: self.source_rows,
             column_maps: self.column_maps,
             fills: self.fills,
+            scales: self.scales,
             source_origin: self.source_origin,
         })
     }
@@ -215,6 +289,8 @@ pub struct StyledDocument {
     source_rows: Vec<SourceRow>,
     column_maps: Vec<ColumnMap>,
     fills: Vec<Option<Style>>,
+    /// Each line's size, as a multiple of the text size.
+    scales: Vec<f32>,
     source_origin: usize,
 }
 impl StyledDocument {
@@ -336,6 +412,7 @@ impl StyledDocument {
         }
         let mut rows = Vec::new();
         let mut line_rows = Vec::with_capacity(self.lines.len());
+        let mut scaled = false;
         for (line, range) in self.lines.iter().enumerate() {
             if cancel.is_cancelled() {
                 return Err("preview cancelled".into());
@@ -344,6 +421,10 @@ impl StyledDocument {
             let text = self.text(range.clone());
             let mut start = range.start;
             let mut width = 0;
+            // A line drawn larger wraps sooner: its cells are wider.
+            let scale = self.scales.get(line).copied().unwrap_or(1.0);
+            scaled |= scale != 1.0;
+            let columns = scaled_columns(columns, scale);
             for (byte, grapheme) in text.grapheme_indices(true) {
                 if byte % 4096 == 0 && cancel.is_cancelled() {
                     return Err("preview cancelled".into());
@@ -356,6 +437,7 @@ impl StyledDocument {
                         width,
                         wraps: true,
                         fill: None,
+                        scale,
                     });
                     start = range.start + byte;
                     width = 0;
@@ -368,6 +450,7 @@ impl StyledDocument {
                 width,
                 wraps: false,
                 fill: self.fills.get(line).copied().flatten(),
+                scale,
             });
         }
         static REVISION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -376,6 +459,7 @@ impl StyledDocument {
             columns,
             rows,
             line_rows,
+            scaled,
             revision: REVISION.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             synchronous_search: false,
         })
@@ -472,12 +556,16 @@ struct LayoutRow {
     wraps: bool,
     /// Style of the padding after the line's text (final row only).
     fill: Option<Style>,
+    /// The row's size, as a multiple of the text size.
+    scale: f32,
 }
 pub struct DocumentLayout {
     document: Arc<StyledDocument>,
     columns: usize,
     rows: Vec<LayoutRow>,
     line_rows: Vec<usize>,
+    /// Whether any row is drawn larger than the text size.
+    scaled: bool,
     revision: u64,
     /// Set for plain-text layouts; see `StyledDocument::text_layout`.
     synchronous_search: bool,
@@ -491,7 +579,32 @@ impl DocumentLayout {
     }
     /// First row of a `rows`-tall viewport, clamped to the last full page.
     pub(crate) fn first_row(&self, requested: usize, rows: usize) -> usize {
-        requested.min(self.rows.len().saturating_sub(rows))
+        requested.min(self.last_page_top(rows))
+    }
+    /// The first row of the last page of a pane `rows` rows tall at the text
+    /// size: with larger rows on it, it holds fewer than `rows`.
+    pub fn last_page_top(&self, rows: usize) -> usize {
+        if !self.scaled {
+            return self.rows.len().saturating_sub(rows);
+        }
+        last_page_top(|y| self.scale_of(y), self.rows.len() as u64, rows) as usize
+    }
+    /// How many rows from `top` are wholly in view in a pane `rows` rows tall
+    /// at the text size; see `rows_in_view`.
+    pub fn rows_in_view(&self, top: usize, rows: usize) -> usize {
+        if !self.scaled {
+            return rows.max(1);
+        }
+        rows_in_view(|y| self.scale_of(y), self.rows.len() as u64, top as u64, rows)
+    }
+    fn scale_of(&self, row: u64) -> f32 {
+        self.rows.get(row as usize).map_or(1.0, |row| row.scale)
+    }
+    /// The cells row `y` holds: fewer than the layout's where it is larger.
+    fn row_columns(&self, y: usize) -> usize {
+        self.rows
+            .get(y)
+            .map_or(self.columns, |row| scaled_columns(self.columns, row.scale))
     }
     pub fn cell(&self, position: Position) -> Option<CellPosition> {
         let line = self.document.lines.get(position.line)?;
@@ -579,6 +692,7 @@ impl DocumentLayout {
                         foreground,
                         background,
                     );
+                    cell.scale = row.scale;
                     apply_highlight(&mut cell, x + spacer, y, highlight);
                     cells.push(cell);
                 }
@@ -587,6 +701,7 @@ impl DocumentLayout {
             let fill = row.fill.unwrap_or_default();
             while x < self.columns {
                 let mut cell = styled_cell(fill, " ", foreground, background);
+                cell.scale = row.scale;
                 apply_highlight(&mut cell, x, y, highlight);
                 cells.push(cell);
                 x += 1;
@@ -625,6 +740,7 @@ fn styled_cell(style: Style, text: &str, fg: egui::Color32, bg: egui::Color32) -
         invisible: style.flags & 16 != 0,
         faint: style.flags & 32 != 0,
         underline: style.underline,
+        scale: 1.0,
     }
 }
 fn apply_highlight(
@@ -665,6 +781,12 @@ impl CopyDocument for DocumentLayout {
     fn search_synchronously(&self) -> bool {
         self.synchronous_search
     }
+    fn row_scale(&self, row: u64) -> f32 {
+        self.scale_of(row)
+    }
+    fn scaled(&self) -> bool {
+        self.scaled
+    }
     fn resolve_cell(
         &self,
         mut cell: CellPosition,
@@ -673,7 +795,8 @@ impl CopyDocument for DocumentLayout {
         let row = self
             .row(cell.y as usize)
             .ok_or("Document row unavailable")?;
-        let mut x = (cell.x as usize).min(self.columns - 1);
+        // A larger row holds fewer cells; the rest of it is out of view.
+        let mut x = (cell.x as usize).min(self.row_columns(cell.y as usize) - 1);
         while x > 0 && row.widths[x] == 0 {
             x -= 1;
         }
@@ -795,6 +918,12 @@ impl CopyDocument for SelectedDocument {
     fn line_number(&self, row: u64) -> Option<u64> {
         self.layout.line_number(row)
     }
+    fn row_scale(&self, row: u64) -> f32 {
+        self.layout.scale_of(row)
+    }
+    fn scaled(&self) -> bool {
+        self.layout.scaled
+    }
 }
 type Resolver<T> = dyn Fn(&crate::Selection<T>) -> Result<(Arc<StyledDocument>, Option<DocumentRange>), String>
     + Send
@@ -867,7 +996,7 @@ impl<T: Clone + Send + 'static> PreviewProvider<T> for DocumentPreviewProvider<T
         } else {
             request.scroll_offset
         };
-        let first = first.min(layout.rows.len().saturating_sub(request.rows as usize));
+        let first = layout.first_row(first, request.rows as usize);
         if cancel.is_cancelled() {
             return Err("preview cancelled".into());
         }
@@ -972,6 +1101,84 @@ mod tests {
                 }],
             )
             .unwrap();
+    }
+    /// A document of ASCII lines, each drawn at its size.
+    fn sized(lines: &[(&str, f32)]) -> Arc<StyledDocument> {
+        let mut builder = DocumentBuilder::default();
+        for (text, scale) in lines {
+            let columns: Vec<u32> = (0..text.len() as u32).collect();
+            builder
+                .push_row_scaled(text, &columns, false, &[], None, *scale)
+                .unwrap();
+        }
+        builder.finish()
+    }
+    #[test]
+    fn larger_lines_wrap_sooner_and_leave_fewer_rows_in_view() {
+        let document = sized(&[
+            ("abcdefgh", 2.0),
+            ("body", 1.0),
+            ("more", 1.0),
+            ("h2", 1.5),
+            ("end", 1.0),
+        ]);
+        let layout = document.layout(8, &Cancellation::test()).unwrap();
+        // Twice the size, the heading holds four cells a row: it takes two.
+        assert_eq!(layout.total_rows(), 6);
+        let scales: Vec<f32> = (0..6).map(|row| layout.row_scale(row)).collect();
+        assert_eq!(scales, [2.0, 2.0, 1.0, 1.0, 1.5, 1.0]);
+        assert!(layout.scaled());
+        let row = layout.text_row(0).unwrap().unwrap();
+        assert_eq!(row.text.text.trim_end(), "abcd");
+        assert!(row.text.wraps_to_next);
+        assert_eq!(layout.line_number(1), Some(0));
+        // Its cells say how large they are drawn; the text's stay at 1.
+        let Preview::Grid { cells, .. } =
+            layout.grid(1, 2, egui::Color32::WHITE, egui::Color32::BLACK, None)
+        else {
+            panic!("layouts page as grids");
+        };
+        assert_eq!((cells[0].text.as_str(), cells[0].scale), ("e", 2.0));
+        assert_eq!((cells[8].text.as_str(), cells[8].scale), ("b", 1.0));
+        // The cursor stays on the cells the larger row has room for.
+        let resolve = |x, y| layout.resolve_cell(CellPosition { x, y }, false).unwrap().x;
+        assert_eq!((resolve(7, 0), resolve(7, 2)), (3, 7));
+        // What is copied is the text, whatever size it is drawn at.
+        let selection = CopySelection {
+            range: crate::copy_mode::CellRange {
+                start: CellPosition { x: 0, y: 0 },
+                end: CellPosition { x: 0, y: 2 },
+            },
+            linewise: true,
+            rectangle: false,
+            trim: true,
+        };
+        assert_eq!(layout.selection_text(&selection).unwrap(), "abcdefgh\nbody\n");
+        // A pane four text rows tall holds the heading's two rows and no
+        // more; from the text below it, three; past the end, four.
+        assert_eq!(layout.rows_in_view(0, 4), 2);
+        assert_eq!(layout.rows_in_view(2, 4), 3);
+        assert_eq!(layout.rows_in_view(5, 4), 4);
+        // The last page starts where everything to the end is in view.
+        assert_eq!(layout.last_page_top(4), 3);
+        assert_eq!(layout.first_row(usize::MAX, 4), 3);
+        assert_eq!(layout.last_page_top(1), 5);
+
+        let plain = sized(&[("a", 1.0), ("b", 1.0), ("c", 1.0)])
+            .layout(8, &Cancellation::test())
+            .unwrap();
+        assert!(!plain.scaled());
+        assert_eq!((plain.rows_in_view(2, 2), plain.last_page_top(2)), (2, 1));
+    }
+    #[test]
+    fn line_sizes_are_kept_between_the_text_size_and_the_largest() {
+        let document = sized(&[("a", 0.5), ("b", f32::NAN), ("c", 99.0), ("d", f32::INFINITY)]);
+        let layout = document.layout(8, &Cancellation::test()).unwrap();
+        let scales: Vec<f32> = (0..4).map(|row| layout.row_scale(row)).collect();
+        assert_eq!(scales, [1.0, 1.0, MAX_LINE_SCALE, 1.0]);
+        // A row always holds a cell, however large it is drawn.
+        let narrow = document.layout(2, &Cancellation::test()).unwrap();
+        assert_eq!(narrow.total_rows(), 4);
     }
     fn request(index: usize, columns: u16) -> PreviewRequest<usize> {
         PreviewRequest {

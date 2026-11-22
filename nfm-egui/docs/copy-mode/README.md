@@ -56,6 +56,26 @@ physical rows. Hosts must supply correct wrap information to obtain this behavio
 The cursor scroll margin defaults to two rows above and below, reduced for
 short viewports. A margin of zero disables it. `zz` centers the cursor.
 
+### Rows of different sizes
+
+A document can draw some rows larger than the text, as markdown headings are:
+`CopyDocument::row_scale` says how large, and `scaled` that any are. A row at
+2 is twice as tall, its cells are twice as wide, and it holds half as many of
+them. Its characters still take one column each, so the cursor, selections,
+search matches and copied text work as on any row. What differs:
+
+- The viewport holds fewer rows where larger ones are in view. Paging, `H`,
+  `M`, `L` and the scroll margin count the rows in view, and the cursor's row
+  is always shown whole.
+- `zz` centers by rows, so it is off-center beside larger rows.
+- `j` and `k` keep the column, not the place on screen: column 10 of a row at
+  2 is twice as far from the left as column 10 of the text. A rectangular
+  selection takes the same columns of each row, so it copies a rectangle of
+  characters but does not look like one across rows of different sizes.
+
+The engine itself counts rows and columns only; `PreviewCopyMode` does the
+arithmetic of heights for the picker's preview and the output page.
+
 ## Selecting and yanking
 
 | Keys | Action |

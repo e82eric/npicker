@@ -41,4 +41,15 @@ pub trait CopyDocument: Send + Sync + 'static {
     fn search_synchronously(&self) -> bool {
         false
     }
+    /// How large `row` is drawn, as a multiple of the text size: a row at 2
+    /// is twice as tall, its cells twice as wide, and it holds half as many
+    /// of them. Rows are text-sized unless a document says otherwise.
+    fn row_scale(&self, _row: u64) -> f32 {
+        1.0
+    }
+    /// Whether any row is larger than the text size. A document whose
+    /// `row_scale` is not always 1 must say so: only then is it asked.
+    fn scaled(&self) -> bool {
+        false
+    }
 }

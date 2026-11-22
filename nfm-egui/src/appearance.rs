@@ -107,6 +107,17 @@ impl Typography {
         ((self.preview_cell_height(ctx) + 6.0) * scale).round() / scale
     }
 
+    /// Height of a preview row drawn `scale` times the text size, such as a
+    /// heading, on whole physical pixels.
+    pub fn scaled_preview_row_height(&self, ctx: &egui::Context, scale: f32) -> f32 {
+        let height = self.preview_row_height(ctx);
+        if scale == 1.0 {
+            return height;
+        }
+        let pixels = ctx.pixels_per_point().max(0.01);
+        (height * scale * pixels).round().max(1.0) / pixels
+    }
+
     /// Preview cell height follows the larger of the normal and bold font
     /// metrics, rounded to a whole physical pixel at the current DPI.
     /// Shared row layout adds padding to this font height.

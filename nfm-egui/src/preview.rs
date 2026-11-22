@@ -20,6 +20,9 @@ pub struct PreviewCell {
     pub inverse: bool,
     pub invisible: bool,
     pub faint: bool,
+    /// How large the cell is drawn, as a multiple of the text size. The cells
+    /// of a row share it: the row is as tall as its first cell.
+    pub scale: f32,
 }
 impl Default for PreviewCell {
     fn default() -> Self {
@@ -35,6 +38,7 @@ impl Default for PreviewCell {
             inverse: false,
             invisible: false,
             faint: false,
+            scale: 1.0,
         }
     }
 }
@@ -411,16 +415,42 @@ pub(crate) fn paint(ui: &mut egui::Ui, preview: &Preview, appearance: &Appearanc
             if *columns == 0 {
                 return;
             }
+            // Larger rows take more of the pane, so it holds fewer of them:
+            // the row that crosses its end is cut off there.
+            let mut remaining = rows as f32 * row_height;
             for row in cells.chunks(*columns).take(rows) {
+                let scale = row_scale(row);
+                let row_height = typography.scaled_preview_row_height(ui.ctx(), scale);
+                let cell_width = typography.cell_width.max(1.0) * scale;
+                let shown = if remaining + 0.01 >= row_height {
+                    row_height
+                } else {
+                    remaining
+                };
+                if shown <= 0.0 {
+                    break;
+                }
+                remaining -= shown;
                 let (rect, _) = ui.allocate_exact_size(
-                    egui::vec2(ui.available_width(), row_height),
+                    egui::vec2(ui.available_width(), shown),
                     egui::Sense::hover(),
                 );
                 let painter = ui.painter().with_clip_rect(rect.intersect(ui.clip_rect()));
+                // A larger row's cells past the pane's edge are never seen.
+                let in_view = if scale == 1.0 {
+                    row.len()
+                } else {
+                    ((rect.width() / cell_width).ceil() as usize).min(row.len())
+                };
+                let row = &row[..in_view];
+                let (normal, bold) = (
+                    scaled_font(&typography.normal, scale),
+                    scaled_font(&typography.bold, scale),
+                );
                 for (x, cell) in row.iter().enumerate() {
                     let rect = egui::Rect::from_min_size(
-                        rect.min + egui::vec2(x as f32 * typography.cell_width.max(1.0), 0.0),
-                        egui::vec2(typography.cell_width.max(1.0), row_height),
+                        rect.min + egui::vec2(x as f32 * cell_width, 0.0),
+                        egui::vec2(cell_width, row_height),
                     );
                     painter.rect_filled(
                         rect,
@@ -434,8 +464,8 @@ pub(crate) fn paint(ui: &mut egui::Ui, preview: &Preview, appearance: &Appearanc
                 }
                 for (x, cell) in row.iter().enumerate() {
                     let cell_rect = egui::Rect::from_min_size(
-                        rect.min + egui::vec2(x as f32 * typography.cell_width.max(1.0), 0.0),
-                        egui::vec2(typography.cell_width.max(1.0), row_height),
+                        rect.min + egui::vec2(x as f32 * cell_width, 0.0),
+                        egui::vec2(cell_width, row_height),
                     );
                     let (fg, _bg) = if cell.inverse {
                         (cell.background, cell.foreground)
@@ -445,9 +475,9 @@ pub(crate) fn paint(ui: &mut egui::Ui, preview: &Preview, appearance: &Appearanc
                     if !cell.invisible {
                         let mut format = egui::TextFormat {
                             font_id: if cell.bold {
-                                typography.bold.clone()
+                                bold.clone()
                             } else {
-                                typography.normal.clone()
+                                normal.clone()
                             },
                             color: if cell.faint {
                                 fg.gamma_multiply(0.6)
@@ -469,22 +499,65 @@ pub(crate) fn paint(ui: &mut egui::Ui, preview: &Preview, appearance: &Appearanc
                         if cell.underline {
                             painter.line_segment(
                                 [
-                                    cell_rect.left_bottom() - egui::vec2(0.0, 2.0),
-                                    cell_rect.right_bottom() - egui::vec2(0.0, 2.0),
+                                    cell_rect.left_bottom() - egui::vec2(0.0, 2.0 * scale),
+                                    cell_rect.right_bottom() - egui::vec2(0.0, 2.0 * scale),
                                 ],
-                                egui::Stroke::new(1.0, cell.underline_color),
+                                egui::Stroke::new(scale, cell.underline_color),
                             );
                         }
                         if cell.strikethrough {
                             painter.line_segment(
                                 [cell_rect.left_center(), cell_rect.right_center()],
-                                egui::Stroke::new(1.0, fg),
+                                egui::Stroke::new(scale, fg),
                             );
                         }
                     }
                 }
             }
         }
+    }
+}
+
+/// How large a grid row is drawn: the scale of its first cell.
+pub(crate) fn row_scale(row: &[PreviewCell]) -> f32 {
+    row.first()
+        .map_or(1.0, |cell| crate::styled_document::line_scale(cell.scale))
+}
+
+/// The scale of each of a grid's rows, at most `rows` of them.
+pub(crate) fn row_scales(preview: &Preview, rows: usize) -> Vec<f32> {
+    match preview {
+        Preview::Grid { columns, cells, .. } if *columns > 0 => {
+            cells.chunks(*columns).take(rows).map(row_scale).collect()
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// Where rows drawn at `scales` start below the top of a pane, and how tall
+/// each is, as `paint` lays them out.
+pub(crate) fn row_spans(
+    ctx: &Context,
+    typography: &crate::appearance::Typography,
+    scales: impl IntoIterator<Item = f32>,
+) -> Vec<(f32, f32)> {
+    let mut top = 0.0;
+    scales
+        .into_iter()
+        .map(|scale| {
+            let height = typography.scaled_preview_row_height(ctx, scale);
+            let span = (top, height);
+            top += height;
+            span
+        })
+        .collect()
+}
+
+fn scaled_font(font: &egui::FontId, scale: f32) -> egui::FontId {
+    if scale == 1.0 {
+        font.clone()
+    } else {
+        egui::FontId::new(font.size * scale, font.family.clone())
     }
 }
 
@@ -519,6 +592,60 @@ pub fn parse_ansi<T>(bytes: &[u8], request: &PreviewRequest<T>) -> Result<Previe
 mod tests {
     use super::*;
     use std::time::{Duration, Instant};
+    #[test]
+    fn larger_rows_are_drawn_larger_and_the_pane_holds_fewer() {
+        let ctx = Context::default();
+        let appearance = Appearance::default();
+        let row = |text: &str, scale: f32| -> Vec<PreviewCell> {
+            text.chars()
+                .map(|ch| PreviewCell {
+                    text: ch.into(),
+                    scale,
+                    ..Default::default()
+                })
+                .collect()
+        };
+        let grid = Preview::Grid {
+            columns: 2,
+            cells: [row("Hh", 2.0), row("ab", 1.0), row("cd", 1.0)].concat(),
+            total_rows: 3,
+            lines: None,
+        };
+        let mut line = 0.0;
+        let mut frame = ctx.run_ui(egui::RawInput::default(), |ui| {
+            ui.spacing_mut().item_spacing = egui::Vec2::ZERO;
+            line = appearance.typography.preview_row_height(ui.ctx());
+            paint(ui, &grid, &appearance, 3);
+        });
+        frame.textures_delta.clear();
+        // (text, font size, left, top) of what was drawn, in order.
+        let drawn: Vec<(String, f32, f32, f32)> = frame
+            .shapes
+            .iter()
+            .filter_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) => Some((
+                    text.galley.text().to_owned(),
+                    text.galley.job.sections[0].format.font_id.size,
+                    text.pos.x,
+                    shape.clip_rect.top(),
+                )),
+                _ => None,
+            })
+            .collect();
+        let size = appearance.typography.normal.size;
+        let width = appearance.typography.cell_width;
+        // The heading takes two of the pane's three rows, so one row of text
+        // follows it and the last is not drawn.
+        let texts: Vec<&str> = drawn.iter().map(|d| d.0.as_str()).collect();
+        assert_eq!(texts, ["H", "h", "a", "b"]);
+        assert_eq!((drawn[0].1, drawn[2].1), (size * 2.0, size));
+        // Its cells are twice as wide, and the text starts two rows down.
+        assert!((drawn[1].2 - drawn[0].2 - 2.0 * width).abs() < 0.01);
+        assert!((drawn[3].2 - drawn[2].2 - width).abs() < 0.01);
+        assert!((drawn[2].3 - drawn[0].3 - 2.0 * line).abs() < 0.01);
+        let spans = row_spans(&ctx, &appearance.typography, [2.0, 1.0]);
+        assert_eq!(spans, [(0.0, 2.0 * line), (2.0 * line, line)]);
+    }
     #[test]
     fn image_texture_is_uploaded_once_and_grid_rows_are_limited() {
         let ctx = Context::default();

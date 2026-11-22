@@ -299,12 +299,16 @@ fn paint_line_numbers(
     ui: &egui::Ui,
     rect: egui::Rect,
     numbers: &[Option<crate::preview_copy::GutterNumber>],
+    scales: &[f32],
     appearance: &Appearance,
 ) {
     let typography = &appearance.typography;
     let row_height = typography.preview_row_height(ui.ctx());
     let right = rect.right() - typography.cell_width.max(1.0);
     let painter = ui.painter().with_clip_rect(rect.intersect(ui.clip_rect()));
+    // Rows drawn larger than the text, such as headings, are taller: a
+    // number is centered beside its row, at the text size.
+    let spans = preview::row_spans(ui.ctx(), typography, scales.iter().copied());
     for (y, number) in numbers.iter().enumerate() {
         let Some(number) = number else {
             continue;
@@ -314,7 +318,14 @@ fn paint_line_numbers(
         } else {
             (typography.normal.clone(), appearance.palette.muted)
         };
-        let y = rect.top() + (y as f32 + 0.5) * row_height;
+        let y = match (spans.get(y), spans.last()) {
+            (Some((top, height)), _) => rect.top() + top + height / 2.0,
+            // Past the rows whose sizes are known, rows are text-sized.
+            (None, Some((top, height))) => {
+                rect.top() + top + height + (y - spans.len()) as f32 * row_height + row_height / 2.0
+            }
+            (None, None) => rect.top() + (y as f32 + 0.5) * row_height,
+        };
         let (x, align) = if number.left_aligned {
             (rect.left(), egui::Align2::LEFT_CENTER)
         } else {
@@ -2060,10 +2071,12 @@ where
                         |ui| self.preview_content_ui(ui, appearance, style),
                     )
                     .inner;
+                let scales = self.preview_row_scales();
                 paint_line_numbers(
                     ui,
                     egui::Rect::from_min_size(origin, egui::vec2(gutter_width, height)),
                     &numbers,
+                    &scales,
                     appearance,
                 );
                 if self.preview_gutter_columns() != gutter_columns {
@@ -2083,6 +2096,25 @@ where
         match self.preview.as_ref()?.document.as_ref()? {
             Ok(Preview::Grid { lines, .. }) => lines.as_ref(),
             _ => None,
+        }
+    }
+    /// How large each row of the displayed preview is drawn, from its top.
+    /// Empty when every row is text-sized.
+    fn preview_row_scales(&self) -> Vec<f32> {
+        let rows = self.visible_preview_rows;
+        if let Some(copy) = &self.preview_viewport {
+            return copy.row_scales(rows);
+        }
+        match self.preview.as_ref().and_then(|p| p.document.as_ref()) {
+            Some(Ok(document)) => {
+                let scales = preview::row_scales(document, rows);
+                if scales.iter().all(|scale| *scale == 1.0) {
+                    Vec::new()
+                } else {
+                    scales
+                }
+            }
+            _ => Vec::new(),
         }
     }
     /// Paint the preview document and return its gutter numbers, one per

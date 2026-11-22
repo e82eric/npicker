@@ -231,17 +231,26 @@ impl Output {
         let layout =
             document.and_then(|document| document.layout(columns, &Cancellation::never()).ok());
         let total = layout.as_ref().map_or(0, |layout| layout.total_rows());
-        let last_page = total.saturating_sub(rows);
+        // Larger rows, such as headings, leave fewer in view than `rows`.
+        let last_page = layout
+            .as_ref()
+            .map_or(0, |layout| layout.last_page_top(rows));
         let top = match place {
             Some((top, _)) if !self.following => top.min(last_page),
             _ => last_page,
         };
+        let in_view = layout
+            .as_ref()
+            .map_or(rows, |layout| layout.rows_in_view(top, rows));
         self.viewport = layout.and_then(|layout| PreviewCopyMode::host(layout, top, rows));
         if let Some(viewport) = &mut self.viewport {
             // The cursor stays where it was, within the rows in view; at the
             // end while following it.
             let last_row = total.saturating_sub(1) as u64;
-            let (first, last) = (top as u64, ((top + rows).saturating_sub(1) as u64).min(last_row));
+            let (first, last) = (
+                top as u64,
+                ((top + in_view).saturating_sub(1) as u64).min(last_row),
+            );
             viewport.mode.cursor = match place {
                 Some((_, cursor)) if !self.following => CellPosition {
                     x: cursor.x.min(columns.saturating_sub(1) as u32),
@@ -255,7 +264,7 @@ impl Output {
     /// and the cursor is on it. Moving up a row is enough to stop following.
     fn at_end(&self, rows: usize) -> bool {
         self.viewport.as_ref().is_none_or(|viewport| {
-            viewport.top + rows as u64 >= viewport.rows()
+            viewport.top + viewport.rows_in_view(rows) as u64 >= viewport.rows()
                 && viewport.mode.cursor.y + 1 >= viewport.rows()
         })
     }
