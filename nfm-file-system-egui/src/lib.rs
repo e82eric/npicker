@@ -183,6 +183,9 @@ where
                 native: nfm_preview::file_preview_provider(),
             }),
         );
+        // A file is copied as its whole path, however the row shows it.
+        let paths = adapter.clone();
+        picker.set_copy_text(move |selection| paths.path(&selection.item).map(str::to_owned));
         Ok(Self {
             picker,
             scan,
@@ -236,13 +239,6 @@ where
                 }
             }
             Some(PickerEvent::Cancelled) => Ok(Some(FileEvent::Cancelled)),
-            Some(PickerEvent::CopyRequested(selection)) => {
-                if let Some(path) = self.adapter.path(&selection.item) {
-                    ctx.copy_text(path.to_owned());
-                    self.picker.notify_copied_value(ctx, path);
-                }
-                Ok(None)
-            }
             Some(PickerEvent::CustomAction { .. }) | None => Ok(None),
         }
     }

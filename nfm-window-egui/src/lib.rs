@@ -153,11 +153,6 @@ where
                 .window(&selection.item)
                 .map(|item| WindowEvent::Selected(item.native_window)),
             Some(PickerEvent::Cancelled) => Some(WindowEvent::Cancelled),
-            Some(PickerEvent::CopyRequested(selection)) => {
-                self.picker.notify_copied_value(ctx, &selection.text);
-                ctx.copy_text(selection.text);
-                None
-            }
             Some(PickerEvent::CustomAction { .. }) | None => None,
         }
     }

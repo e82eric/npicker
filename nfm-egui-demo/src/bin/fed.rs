@@ -199,10 +199,6 @@ impl eframe::App for Demo {
                 self.status = "Cancelled".into();
                 self.picker = None;
             }
-            Some(PickerEvent::CopyRequested(selection)) => {
-                ctx.copy_text(selection.text);
-                picker.notify_copied(ctx);
-            }
             Some(PickerEvent::CustomAction { .. }) | None => {}
         }
     }

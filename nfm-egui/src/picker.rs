@@ -488,7 +488,6 @@ pub enum PickerEvent<T> {
         selection: Selection<T>,
     },
     Cancelled,
-    CopyRequested(Selection<T>),
 }
 pub struct PickerOutput<T> {
     /// Content paint commands were built this frame; this is not GPU presentation.
@@ -512,8 +511,7 @@ impl<T> PickerOutput<T> {
     pub fn selection(&self) -> Option<&Selection<T>> {
         match &self.event {
             Some(PickerEvent::Accepted(selection))
-            | Some(PickerEvent::CustomAction { selection, .. })
-            | Some(PickerEvent::CopyRequested(selection)) => Some(selection),
+            | Some(PickerEvent::CustomAction { selection, .. }) => Some(selection),
             _ => self.frame_selection.as_ref(),
         }
     }
@@ -522,6 +520,9 @@ impl<T> PickerOutput<T> {
 /// The icon reference for a one-line result, from its item (see
 /// [`Picker::set_row_icon`]).
 pub type RowIcon<T> = Arc<dyn Fn(&T) -> Option<String> + Send + Sync>;
+
+/// What is copied for a row (see [`Picker::set_copy_text`]).
+pub type CopyText<T> = Arc<dyn Fn(&Selection<T>) -> Option<String> + Send + Sync>;
 
 /// The egui id of one live picker or prompt. egui keeps state by id: the query box's
 /// cursor and undo history, popups, the picker's area. Pickers made with the
@@ -677,6 +678,8 @@ pub struct Picker<S: ItemsSource + Send + Sync + 'static> {
     icons: IconCache,
     /// Icons beside one-line results.
     row_icon: Option<RowIcon<S::Item>>,
+    /// What is copied for a row, where it is not the row's text.
+    copy_text: Option<CopyText<S::Item>>,
     visible_preview_rows: usize,
     external_preview: bool,
     preview_rect: Option<egui::Rect>,
@@ -779,6 +782,7 @@ where
             visible_result_rows: 7,
             icons: IconCache::default(),
             row_icon: None,
+            copy_text: None,
             visible_preview_rows: 12,
             external_preview: false,
             preview_rect: None,
@@ -1178,6 +1182,31 @@ where
         self.row_icon.is_some()
     }
 
+    /// Say what is copied for a row. The picker copies the selected row
+    /// itself, and says so over the results: the row's text, unless `text`
+    /// gives something else for it, such as the whole path of a file shown
+    /// by its name. Nothing is copied, and nothing said, for a row `text`
+    /// gives `None` for. The function stays until replaced, also across
+    /// [`Self::replace_source`].
+    pub fn set_copy_text(
+        &mut self,
+        text: impl Fn(&Selection<S::Item>) -> Option<String> + Send + Sync + 'static,
+    ) {
+        self.copy_text = Some(Arc::new(text));
+    }
+
+    /// Copy what is copied for `selection`, and say so.
+    fn copy_selection(&mut self, ctx: &Context, selection: &Selection<S::Item>) {
+        let text = match &self.copy_text {
+            Some(text) => text(selection),
+            None => Some(selection.text.clone()),
+        };
+        if let Some(text) = text {
+            self.notify_copied_value(ctx, &text);
+            ctx.copy_text(text);
+        }
+    }
+
     /// Show line numbers in a gutter left of preview text. Wrapping providers
     /// receive the narrower width, so changing this re-requests the preview.
     pub fn set_preview_line_numbers(&mut self, numbers: PreviewLineNumbers) {
@@ -1407,7 +1436,9 @@ where
             preview_visible: false,
             ..PickerConfig::default()
         };
-        let picker = Picker::new(self.id.with("command-palette"), ctx, source, config);
+        let mut picker = Picker::new(self.id.with("command-palette"), ctx, source, config);
+        // A command is run, not copied.
+        picker.set_copy_text(|_| None);
         self.palette = Some(Box::new(CommandPalette {
             picker,
             actions: rows.into_iter().map(|row| row.action).collect(),
@@ -1496,14 +1527,8 @@ where
         }
     }
 
-    pub fn notify_copied(&mut self, ctx: &Context) {
-        let value = self
-            .selection()
-            .map(|selection| selection.text)
-            .unwrap_or_default();
-        self.notify_copied_value(ctx, &value);
-    }
-    /// Confirm the actual clipboard value when it differs from the displayed candidate.
+    /// Say that `value` was copied: for a host that copies something of its
+    /// own. The picker says it itself for a row it copies.
     pub fn notify_copied_value(&mut self, ctx: &Context, value: &str) {
         let notice = if value.is_empty() {
             "Copied".into()
@@ -2954,13 +2979,13 @@ where
                     {
                         event = Some(PickerEvent::CustomAction { action, selection });
                     } else if copy {
-                        event = Some(PickerEvent::CopyRequested(selection));
+                        self.copy_selection(ctx, &selection);
                     }
                 }
             } else if accept {
                 event = Some(PickerEvent::Accepted(selection));
             } else if copy {
-                event = Some(PickerEvent::CopyRequested(selection));
+                self.copy_selection(ctx, &selection);
             } else if let Some(action) = custom_action {
                 event = Some(PickerEvent::CustomAction { action, selection });
             }
@@ -2970,9 +2995,7 @@ where
             ctx.request_repaint_after(Duration::from_millis(50));
         }
         let frame_selection = match &event {
-            Some(PickerEvent::Accepted(_))
-            | Some(PickerEvent::CustomAction { .. })
-            | Some(PickerEvent::CopyRequested(_)) => None,
+            Some(PickerEvent::Accepted(_)) | Some(PickerEvent::CustomAction { .. }) => None,
             _ => self.selection(),
         };
         PickerOutput {
@@ -5531,6 +5554,7 @@ mod query_parity_tests {
         }
         add_host_commands(&mut picker);
         let selection = picker.selection().unwrap().index;
+        let row = picker.selection().unwrap().text;
         let (output, event) = draw(
             &ctx,
             &mut picker,
@@ -5539,14 +5563,10 @@ mod query_parity_tests {
                 egui::Event::Copy,
             ],
         );
-        assert!(matches!(event, Some(PickerEvent::CopyRequested(_))));
-        assert!(
-            !output
-                .platform_output
-                .commands
-                .iter()
-                .any(|command| matches!(command, egui::OutputCommand::CopyText(_)))
-        );
+        // With no preview focused the chord copies the row, once, and the
+        // picker says so itself: the host is told nothing.
+        assert!(event.is_none());
+        assert_eq!(output.platform_output.commands, [egui::OutputCommand::CopyText(row.clone())]);
         draw(
             &ctx,
             &mut picker,
@@ -5564,12 +5584,13 @@ mod query_parity_tests {
             &mut picker,
             vec![modified_key(Key::W, Modifiers::CTRL)],
         );
-        let (_, event) = draw(
+        let (output, event) = draw(
             &ctx,
             &mut picker,
             vec![modified_key(Key::C, Modifiers::CTRL)],
         );
-        assert!(matches!(event, Some(PickerEvent::CopyRequested(_))));
+        assert!(event.is_none());
+        assert!(output.platform_output.commands.contains(&egui::OutputCommand::CopyText(row)));
         let (output, event) = draw(
             &ctx,
             &mut picker,
@@ -5686,18 +5707,14 @@ mod query_parity_tests {
             .filter(|text: &String| text.chars().all(|ch| ch.is_ascii_digit()))
             .collect();
         assert_eq!(numbers, ["1", "2"]);
+        // Unfocused, the chord copies the row and not the document.
+        let row = picker.selection().unwrap().text;
         let (unfocused, _) = draw(
             &ctx,
             &mut picker,
             vec![modified_key(Key::C, Modifiers::CTRL | Modifiers::SHIFT)],
         );
-        assert!(
-            !unfocused
-                .platform_output
-                .commands
-                .iter()
-                .any(|command| matches!(command, egui::OutputCommand::CopyText(_)))
-        );
+        assert_eq!(unfocused.platform_output.commands, [egui::OutputCommand::CopyText(row)]);
         draw(
             &ctx,
             &mut picker,
@@ -5776,6 +5793,34 @@ mod query_parity_tests {
         assert!(bounds.is_none());
     }
     #[test]
+    fn a_host_says_what_is_copied_for_a_row_or_that_nothing_is() {
+        let (ctx, mut picker) = make();
+        wait(&mut picker);
+        draw(&ctx, &mut picker, vec![]);
+        let row = picker.selection().unwrap().text;
+        // With nothing said, the row's text, and the picker says so.
+        let (output, event) = draw(&ctx, &mut picker, vec![egui::Event::Copy]);
+        assert!(event.is_none());
+        assert_eq!(output.platform_output.commands, [egui::OutputCommand::CopyText(row.clone())]);
+        assert_eq!(picker.notice, format!("Copied: {row}"));
+        assert!(picker.notice_until.is_some());
+        // What the host gives for the row, and that is what is said.
+        picker.set_copy_text(|selection| Some(format!("value of {}", selection.text)));
+        let (output, event) = draw(&ctx, &mut picker, vec![egui::Event::Copy]);
+        assert!(event.is_none());
+        let value = format!("value of {row}");
+        assert_eq!(output.platform_output.commands, [egui::OutputCommand::CopyText(value.clone())]);
+        assert_eq!(picker.notice, format!("Copied: {value}"));
+        // A row the host gives nothing for is not copied, and nothing is said.
+        picker.notice_until = None;
+        picker.set_copy_text(|_| None);
+        let (output, event) = draw(&ctx, &mut picker, vec![egui::Event::Copy]);
+        assert!(event.is_none());
+        assert!(output.platform_output.commands.is_empty());
+        assert!(picker.notice_until.is_none());
+        assert_eq!(picker.selection().unwrap().text, row);
+    }
+    #[test]
     fn preview_toggle_scroll_and_missing_preview_copy_match_skia() {
         let (ctx, mut picker) = make();
         wait(&mut picker);
@@ -5785,14 +5830,10 @@ mod query_parity_tests {
             &mut picker,
             vec![modified_key(Key::C, Modifiers::CTRL | Modifiers::SHIFT)],
         );
-        assert!(matches!(event, Some(PickerEvent::CopyRequested(_))));
-        assert!(
-            output
-                .platform_output
-                .commands
-                .iter()
-                .all(|command| !matches!(command, egui::OutputCommand::CopyText(_)))
-        );
+        // With no preview to copy, the chord copies the row.
+        let row = picker.selection().unwrap().text;
+        assert!(event.is_none());
+        assert_eq!(output.platform_output.commands, [egui::OutputCommand::CopyText(row)]);
         picker.set_preview_provider(
             &ctx,
             Arc::new(
@@ -6774,14 +6815,11 @@ mod output_selection_tests {
                 action: 42,
                 selection: selection(2),
             },
-            PickerEvent::CopyRequested(selection(2)),
         ] {
             let output = output(Some(event));
             let selected = output.selection().unwrap();
             let event_selection = match output.event.as_ref().unwrap() {
-                PickerEvent::Accepted(s)
-                | PickerEvent::CustomAction { selection: s, .. }
-                | PickerEvent::CopyRequested(s) => s,
+                PickerEvent::Accepted(s) | PickerEvent::CustomAction { selection: s, .. } => s,
                 _ => unreachable!(),
             };
             assert!(std::ptr::eq(selected, event_selection));

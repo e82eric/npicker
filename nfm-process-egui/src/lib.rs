@@ -230,14 +230,7 @@ where
                     });
             }
         }
-        match output.event {
-            Some(PickerEvent::CopyRequested(selection)) => {
-                self.picker.notify_copied_value(ctx, &selection.text);
-                ctx.copy_text(selection.text);
-                None
-            }
-            event => event,
-        }
+        output.event
     }
 }
 

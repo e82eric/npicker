@@ -275,12 +275,6 @@ impl View {
             match picker.show(ctx, placement, appearance, false).event {
                 Some(PickerEvent::Accepted(selection)) => Shown::Accepted(Some(chosen(selection))),
                 Some(PickerEvent::Cancelled) => Shown::Cancelled,
-                Some(PickerEvent::CopyRequested(selection)) => {
-                    let value = chosen(selection).value;
-                    picker.notify_copied_value(ctx, &value);
-                    ctx.copy_text(value);
-                    Shown::Nothing
-                }
                 Some(PickerEvent::CustomAction { .. }) | None => Shown::Nothing,
             }
         }
@@ -1003,6 +997,8 @@ fn build_view(
             store.publish(Arc::new(nfm_window_egui::window_snapshot(windows, hwnd)));
             store.complete();
             let mut picker = Picker::new("nfm-window-list", ctx, store, config);
+            // What is copied for a row is what accepting it prints.
+            picker.set_copy_text(|s| Some(window_chosen(&s.item, s.index).value));
             picker.set_preview_provider(
                 ctx,
                 preview.provider(|s: &Selection<nfm_win32::WindowPickerItem>| {
@@ -1051,6 +1047,8 @@ fn build_view(
         )),
         (_, Some(Source::Lines(feed, values))) => {
             let mut picker = Picker::new("nfm-lines", ctx, feed.store.clone(), config);
+            let copied = values.clone();
+            picker.set_copy_text(move |s| Some(line_chosen(&copied, s.index, s.text.clone()).value));
             if !preview.is_empty() {
                 let lookup = values.clone();
                 picker.set_preview_provider(
@@ -1071,6 +1069,7 @@ fn build_view(
         }
         (_, Some(Source::Delimited(feed))) => {
             let mut picker = Picker::new("nfm-delimited", ctx, feed.store.clone(), config);
+            picker.set_copy_text(|s| Some(s.item.value.clone()));
             if !preview.is_empty() {
                 picker.set_preview_provider(
                     ctx,
@@ -1088,6 +1087,7 @@ fn build_view(
         }
         (_, Some(Source::Csv(feed))) => {
             let mut picker = Picker::new("nfm-csv", ctx, feed.store.clone(), config);
+            picker.set_copy_text(|s| Some(s.item.value.clone()));
             if !preview.is_empty() {
                 picker.set_preview_provider(
                     ctx,

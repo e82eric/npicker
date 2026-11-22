@@ -222,10 +222,6 @@ impl eframe::App for Demo {
                     self.status = format!("Accepted payload {}: {}", selection.item, selection.text)
                 }
                 Some(PickerEvent::Cancelled) => self.status = "Cancelled".into(),
-                Some(PickerEvent::CopyRequested(selection)) => {
-                    ctx.copy_text(selection.text);
-                    picker.notify_copied(ctx);
-                }
                 Some(PickerEvent::CustomAction { .. }) | None => {}
             }
             if !output.busy

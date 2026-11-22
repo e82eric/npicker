@@ -49,7 +49,6 @@ let frame = ctx.run_ui(egui::RawInput::default(), |ui| {
             // Host focuses the window identified by selection.item.
             assert!(selection.item == 101 || selection.item == 202);
         }
-        Some(PickerEvent::CopyRequested(selection)) => ctx.copy_text(selection.text),
         Some(PickerEvent::Cancelled)
         | Some(PickerEvent::CustomAction { .. })
         | None => {}
@@ -63,6 +62,11 @@ The picker reports acceptance and cancellation and stays as it is: ending it is
 the host's. Drop it, or call `close` to stop its workers and keep it around
 drawing nothing. Handle events inside the UI callback: egui may run multiple
 passes, and an event is emitted once.
+
+Ctrl+C copies the selected row and says so over the results, with no event:
+the row's text, or what the host gives for the row with `set_copy_text`, such
+as the whole path of a file shown by its name. A row it gives `None` for is not
+copied.
 
 A host that shows one picker on top of another keeps them in a `PageStack` and
 answers each event with an `Outcome`: `Stay`, `Back` to the page beneath as it
@@ -237,7 +241,7 @@ Graphics resources can be recreated without recreating picker/search state.
 - Enter accepts; Escape cancels; double-click accepts a result.
 - Up/Down navigate in visual order; Ctrl+N advances search rank.
 - PageUp/PageDown move a result page; Ctrl+Home/End select first/last search rank.
-- Ctrl+C requests copying the selected candidate from the host.
+- Ctrl+C copies the selected candidate: its text, or what `set_copy_text` gives.
 - Ctrl+P (as in Ghostty) or Ctrl+Space toggles the preview; Ctrl+PageUp/PageDown scroll its document by a page and Ctrl+Up/Down by a line.
 - Ctrl+Shift+F toggles full-pane placement for all pickers, retaining
   the query and result selection. Toggle again to restore the host placement;
@@ -382,7 +386,7 @@ popup before closing the picker. Suggestions include actions, columns, operators
 and values, with match highlighting and mouse selection. Completion retains the
 surrounding query and cursor position. Headers and row display use the source's
 selected columns; header text is yellow with a gold separator.
-Keyboard parity: Ctrl+C requests copying the selected item; Preview copying requires Ctrl+W preview focus; Ctrl+Shift+C then copies the complete document. Results-pane copy commands apply to the selected item. Ctrl+Shift+/ opens the command palette; Escape closes it without cancelling the picker. Hosts should check `keybinding_help_visible` (true while the palette is open) before consuming custom keys.
+Keyboard parity: Ctrl+C copies the selected item; Preview copying requires Ctrl+W preview focus; Ctrl+Shift+C then copies the complete document. Results-pane copy commands apply to the selected item. Ctrl+Shift+/ opens the command palette; Escape closes it without cancelling the picker. Hosts should check `keybinding_help_visible` (true while the palette is open) before consuming custom keys.
 
 Hosts can call `set_external_preview(true)` to reserve preview space without a
 preview worker. `PickerOutput.preview_rect` supplies the clipped bounds in egui
