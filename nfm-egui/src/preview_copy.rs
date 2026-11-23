@@ -1714,7 +1714,7 @@ impl PreviewCopyMode {
                         }
                         return false;
                     }
-                    CopyEffect::OpenLineSplit { .. } => {}
+                    CopyEffect::OpenLineSplit { .. } | CopyEffect::Open { .. } => {}
                     CopyEffect::ClearSearch { cancel_pending } => {
                         if cancel_pending {
                             self.search_job = None;

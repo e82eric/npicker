@@ -168,7 +168,8 @@ The lower-level `CopyMode` remains available for custom integrations.
    pass accepted feedback to `finish_search`. An optional anchor supports live
    incremental searches without briefly resetting the displayed cursor.
 6. `QuickSelect` opens hints; pass a completed hint to `select_quick` with its
-   purpose. `OpenLineSplit` is an optional host picker action. `ClearSearch`
+   purpose. `OpenLineSplit` is an optional host picker action. `Open` (Enter)
+   asks the host to open what the cursor is on, if it opens links. `ClearSearch`
    cancels pending work when requested. `Exit` releases copy focus/snapshot.
 7. Treat controller errors as failed operations. Stop using expired native
    documents. Cancel and wait for asynchronous reads before invalidating leases.

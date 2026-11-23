@@ -2333,6 +2333,8 @@ pub enum CopyAction {
         forward: bool,
     },
     OpenLineSplit,
+    /// Enter: open what the cursor is on, which is the host's to find.
+    Open,
     None,
     Exit,
     ClearSearch {
@@ -2502,6 +2504,18 @@ impl CopyMode {
         }
         if is_copy_modifier_key(key) {
             return CopyAction::None;
+        }
+        if key == egui::Key::Enter
+            && !modifiers.ctrl
+            && !modifiers.shift
+            && !modifiers.alt
+            && !modifiers.mac_cmd
+        {
+            // A command half typed is dropped; a selection is kept.
+            let anchor = self.visual_anchor;
+            self.clear_pending_for_navigation();
+            self.visual_anchor = anchor;
+            return CopyAction::Open;
         }
         if key == egui::Key::Escape {
             if self.pending_z {
@@ -2925,6 +2939,32 @@ mod tests {
             mode.input(&key(egui::Modifiers::CTRL | egui::Modifiers::SHIFT)),
             super::CopyAction::OpenLineSplit
         ));
+    }
+
+    #[test]
+    fn enter_opens_keeping_a_selection_and_dropping_a_half_typed_command() {
+        let mut mode = super::CopyMode::default();
+        mode.cursor = super::CellPosition { x: 7, y: 42 };
+        mode.visual_anchor = Some(super::CellPosition { x: 2, y: 42 });
+        mode.pending_count = Some(3);
+        mode.pending_g = true;
+        let key = |mods| egui::Event::Key {
+            key: egui::Key::Enter,
+            physical_key: Some(egui::Key::Enter),
+            pressed: true,
+            repeat: false,
+            modifiers: mods,
+        };
+        assert!(matches!(
+            mode.input(&key(egui::Modifiers::NONE)),
+            super::CopyAction::Open
+        ));
+        assert_eq!(mode.cursor, super::CellPosition { x: 7, y: 42 });
+        assert_eq!(mode.visual_anchor, Some(super::CellPosition { x: 2, y: 42 }));
+        assert!(mode.pending_count.is_none() && !mode.pending_g);
+        for mods in [egui::Modifiers::CTRL, egui::Modifiers::SHIFT, egui::Modifiers::ALT] {
+            assert!(!matches!(mode.input(&key(mods)), super::CopyAction::Open));
+        }
     }
 
     #[test]

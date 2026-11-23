@@ -64,6 +64,11 @@ pub enum CopyEffect {
     OpenLineSplit {
         cursor: CellPosition,
     },
+    /// Enter was pressed with the cursor here. A host that opens links
+    /// finds the one the cursor is on; any other ignores this.
+    Open {
+        cursor: CellPosition,
+    },
     Exit,
 }
 
@@ -228,6 +233,9 @@ impl<'a, D: CopyNavigationDocument + ?Sized> CopyController<'a, D> {
                 update.effects.push(CopyEffect::QuickSelect { origin })
             }
             CopyAction::OpenLineSplit => update.effects.push(CopyEffect::OpenLineSplit {
+                cursor: self.mode.cursor,
+            }),
+            CopyAction::Open => update.effects.push(CopyEffect::Open {
                 cursor: self.mode.cursor,
             }),
             CopyAction::ClearSearch { cancel_pending } => {
@@ -923,6 +931,13 @@ mod tests {
         assert!(matches!(
             update.effects[0],
             CopyEffect::OpenLineSplit {
+                cursor: CellPosition { x: 4, y: 0 }
+            }
+        ));
+        let update = controller.execute(CopyAction::Open).unwrap();
+        assert!(matches!(
+            update.effects[0],
+            CopyEffect::Open {
                 cursor: CellPosition { x: 4, y: 0 }
             }
         ));
