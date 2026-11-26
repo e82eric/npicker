@@ -224,51 +224,12 @@ impl QuickSelect {
         view: SnapshotView,
         patterns: &[Regex],
         alphabet: &Alphabet,
-        mut read: impl FnMut(u64) -> Option<TextRow>,
-        mut visible: impl FnMut(SnapshotCell) -> bool,
+        read: impl FnMut(u64) -> Option<TextRow>,
+        visible: impl FnMut(SnapshotCell) -> bool,
     ) -> Option<Self> {
-        let bottom = view
-            .viewport_top
-            .saturating_add(u64::from(view.viewport_rows))
-            .min(view.total_rows);
-        let mut row = view.viewport_top;
-        // Include the beginning of the first logical line. Matches whose
-        // start is above the viewport are excluded rather than mislabeled.
-        while row > 0 && read(row - 1)?.wraps_to_next {
-            row -= 1;
-        }
-        let mut text = String::new();
-        let mut points = Vec::new();
-        let mut ranges = Vec::new();
-        while row < view.total_rows {
-            let line = read(row)?;
-            if line.text.len() != line.columns.len() {
-                return None;
-            }
-            if text.len().saturating_add(line.text.len()) > 4 * 1024 * 1024 {
-                return None;
-            }
-            text.push_str(&line.text);
-            points.extend(line.columns.iter().map(|&x| SnapshotCell { x, y: row }));
-            row += 1;
-            if !line.wraps_to_next || row == view.total_rows {
-                for (found_start, found_end) in matches(patterns, &text) {
-                    let start = points[found_start];
-                    let end = points[found_end - 1];
-                    if start.y >= view.viewport_top && start.y < bottom && visible(start) {
-                        if ranges.len() >= 200_000 {
-                            return None;
-                        }
-                        ranges.push(SnapshotCellRange { start, end });
-                    }
-                }
-                text.clear();
-                points.clear();
-                if row >= bottom {
-                    break;
-                }
-            }
-        }
+        // Matches whose start is above the viewport are excluded rather than
+        // mislabeled.
+        let mut ranges = crate::copy_mode::matches_in_view(view, patterns, read, visible)?;
         // Prefer the most recent output. Decorations expect newest first.
         ranges.reverse();
         let labels = labels(&alphabet.0, ranges.len());
@@ -336,35 +297,6 @@ impl QuickSelect {
         }
         text
     }
-}
-
-/// Byte ranges of the non-empty, non-overlapping matches in text order.
-fn matches(patterns: &[Regex], text: &str) -> Vec<(usize, usize)> {
-    let mut found: Vec<(usize, usize)> = Vec::new();
-    for pattern in patterns {
-        for captures in pattern.captures_iter(text) {
-            let target = (1..captures.len())
-                .find_map(|group| captures.get(group))
-                .or_else(|| captures.get(0))
-                .expect("a match has group 0");
-            if !target.is_empty() {
-                found.push((target.start(), target.end()));
-            }
-        }
-    }
-    if patterns.len() > 1 {
-        // Earliest first; at the same start, the longer match.
-        found.sort_unstable_by_key(|&(start, end)| (start, std::cmp::Reverse(end)));
-        let mut end_of_last = 0;
-        found.retain(|&(start, end)| {
-            let keep = start >= end_of_last;
-            if keep {
-                end_of_last = end;
-            }
-            keep
-        });
-    }
-    found
 }
 
 fn labels(alphabet: &[u8], count: usize) -> Vec<String> {

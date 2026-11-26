@@ -25,6 +25,7 @@ pub struct CellRange {
     pub end: CellPosition,
 }
 
+use regex::Regex;
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 use unicode_segmentation::UnicodeSegmentation;
@@ -2111,6 +2112,93 @@ impl CopyMode {
 }
 
 pub use crate::document_search::next_match_cell;
+/// Where each match of `patterns` is among the rows `view` shows, first to
+/// last. Rows that wrap are matched as the one line they are, so a match can
+/// run over several; one that starts above the rows shown is left out, and so
+/// is one that starts where the host says is not `visible`. A pattern with a
+/// capture group gives only the first group that participates, so context can
+/// be required without being part of the match. Empty matches are skipped,
+/// and where matches of different patterns overlap the earliest one wins.
+/// `None` when a row cannot be read, or there is more than is matched.
+pub fn matches_in_view(
+    view: View,
+    patterns: &[Regex],
+    mut read: impl FnMut(u64) -> Option<TextRow>,
+    mut visible: impl FnMut(CellPosition) -> bool,
+) -> Option<Vec<CellRange>> {
+    let bottom = view
+        .viewport_top
+        .saturating_add(u64::from(view.viewport_rows))
+        .min(view.total_rows);
+    let mut row = view.viewport_top;
+    // Include the beginning of the first logical line.
+    while row > 0 && read(row - 1)?.wraps_to_next {
+        row -= 1;
+    }
+    let mut text = String::new();
+    let mut points = Vec::new();
+    let mut ranges = Vec::new();
+    while row < view.total_rows {
+        let line = read(row)?;
+        if line.text.len() != line.columns.len() {
+            return None;
+        }
+        if text.len().saturating_add(line.text.len()) > 4 * 1024 * 1024 {
+            return None;
+        }
+        text.push_str(&line.text);
+        points.extend(line.columns.iter().map(|&x| CellPosition { x, y: row }));
+        row += 1;
+        if !line.wraps_to_next || row == view.total_rows {
+            for (found_start, found_end) in matches(patterns, &text) {
+                let start = points[found_start];
+                let end = points[found_end - 1];
+                if start.y >= view.viewport_top && start.y < bottom && visible(start) {
+                    if ranges.len() >= 200_000 {
+                        return None;
+                    }
+                    ranges.push(CellRange { start, end });
+                }
+            }
+            text.clear();
+            points.clear();
+            if row >= bottom {
+                break;
+            }
+        }
+    }
+    Some(ranges)
+}
+
+/// Byte ranges of the non-empty, non-overlapping matches in text order.
+fn matches(patterns: &[Regex], text: &str) -> Vec<(usize, usize)> {
+    let mut found: Vec<(usize, usize)> = Vec::new();
+    for pattern in patterns {
+        for captures in pattern.captures_iter(text) {
+            let target = (1..captures.len())
+                .find_map(|group| captures.get(group))
+                .or_else(|| captures.get(0))
+                .expect("a match has group 0");
+            if !target.is_empty() {
+                found.push((target.start(), target.end()));
+            }
+        }
+    }
+    if patterns.len() > 1 {
+        // Earliest first; at the same start, the longer match.
+        found.sort_unstable_by_key(|&(start, end)| (start, std::cmp::Reverse(end)));
+        let mut end_of_last = 0;
+        found.retain(|&(start, end)| {
+            let keep = start >= end_of_last;
+            if keep {
+                end_of_last = end;
+            }
+            keep
+        });
+    }
+    found
+}
+
 
 /// Decoration ranges are ordered newest row first. Only materialize visible
 /// physical rows, even when a block extends across the entire scrollback.
@@ -4686,6 +4774,52 @@ mod tests {
         assert_eq!(mode.move_to(Motion::PageDown, Some(view)).unwrap().0.y, 99);
         mode.cursor.y = 2;
         assert_eq!(mode.move_to(Motion::HalfPageUp, Some(view)).unwrap().0.y, 0);
+    }
+
+    #[test]
+    fn matches_in_view_are_found_over_wrapped_rows_and_only_from_the_rows_shown() {
+        use super::{matches_in_view, CellPosition, CellRange, TextRow, View};
+        // Row 0 wraps into row 1, row 2 wraps into row 3.
+        let rows = ["see src/ma", "in.rs now", "and docs/a", ".md too", "last.txt"];
+        let read = |row: u64| {
+            let text = *rows.get(row as usize)?;
+            Some(TextRow {
+                text: text.to_owned(),
+                columns: (0..text.len() as u32).collect(),
+                wraps_to_next: row == 0 || row == 2,
+            })
+        };
+        let paths = [regex::Regex::new(r"[\w/]+\.\w+").unwrap()];
+        let at = |x, y| CellPosition { x, y };
+        let all = View {
+            viewport_top: 0,
+            viewport_rows: 5,
+            total_rows: 5,
+            columns: 10,
+            ..Default::default()
+        };
+        // First to last, each from its first cell to its last.
+        assert_eq!(
+            matches_in_view(all, &paths, read, |_| true).unwrap(),
+            [
+                CellRange { start: at(4, 0), end: at(4, 1) },
+                CellRange { start: at(4, 2), end: at(2, 3) },
+                CellRange { start: at(0, 4), end: at(7, 4) },
+            ]
+        );
+        // One that starts above the rows shown is left out, though the line
+        // it is on is read from its start; so is one that is not visible.
+        let lower = View { viewport_top: 1, viewport_rows: 2, ..all };
+        assert_eq!(
+            matches_in_view(lower, &paths, read, |_| true).unwrap(),
+            [CellRange { start: at(4, 2), end: at(2, 3) }]
+        );
+        assert_eq!(
+            matches_in_view(all, &paths, read, |cell| cell.y != 2).unwrap().len(),
+            2
+        );
+        // A row that cannot be read.
+        assert!(matches_in_view(View { total_rows: 6, viewport_rows: 6, ..all }, &paths, read, |_| true).is_none());
     }
 }
 
